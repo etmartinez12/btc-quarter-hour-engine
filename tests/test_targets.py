@@ -32,3 +32,22 @@ def test_build_direction_target_labels_up_down_and_flat_moves():
     assert actual.loc[2, "log_return_15m"] == 0.0
     assert pd.isna(actual.loc[3, "target"])
     assert pd.isna(actual.loc[3, "log_return_15m"])
+
+
+def test_build_direction_target_avoids_infinite_returns_for_non_positive_prices():
+    boundaries = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:15:00Z",
+                ],
+                utc=True,
+            ),
+            "midpoint": [0.0, 101.0],
+        }
+    )
+
+    actual = build_direction_target(boundaries)
+
+    assert pd.isna(actual.loc[0, "log_return_15m"])

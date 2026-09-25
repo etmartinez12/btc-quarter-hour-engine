@@ -14,7 +14,16 @@ class ExpandingWindowSplit:
 
     def split(self, X) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         n_samples = len(X)
-        step = self.step_size or self.test_size
+        if self.initial_train_size <= 0:
+            raise ValueError("initial_train_size must be positive")
+        if self.test_size <= 0:
+            raise ValueError("test_size must be positive")
+        if self.step_size is None:
+            step = self.test_size
+        elif self.step_size <= 0:
+            raise ValueError("step_size must be positive when provided")
+        else:
+            step = self.step_size
         train_end = self.initial_train_size
 
         while train_end + self.test_size <= n_samples:

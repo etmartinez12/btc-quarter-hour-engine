@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from ..boundaries import is_quarter_hour_boundary
@@ -27,5 +28,6 @@ class LivePredictor:
 
         features = build_feature_frame(market_frame, self.feature_config)
         latest_row = features.drop(columns=["timestamp"], errors="ignore").tail(1)
-        probability_up = self.model.predict_proba(latest_row)[0, 1]
+        probabilities = np.asarray(self.model.predict_proba(latest_row))
+        probability_up = probabilities[0, 1]
         return float(probability_up)

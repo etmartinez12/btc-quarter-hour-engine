@@ -86,6 +86,8 @@ The unit tests cover:
 
 - quarter-hour target construction behavior
 - walk-forward split ordering and non-overlap
+- zero-fold walk-forward benchmark rejection
+- live predictor boundary freshness checks
 
 ## Design notes
 
