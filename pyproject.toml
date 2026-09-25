@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btc-quarter-hour-engine"
+version = "0.1.0"
+description = "Leakage-safe Bitcoin quarter-hour prediction baseline engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "etmartinez12" }
+]
+dependencies = [
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "scikit-learn>=1.5,<2",
+  "lightgbm>=4.5,<5"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9"
+]
+
+[project.scripts]
+btc-qh-baseline = "btc_quarter_hour_engine.run_baseline:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["btc_quarter_hour_engine*"]
+
+[tool.setuptools.package-data]
+btc_quarter_hour_engine = ["data/*.csv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
