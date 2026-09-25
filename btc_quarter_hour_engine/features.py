@@ -7,6 +7,17 @@ from .boundaries import compute_midpoint, is_quarter_hour_boundary
 from .config import FeatureConfig
 
 
+MICROSTRUCTURE_COLUMNS = {
+    "bid_size",
+    "ask_size",
+    "depth_bid_5",
+    "depth_ask_5",
+    "trade_count",
+    "buy_volume",
+    "sell_volume",
+}
+
+
 def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None) -> pd.DataFrame:
     """Create leakage-safe quarter-hour features.
 
@@ -78,6 +89,37 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
     market["momentum_15m_minus_60m"] = market["return_15m"] - market["return_60m"]
     market["volume_5m_to_30m_ratio"] = market["volume_5m"] / market["volume_30m"]
     market["vol_regime_ratio_15m_to_60m"] = market["realized_vol_15m"] / market["realized_vol_60m"]
+
+    if MICROSTRUCTURE_COLUMNS.issubset(market.columns):
+        book_size_total = market["bid_size"] + market["ask_size"]
+        depth_total = market["depth_bid_5"] + market["depth_ask_5"]
+        flow_total = market["buy_volume"] + market["sell_volume"]
+
+        market["spread_change_1m"] = market["spread_bps"].diff()
+        market["order_book_imbalance"] = (market["bid_size"] - market["ask_size"]) / book_size_total
+        market["depth_imbalance_5"] = (market["depth_bid_5"] - market["depth_ask_5"]) / depth_total
+        market["quote_pressure"] = market["bid_size"] / market["ask_size"] - 1.0
+        market["buy_sell_volume_imbalance_1m"] = (market["buy_volume"] - market["sell_volume"]) / flow_total
+        market["aggressive_buy_share_1m"] = market["buy_volume"] / flow_total
+        market["aggressive_sell_share_1m"] = market["sell_volume"] / flow_total
+        market["average_trade_size_1m"] = flow_total / market["trade_count"]
+
+        for window in cfg.microstructure_windows_minutes:
+            market[f"trade_count_{window}m"] = market["trade_count"].rolling(window=window, min_periods=window).sum()
+            market[f"buy_volume_{window}m"] = market["buy_volume"].rolling(window=window, min_periods=window).sum()
+            market[f"sell_volume_{window}m"] = market["sell_volume"].rolling(window=window, min_periods=window).sum()
+            rolling_flow_total = market[f"buy_volume_{window}m"] + market[f"sell_volume_{window}m"]
+            market[f"trade_flow_imbalance_{window}m"] = (
+                market[f"buy_volume_{window}m"] - market[f"sell_volume_{window}m"]
+            ) / rolling_flow_total
+            market[f"average_trade_size_{window}m"] = rolling_flow_total / market[f"trade_count_{window}m"]
+            market[f"order_book_imbalance_mean_{window}m"] = market["order_book_imbalance"].rolling(
+                window=window, min_periods=window
+            ).mean()
+            market[f"depth_imbalance_mean_{window}m"] = market["depth_imbalance_5"].rolling(
+                window=window, min_periods=window
+            ).mean()
+
     market = market.replace([np.inf, -np.inf], np.nan)
 
     seconds_of_day = (

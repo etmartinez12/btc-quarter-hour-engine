@@ -7,6 +7,15 @@ import pandas as pd
 
 
 REQUIRED_COLUMNS = ("timestamp", "bid", "ask", "last_trade", "volume")
+OPTIONAL_MICROSTRUCTURE_COLUMNS = (
+    "bid_size",
+    "ask_size",
+    "depth_bid_5",
+    "depth_ask_5",
+    "trade_count",
+    "buy_volume",
+    "sell_volume",
+)
 
 
 def _normalize_market_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -16,6 +25,9 @@ def _normalize_market_frame(frame: pd.DataFrame) -> pd.DataFrame:
 
     normalized = frame.copy()
     normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True)
+    for column in OPTIONAL_MICROSTRUCTURE_COLUMNS:
+        if column in normalized.columns:
+            normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
     normalized = normalized.sort_values("timestamp").drop_duplicates("timestamp")
     return normalized.reset_index(drop=True)
 

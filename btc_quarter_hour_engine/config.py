@@ -11,6 +11,7 @@ class FeatureConfig:
     range_windows_minutes: tuple[int, ...] = (15, 30, 60)
     vwap_windows_minutes: tuple[int, ...] = (5, 15, 30, 60)
     regime_windows_minutes: tuple[int, ...] = (60, 240, 1440)
+    microstructure_windows_minutes: tuple[int, ...] = (5, 15, 30)
     rolling_extrema_window_minutes: int = 60
     volume_zscore_window_minutes: int = 60
     ema_fast_window_minutes: int = 15
