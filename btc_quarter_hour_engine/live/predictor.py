@@ -30,6 +30,8 @@ class LivePredictor:
         latest_row = features.loc[features["timestamp"].eq(latest_timestamp)].drop(
             columns=["timestamp"], errors="ignore"
         )
+        if len(latest_row) > 1:
+            raise ValueError("multiple feature rows were found for the latest quarter-hour boundary")
         if latest_row.empty or latest_row.isna().any(axis=None):
             raise ValueError("no usable feature row is available for the latest quarter-hour boundary")
 

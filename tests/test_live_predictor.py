@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 
 from btc_quarter_hour_engine.acquisition import load_sample_market_data
@@ -44,4 +45,13 @@ def test_live_predictor_rejects_invalid_probability_shape():
     predictor = LivePredictor(BadShapeModel())
 
     with pytest.raises(ValueError, match="2D array-like"):
+        predictor.predict_latest_probability(raw)
+
+
+def test_live_predictor_rejects_duplicate_latest_boundary_rows():
+    raw = load_sample_market_data().iloc[:61].copy()
+    raw = pd.concat([raw, raw.iloc[[-1]]], ignore_index=True)
+    predictor = LivePredictor(DummyModel())
+
+    with pytest.raises(ValueError, match="multiple feature rows"):
         predictor.predict_latest_probability(raw)

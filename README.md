@@ -67,7 +67,7 @@ python -m btc_quarter_hour_engine.run_baseline
 
 The sample pipeline will:
 
-- load bundled mock Coinbase-style 1-minute market data
+- load bundled mock Coinbase-style 1-minute market data from `btc_quarter_hour_engine/data/coinbase_btc_usd_1m_sample.csv`
 - compute the midpoint price series
 - extract exact quarter-hour boundary rows
 - build leakage-safe features aligned to boundary `t`
