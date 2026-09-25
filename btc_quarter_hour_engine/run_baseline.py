@@ -44,6 +44,12 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         test_size=cfg.validation.test_size,
         step_size=cfg.validation.step_size,
     )
+    n_splits = splitter.get_n_splits(X)
+    if n_splits == 0:
+        raise ValueError(
+            "walk-forward validation produced zero folds; reduce initial_train_size/test_size "
+            "or provide more quarter-hour observations"
+        )
 
     model_factories = {
         "logistic_regression": lambda: LogisticBaselineModel(

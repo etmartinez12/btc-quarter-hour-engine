@@ -33,8 +33,8 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
     extrema_window = cfg.rolling_extrema_window_minutes
     rolling_high = market["midpoint"].rolling(window=extrema_window, min_periods=extrema_window).max()
     rolling_low = market["midpoint"].rolling(window=extrema_window, min_periods=extrema_window).min()
-    market["distance_from_high_60m"] = market["midpoint"] / rolling_high - 1.0
-    market["distance_from_low_60m"] = market["midpoint"] / rolling_low - 1.0
+    market[f"distance_from_high_{extrema_window}m"] = market["midpoint"] / rolling_high - 1.0
+    market[f"distance_from_low_{extrema_window}m"] = market["midpoint"] / rolling_low - 1.0
 
     minutes_of_day = market["timestamp"].dt.hour * 60 + market["timestamp"].dt.minute
     market["tod_sin"] = np.sin(2.0 * np.pi * minutes_of_day / (24 * 60))

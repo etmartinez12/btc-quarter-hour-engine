@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 
 from btc_quarter_hour_engine.targets import build_direction_target
@@ -23,5 +25,10 @@ def test_build_direction_target_labels_up_down_and_flat_moves():
 
     assert actual.loc[0, "target"] == 1
     assert actual.loc[1, "target"] == 0
+    assert actual.loc[0, "price_change"] == 1.0
+    assert round(actual.loc[1, "log_return_15m"], 8) == round(math.log(99.0 / 101.0), 8)
     assert pd.isna(actual.loc[2, "target"])
+    assert actual.loc[2, "price_change"] == 0.0
+    assert actual.loc[2, "log_return_15m"] == 0.0
     assert pd.isna(actual.loc[3, "target"])
+    assert pd.isna(actual.loc[3, "log_return_15m"])
