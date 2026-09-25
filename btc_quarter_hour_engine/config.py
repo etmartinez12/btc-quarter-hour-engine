@@ -5,10 +5,16 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class FeatureConfig:
-    momentum_windows_minutes: tuple[int, ...] = (1, 5, 15, 30, 60)
-    volatility_windows_minutes: tuple[int, ...] = (5, 15, 30)
-    volume_windows_minutes: tuple[int, ...] = (5, 15, 30)
+    momentum_windows_minutes: tuple[int, ...] = (1, 2, 3, 5, 10, 15, 30, 60)
+    volatility_windows_minutes: tuple[int, ...] = (5, 15, 30, 60)
+    volume_windows_minutes: tuple[int, ...] = (1, 5, 15, 30, 60)
+    range_windows_minutes: tuple[int, ...] = (15, 30, 60)
+    vwap_windows_minutes: tuple[int, ...] = (5, 15, 30, 60)
+    regime_windows_minutes: tuple[int, ...] = (60, 240, 1440)
     rolling_extrema_window_minutes: int = 60
+    volume_zscore_window_minutes: int = 60
+    ema_fast_window_minutes: int = 15
+    ema_slow_window_minutes: int = 60
 
 
 @dataclass(slots=True)

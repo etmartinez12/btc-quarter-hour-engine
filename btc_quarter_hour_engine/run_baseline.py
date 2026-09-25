@@ -11,7 +11,13 @@ from .config import BaselineConfig
 from .features import build_feature_frame
 from .models import LightGBMBaselineModel, LogisticBaselineModel
 from .targets import build_direction_target
-from .validation import ExpandingWindowSplit, classification_metrics
+from .validation import (
+    ExpandingWindowSplit,
+    accuracy_by_boundary_slot,
+    accuracy_by_move_size,
+    classification_metrics,
+    confidence_accuracy_table,
+)
 
 
 def _to_builtin(value):
@@ -25,6 +31,34 @@ def _to_builtin(value):
         except (ValueError, TypeError):
             return value
     return value
+
+
+def _feature_family_summary(feature_columns: list[str]) -> dict[str, int]:
+    family_rules = {
+        "momentum": ("return_", "momentum_", "price_acceleration"),
+        "volatility": ("realized_vol_", "vol_regime_ratio_", "regime_vol_"),
+        "volume": ("volume_",),
+        "technical": (
+            "spread_bps",
+            "range_",
+            "distance_from_",
+            "rolling_extrema_distance_",
+            "price_vs_ema_",
+            "ema_spread_",
+            "price_vs_vwap_",
+        ),
+        "regime": ("regime_trend_",),
+        "time": ("tod_", "dow_", "is_weekend"),
+        "price_level": ("midpoint",),
+    }
+    summary: dict[str, int] = {}
+    for family, prefixes in family_rules.items():
+        summary[family] = sum(
+            1
+            for column in feature_columns
+            if any(column == prefix or column.startswith(prefix) for prefix in prefixes)
+        )
+    return summary
 
 
 def build_training_dataset(config: BaselineConfig | None = None) -> tuple[pd.DataFrame, list[str]]:
@@ -81,6 +115,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         "n_rows": len(dataset),
         "n_features": len(feature_columns),
         "feature_columns": feature_columns,
+        "feature_family_counts": _feature_family_summary(feature_columns),
         "models": {},
         "validation": asdict(cfg.validation),
     }
@@ -88,6 +123,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
     for model_name, factory in model_factories.items():
         fold_metrics: list[dict[str, float]] = []
         skipped_folds = 0
+        oof_parts: list[pd.DataFrame] = []
 
         for train_idx, test_idx in splitter.split(X):
             model = factory()
@@ -104,6 +140,17 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
             probabilities = model.predict_proba(X_test)[:, 1]
             predictions = (probabilities >= 0.5).astype(int)
             fold_metrics.append(classification_metrics(y_test, predictions, probabilities))
+            oof_parts.append(
+                pd.DataFrame(
+                    {
+                        "timestamp": dataset.iloc[test_idx]["timestamp"].to_numpy(),
+                        "y_true": y_test.to_numpy(),
+                        "y_pred": predictions,
+                        "y_proba": probabilities,
+                        "log_return_15m": dataset.iloc[test_idx]["log_return_15m"].to_numpy(),
+                    }
+                )
+            )
 
         if not fold_metrics:
             raise ValueError(
@@ -112,10 +159,26 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
             )
 
         metrics_frame = pd.DataFrame(fold_metrics)
+        oof_frame = pd.concat(oof_parts, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
         summary["models"][model_name] = {
             "folds": len(fold_metrics),
             "skipped_folds": skipped_folds,
             "mean_metrics": metrics_frame.mean(numeric_only=True).to_dict(),
+            "confidence_accuracy": confidence_accuracy_table(
+                oof_frame["timestamp"],
+                oof_frame["y_true"],
+                oof_frame["y_proba"],
+            ),
+            "accuracy_by_move_size": accuracy_by_move_size(
+                oof_frame["y_true"],
+                oof_frame["y_pred"],
+                oof_frame["log_return_15m"],
+            ),
+            "accuracy_by_boundary_slot": accuracy_by_boundary_slot(
+                oof_frame["timestamp"],
+                oof_frame["y_true"],
+                oof_frame["y_pred"],
+            ),
         }
 
     return summary

@@ -26,6 +26,7 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
         / market.loc[valid_midpoint, "midpoint"]
     ) * 10_000.0
     market["return_1m"] = market["log_midpoint"].diff()
+    market["price_acceleration_1m"] = market["return_1m"].diff()
 
     for window in cfg.momentum_windows_minutes:
         market[f"return_{window}m"] = market["log_midpoint"].diff(window)
@@ -36,11 +37,48 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
     for window in cfg.volume_windows_minutes:
         market[f"volume_{window}m"] = market["volume"].rolling(window=window, min_periods=window).sum()
 
+    for window in cfg.range_windows_minutes:
+        rolling_high = market["midpoint"].rolling(window=window, min_periods=window).max()
+        rolling_low = market["midpoint"].rolling(window=window, min_periods=window).min()
+        market[f"range_{window}m"] = rolling_high / rolling_low - 1.0
+        market[f"distance_from_high_{window}m"] = market["midpoint"] / rolling_high - 1.0
+        market[f"distance_from_low_{window}m"] = market["midpoint"] / rolling_low - 1.0
+
+    for window in cfg.vwap_windows_minutes:
+        rolling_notional = (market["midpoint"] * market["volume"]).rolling(window=window, min_periods=window).sum()
+        rolling_volume = market["volume"].rolling(window=window, min_periods=window).sum()
+        vwap = rolling_notional / rolling_volume
+        market[f"price_vs_vwap_{window}m"] = market["midpoint"] / vwap - 1.0
+
+    volume_zscore_window = cfg.volume_zscore_window_minutes
+    volume_mean = market["volume"].rolling(window=volume_zscore_window, min_periods=volume_zscore_window).mean()
+    volume_std = market["volume"].rolling(window=volume_zscore_window, min_periods=volume_zscore_window).std()
+    market[f"volume_zscore_{volume_zscore_window}m"] = (market["volume"] - volume_mean) / volume_std
+
+    ema_fast = market["midpoint"].ewm(span=cfg.ema_fast_window_minutes, adjust=False, min_periods=cfg.ema_fast_window_minutes).mean()
+    ema_slow = market["midpoint"].ewm(span=cfg.ema_slow_window_minutes, adjust=False, min_periods=cfg.ema_slow_window_minutes).mean()
+    market[f"price_vs_ema_{cfg.ema_fast_window_minutes}m"] = market["midpoint"] / ema_fast - 1.0
+    market[f"price_vs_ema_{cfg.ema_slow_window_minutes}m"] = market["midpoint"] / ema_slow - 1.0
+    market[f"ema_spread_{cfg.ema_fast_window_minutes}m_{cfg.ema_slow_window_minutes}m"] = ema_fast / ema_slow - 1.0
+
     extrema_window = cfg.rolling_extrema_window_minutes
     rolling_high = market["midpoint"].rolling(window=extrema_window, min_periods=extrema_window).max()
     rolling_low = market["midpoint"].rolling(window=extrema_window, min_periods=extrema_window).min()
-    market[f"distance_from_high_{extrema_window}m"] = market["midpoint"] / rolling_high - 1.0
-    market[f"distance_from_low_{extrema_window}m"] = market["midpoint"] / rolling_low - 1.0
+    market[f"rolling_extrema_distance_from_high_{extrema_window}m"] = market["midpoint"] / rolling_high - 1.0
+    market[f"rolling_extrema_distance_from_low_{extrema_window}m"] = market["midpoint"] / rolling_low - 1.0
+
+    for window in cfg.regime_windows_minutes:
+        if f"return_{window}m" not in market.columns:
+            market[f"return_{window}m"] = market["log_midpoint"].diff(window)
+        realized_vol = market["return_1m"].rolling(window=window, min_periods=window).std()
+        market[f"regime_trend_{window}m"] = market[f"return_{window}m"]
+        market[f"regime_vol_{window}m"] = realized_vol
+
+    market["momentum_5m_minus_30m"] = market["return_5m"] - market["return_30m"]
+    market["momentum_15m_minus_60m"] = market["return_15m"] - market["return_60m"]
+    market["volume_5m_to_30m_ratio"] = market["volume_5m"] / market["volume_30m"]
+    market["vol_regime_ratio_15m_to_60m"] = market["realized_vol_15m"] / market["realized_vol_60m"]
+    market = market.replace([np.inf, -np.inf], np.nan)
 
     seconds_of_day = (
         market["timestamp"].dt.hour * 3600

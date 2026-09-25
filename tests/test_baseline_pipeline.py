@@ -34,3 +34,14 @@ def test_classification_metrics_handles_single_class_test_fold():
     assert metrics["brier_score"] >= 0.0
     assert metrics["log_loss"] != metrics["log_loss"]
     assert metrics["roc_auc"] != metrics["roc_auc"]
+
+
+def test_walk_forward_benchmark_includes_phase_two_diagnostics():
+    summary = run_walk_forward_benchmark()
+    model_summary = summary["models"]["logistic_regression"]
+
+    assert "feature_family_counts" in summary
+    assert summary["feature_family_counts"]["regime"] > 0
+    assert len(model_summary["confidence_accuracy"]) >= 2
+    assert len(model_summary["accuracy_by_move_size"]) == 6
+    assert len(model_summary["accuracy_by_boundary_slot"]) == 4

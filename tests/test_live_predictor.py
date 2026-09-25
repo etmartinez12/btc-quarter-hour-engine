@@ -24,7 +24,7 @@ def test_live_predictor_rejects_non_boundary_latest_timestamp():
 
 
 def test_live_predictor_returns_probability_for_boundary_aligned_input():
-    raw = load_sample_market_data().iloc[:61].copy()
+    raw = load_sample_market_data().iloc[:1441].copy()
     predictor = LivePredictor(DummyModel())
 
     actual = predictor.predict_latest_probability(raw)
@@ -41,7 +41,7 @@ def test_live_predictor_rejects_boundary_when_latest_features_are_not_usable():
 
 
 def test_live_predictor_rejects_invalid_probability_shape():
-    raw = load_sample_market_data().iloc[:61].copy()
+    raw = load_sample_market_data().iloc[:1441].copy()
     predictor = LivePredictor(BadShapeModel())
 
     with pytest.raises(ValueError, match="2D array-like"):
@@ -49,7 +49,7 @@ def test_live_predictor_rejects_invalid_probability_shape():
 
 
 def test_live_predictor_rejects_duplicate_latest_boundary_rows():
-    raw = load_sample_market_data().iloc[:61].copy()
+    raw = load_sample_market_data().iloc[:1441].copy()
     raw = pd.concat([raw, raw.iloc[[-1]]], ignore_index=True)
     predictor = LivePredictor(DummyModel())
 

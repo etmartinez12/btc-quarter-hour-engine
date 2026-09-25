@@ -8,14 +8,14 @@ Bitcoin quarter-hour prediction baseline focused on one reproducible research pr
 - **Prediction target:** whether `P[t+15m] > P[t]`
 - **Leakage rule:** every feature for timestamp `t` uses only information available at or before `t`
 
-This repository provides the first executable milestone:
+This repository now covers the Phase 1 baseline plus the first Phase 2 feature-engineering expansion:
 
 1. historical raw BTC market data ingestion skeleton
 2. exact quarter-hour boundary extraction
-3. leakage-safe feature engineering
+3. leakage-safe feature engineering with momentum, volatility, volume, technical, and regime families
 4. baseline models (logistic regression and LightGBM)
 5. walk-forward validation
-6. minimal evaluation pipeline on bundled sample data
+6. minimal evaluation pipeline on bundled sample data, including confidence, move-size, and boundary-slot diagnostics
 
 ## Canonical price definition
 
@@ -74,6 +74,7 @@ The sample pipeline will:
 - construct targets from `t` to `t+15m`
 - run expanding walk-forward validation
 - print aggregate metrics for logistic regression and LightGBM
+- report accuracy by confidence threshold, move-size bucket, and quarter-hour slot
 
 ## Testing
 
@@ -87,10 +88,12 @@ The unit tests cover:
 - walk-forward split ordering and non-overlap
 - zero-fold walk-forward benchmark rejection
 - live predictor boundary freshness checks
+- Phase 2 feature-family generation on boundary rows
+- Phase 2 benchmark diagnostics in the walk-forward summary
 
 ## Design notes
 
-- The baseline intentionally uses a small, auditable feature set.
+- Phase 2 expands the feature space while keeping every feature computable from information available at or before boundary `t`.
 - Features are computed from historical windows ending at `t`; no feature reaches into `t+15m`.
 - Flat moves where `P[t+15m] == P[t]` are left unlabeled and excluded from supervised training.
 - The package layout is designed for later expansion into XGBoost, sequence models, microstructure models, and ensembles without changing the target definition.
