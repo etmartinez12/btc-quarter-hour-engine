@@ -28,6 +28,12 @@ class LivePredictor:
 
         features = build_feature_frame(market_frame, self.feature_config)
         latest_row = features.drop(columns=["timestamp"], errors="ignore").tail(1)
+        if latest_row.empty:
+            raise ValueError("no boundary-aligned feature row is available for the provided market data")
+
         probabilities = np.asarray(self.model.predict_proba(latest_row))
-        probability_up = probabilities[0, 1]
+        if probabilities.ndim != 2 or probabilities.shape[0] == 0 or probabilities.shape[1] < 2:
+            raise ValueError("predict_proba must return a 2D array-like with class probabilities")
+
+        probability_up = probabilities[0][1]
         return float(probability_up)

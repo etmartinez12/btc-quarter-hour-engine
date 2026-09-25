@@ -15,3 +15,12 @@ def test_live_predictor_rejects_non_boundary_latest_timestamp():
 
     with pytest.raises(ValueError, match="exact quarter-hour boundary"):
         predictor.predict_latest_probability(raw)
+
+
+def test_live_predictor_returns_probability_for_boundary_aligned_input():
+    raw = load_sample_market_data().iloc[:16].copy()
+    predictor = LivePredictor(DummyModel())
+
+    actual = predictor.predict_latest_probability(raw)
+
+    assert actual == 0.6

@@ -17,7 +17,9 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
     cfg = config or FeatureConfig()
     market = frame.copy().sort_values("timestamp").reset_index(drop=True)
     market["midpoint"] = compute_midpoint(market)
-    market["log_midpoint"] = np.log(market["midpoint"])
+    valid_midpoint = market["midpoint"].gt(0)
+    market["log_midpoint"] = np.nan
+    market.loc[valid_midpoint, "log_midpoint"] = np.log(market.loc[valid_midpoint, "midpoint"])
     market["spread_bps"] = ((market["ask"] - market["bid"]) / market["midpoint"]) * 10_000.0
     market["return_1m"] = market["log_midpoint"].diff()
 
