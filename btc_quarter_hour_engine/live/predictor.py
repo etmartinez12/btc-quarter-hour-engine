@@ -27,9 +27,11 @@ class LivePredictor:
             )
 
         features = build_feature_frame(market_frame, self.feature_config)
-        latest_row = features.drop(columns=["timestamp"], errors="ignore").tail(1)
-        if latest_row.empty:
-            raise ValueError("no boundary-aligned feature row is available for the provided market data")
+        latest_row = features.loc[features["timestamp"].eq(latest_timestamp)].drop(
+            columns=["timestamp"], errors="ignore"
+        )
+        if latest_row.empty or latest_row.isna().any(axis=None):
+            raise ValueError("no usable feature row is available for the latest quarter-hour boundary")
 
         probabilities = np.asarray(self.model.predict_proba(latest_row))
         if probabilities.ndim != 2 or probabilities.shape[0] == 0 or probabilities.shape[1] < 2:

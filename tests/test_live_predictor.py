@@ -18,9 +18,17 @@ def test_live_predictor_rejects_non_boundary_latest_timestamp():
 
 
 def test_live_predictor_returns_probability_for_boundary_aligned_input():
-    raw = load_sample_market_data().iloc[:16].copy()
+    raw = load_sample_market_data().iloc[:61].copy()
     predictor = LivePredictor(DummyModel())
 
     actual = predictor.predict_latest_probability(raw)
 
     assert actual == 0.6
+
+
+def test_live_predictor_rejects_boundary_when_latest_features_are_not_usable():
+    raw = load_sample_market_data().iloc[:16].copy()
+    predictor = LivePredictor(DummyModel())
+
+    with pytest.raises(ValueError, match="no usable feature row"):
+        predictor.predict_latest_probability(raw)

@@ -38,9 +38,13 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
     market[f"distance_from_high_{extrema_window}m"] = market["midpoint"] / rolling_high - 1.0
     market[f"distance_from_low_{extrema_window}m"] = market["midpoint"] / rolling_low - 1.0
 
-    minutes_of_day = market["timestamp"].dt.hour * 60 + market["timestamp"].dt.minute
-    market["tod_sin"] = np.sin(2.0 * np.pi * minutes_of_day / (24 * 60))
-    market["tod_cos"] = np.cos(2.0 * np.pi * minutes_of_day / (24 * 60))
+    seconds_of_day = (
+        market["timestamp"].dt.hour * 3600
+        + market["timestamp"].dt.minute * 60
+        + market["timestamp"].dt.second
+    )
+    market["tod_sin"] = np.sin(2.0 * np.pi * seconds_of_day / (24 * 60 * 60))
+    market["tod_cos"] = np.cos(2.0 * np.pi * seconds_of_day / (24 * 60 * 60))
     market["dow_sin"] = np.sin(2.0 * np.pi * market["timestamp"].dt.dayofweek / 7.0)
     market["dow_cos"] = np.cos(2.0 * np.pi * market["timestamp"].dt.dayofweek / 7.0)
     market["is_weekend"] = market["timestamp"].dt.dayofweek.ge(5).astype(int)

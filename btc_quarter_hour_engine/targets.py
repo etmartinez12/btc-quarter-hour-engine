@@ -22,6 +22,6 @@ def build_direction_target(boundary_prices: pd.DataFrame, price_column: str = "m
         dataset.loc[valid_prices, "price_t_plus_15m"] / dataset.loc[valid_prices, "price_t"]
     )
     dataset["target"] = pd.Series(pd.NA, index=dataset.index, dtype="Int64")
-    dataset.loc[dataset["price_change"] > 0, "target"] = 1
-    dataset.loc[dataset["price_change"] < 0, "target"] = 0
+    dataset.loc[valid_prices & dataset["price_change"].gt(0), "target"] = 1
+    dataset.loc[valid_prices & dataset["price_change"].lt(0), "target"] = 0
     return dataset

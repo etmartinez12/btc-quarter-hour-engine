@@ -51,3 +51,4 @@ def test_build_direction_target_avoids_infinite_returns_for_non_positive_prices(
     actual = build_direction_target(boundaries)
 
     assert pd.isna(actual.loc[0, "log_return_15m"])
+    assert pd.isna(actual.loc[0, "target"])
