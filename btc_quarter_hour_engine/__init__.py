@@ -1,5 +1,5 @@
 """Bitcoin quarter-hour prediction engine baseline package."""
 
-from .config import BaselineConfig, FeatureConfig, ValidationConfig
+from .config import BaselineConfig, EnsembleConfig, FeatureConfig, ValidationConfig
 
-__all__ = ["BaselineConfig", "FeatureConfig", "ValidationConfig"]
+__all__ = ["BaselineConfig", "EnsembleConfig", "FeatureConfig", "ValidationConfig"]

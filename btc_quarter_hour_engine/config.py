@@ -26,10 +26,17 @@ class ValidationConfig:
 
 
 @dataclass(slots=True)
+class EnsembleConfig:
+    weighted_metric: str = "accuracy"
+    min_weight: float = 1e-6
+
+
+@dataclass(slots=True)
 class BaselineConfig:
     boundary_freq: str = "15min"
     feature: FeatureConfig = field(default_factory=FeatureConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
     logistic_max_iter: int = 1000
     extra_trees_n_estimators: int = 300
     extra_trees_max_depth: int | None = 6

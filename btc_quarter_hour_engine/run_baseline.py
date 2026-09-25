@@ -8,6 +8,7 @@ import pandas as pd
 from .acquisition import load_sample_market_data
 from .boundaries import build_boundary_price_frame
 from .config import BaselineConfig
+from .ensemble import build_consensus_diagnostics, build_simple_average_ensemble, build_validation_weighted_ensemble
 from .features import build_feature_frame
 from .models import ExtraTreesBaselineModel, LightGBMBaselineModel, LogisticBaselineModel, XGBoostBaselineModel
 from .targets import build_direction_target
@@ -83,6 +84,28 @@ def _feature_family_summary(feature_columns: list[str]) -> dict[str, int]:
     return summary
 
 
+def _align_oof_predictions(model_oof_predictions: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    model_names = list(model_oof_predictions)
+    first_name = model_names[0]
+    aligned = model_oof_predictions[first_name][["timestamp", "fold_number", "y_true", "log_return_15m"]].copy()
+    aligned = aligned.rename(
+        columns={
+            "y_true": "y_true",
+            "log_return_15m": "log_return_15m",
+        }
+    )
+
+    for model_name in model_names:
+        model_frame = model_oof_predictions[model_name][["timestamp", "fold_number", "y_pred", "y_proba"]].rename(
+            columns={
+                "y_pred": f"{model_name}_pred",
+                "y_proba": f"{model_name}_proba",
+            }
+        )
+        aligned = aligned.merge(model_frame, on=["timestamp", "fold_number"], how="inner")
+    return aligned.sort_values(["fold_number", "timestamp"]).reset_index(drop=True)
+
+
 def build_training_dataset(config: BaselineConfig | None = None) -> tuple[pd.DataFrame, list[str]]:
     cfg = config or BaselineConfig()
     raw = load_sample_market_data()
@@ -149,6 +172,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         "n_features": len(feature_columns),
         "feature_columns": feature_columns,
         "feature_family_counts": _feature_family_summary(feature_columns),
+        "base_models": list(model_factories),
         "models": {},
         "validation": asdict(cfg.validation),
     }
@@ -177,6 +201,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
             oof_parts.append(
                 pd.DataFrame(
                     {
+                        "fold_number": [len(fold_metrics) + skipped_folds] * len(X_test),
                         "timestamp": dataset.iloc[test_idx]["timestamp"].to_numpy(),
                         "y_true": y_test.to_numpy(),
                         "y_pred": predictions,
@@ -216,8 +241,48 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         }
         model_oof_predictions[model_name] = oof_frame
 
+    aligned_oof = _align_oof_predictions(model_oof_predictions)
+    ensemble_model_names = list(model_oof_predictions)
+    simple_average_oof = build_simple_average_ensemble(aligned_oof, ensemble_model_names)
+    weighted_average_oof, weight_history = build_validation_weighted_ensemble(
+        aligned_oof,
+        ensemble_model_names,
+        metric=cfg.ensemble.weighted_metric,
+        min_weight=cfg.ensemble.min_weight,
+    )
+
+    summary["ensembles"] = {}
+    for ensemble_name, ensemble_frame in {
+        "simple_average": simple_average_oof,
+        "validation_weighted_average": weighted_average_oof,
+    }.items():
+        summary["ensembles"][ensemble_name] = {
+            "mean_metrics": classification_metrics(
+                ensemble_frame["y_true"],
+                ensemble_frame["y_pred"],
+                ensemble_frame["y_proba"],
+            ),
+            "confidence_accuracy": confidence_accuracy_table(
+                ensemble_frame["timestamp"],
+                ensemble_frame["y_true"],
+                ensemble_frame["y_proba"],
+            ),
+            "accuracy_by_move_size": accuracy_by_move_size(
+                ensemble_frame["y_true"],
+                ensemble_frame["y_pred"],
+                ensemble_frame["log_return_15m"],
+            ),
+            "accuracy_by_boundary_slot": accuracy_by_boundary_slot(
+                ensemble_frame["timestamp"],
+                ensemble_frame["y_true"],
+                ensemble_frame["y_pred"],
+            ),
+        }
+
+    summary["ensembles"]["validation_weighted_average"]["weight_history"] = weight_history
     summary["model_comparison"] = {
-        "pairwise_prediction_agreement": pairwise_prediction_agreement(model_oof_predictions)
+        "pairwise_prediction_agreement": pairwise_prediction_agreement(model_oof_predictions),
+        "ensemble_consensus": build_consensus_diagnostics(aligned_oof, ensemble_model_names),
     }
     return summary
 

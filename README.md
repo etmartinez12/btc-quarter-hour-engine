@@ -8,15 +8,16 @@ Bitcoin quarter-hour prediction baseline focused on one reproducible research pr
 - **Prediction target:** whether `P[t+15m] > P[t]`
 - **Leakage rule:** every feature for timestamp `t` uses only information available at or before `t`
 
-This repository now covers the Phase 1 baseline, the Phase 2 feature-engineering expansion, the Phase 3 microstructure layer, and the first Phase 4 model-diversity step:
+This repository now covers the Phase 1 baseline, the Phase 2 feature-engineering expansion, the Phase 3 microstructure layer, the first Phase 4 model-diversity step, and the first Phase 5 ensemble layer:
 
 1. historical raw BTC market data ingestion skeleton
 2. exact quarter-hour boundary extraction
 3. leakage-safe feature engineering with momentum, volatility, volume, technical, regime, and microstructure families
 4. baseline model set spanning logistic regression, ExtraTrees, LightGBM, and XGBoost
 5. walk-forward validation
-6. minimal evaluation pipeline on bundled sample data, including confidence, move-size, boundary-slot, and cross-model agreement diagnostics
+6. minimal evaluation pipeline on bundled sample data, including confidence, move-size, boundary-slot, cross-model agreement, and first-stage ensemble diagnostics
 7. microstructure-ready sample schema with order-book and trade-flow style inputs
+8. leakage-safe simple-average and validation-weighted ensemble baselines
 
 ## Canonical price definition
 
@@ -41,7 +42,8 @@ btc_quarter_hour_engine/
   boundaries/    exact quarter-hour boundary extraction
   features.py    leakage-safe feature engineering
   targets.py     quarter-hour labels and returns
-  models/        logistic regression and LightGBM baselines
+  models/        logistic regression, ExtraTrees, LightGBM, and XGBoost baselines
+  ensemble/      simple-average and weighted ensemble utilities
   validation/    walk-forward splits and metrics
   live/          minimal live prediction interface
   config.py      shared configuration dataclasses
@@ -78,6 +80,7 @@ The sample pipeline will:
 - print aggregate metrics for logistic regression, ExtraTrees, LightGBM, and XGBoost
 - report accuracy by confidence threshold, move-size bucket, and quarter-hour slot
 - report pairwise prediction agreement and probability correlation across model families
+- report simple-average and validation-weighted ensemble benchmark outputs plus consensus diagnostics
 
 ## Testing
 
@@ -94,12 +97,14 @@ The unit tests cover:
 - Phase 2/3 feature-family generation on boundary rows
 - Phase 4 multi-model benchmark coverage and comparison outputs
 - Phase 3 microstructure sample-data coverage
+- Phase 5 ensemble benchmark outputs and leakage-safe weighting behavior
 
 ## Design notes
 
 - Phase 2 expands the feature space while keeping every feature computable from information available at or before boundary `t`.
 - Phase 3 adds microstructure-style features such as order-book imbalance, trade-flow imbalance, and average trade size using only contemporaneous or historical values up to boundary `t`.
 - Phase 4 begins the model-diversity stage from the original roadmap by comparing linear, bagged-tree, boosted-tree, and gradient-boosted baselines under the same walk-forward protocol.
+- Phase 5 starts the ensemble stage with simple averaging and validation-weighted averaging computed from chronologically prior fold performance only.
 - Features are computed from historical windows ending at `t`; no feature reaches into `t+15m`.
 - Flat moves where `P[t+15m] == P[t]` are left unlabeled and excluded from supervised training.
 - The package layout is designed for later expansion into XGBoost, sequence models, microstructure models, and ensembles without changing the target definition.

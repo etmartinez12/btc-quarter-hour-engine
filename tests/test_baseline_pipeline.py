@@ -22,6 +22,7 @@ def test_walk_forward_benchmark_summary_is_json_serializable():
     serialized = json.dumps(_to_builtin(summary))
 
     assert "\"models\"" in serialized
+    assert "\"ensembles\"" in serialized
 
 
 def test_classification_metrics_handles_single_class_test_fold():
@@ -39,6 +40,8 @@ def test_classification_metrics_handles_single_class_test_fold():
 def test_walk_forward_benchmark_includes_phase_two_diagnostics():
     summary = run_walk_forward_benchmark()
     model_summary = summary["models"]["logistic_regression"]
+    simple_average = summary["ensembles"]["simple_average"]
+    weighted_average = summary["ensembles"]["validation_weighted_average"]
 
     assert "feature_family_counts" in summary
     assert summary["feature_family_counts"]["regime"] > 0
@@ -48,3 +51,7 @@ def test_walk_forward_benchmark_includes_phase_two_diagnostics():
     assert len(model_summary["accuracy_by_move_size"]) == 6
     assert len(model_summary["accuracy_by_boundary_slot"]) == 4
     assert len(summary["model_comparison"]["pairwise_prediction_agreement"]) == 6
+    assert {"simple_average", "validation_weighted_average"} <= set(summary["ensembles"])
+    assert "mean_metrics" in simple_average
+    assert len(weighted_average["weight_history"]) > 0
+    assert len(summary["model_comparison"]["ensemble_consensus"]["accuracy_by_votes_up"]) == 5
