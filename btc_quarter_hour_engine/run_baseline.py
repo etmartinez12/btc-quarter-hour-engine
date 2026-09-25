@@ -9,7 +9,7 @@ from .acquisition import load_sample_market_data
 from .boundaries import build_boundary_price_frame
 from .config import BaselineConfig
 from .features import build_feature_frame
-from .models import LightGBMBaselineModel, LogisticBaselineModel
+from .models import ExtraTreesBaselineModel, LightGBMBaselineModel, LogisticBaselineModel, XGBoostBaselineModel
 from .targets import build_direction_target
 from .validation import (
     ExpandingWindowSplit,
@@ -17,6 +17,7 @@ from .validation import (
     accuracy_by_move_size,
     classification_metrics,
     confidence_accuracy_table,
+    pairwise_prediction_agreement,
 )
 
 
@@ -124,10 +125,21 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
             max_iter=cfg.logistic_max_iter,
             random_state=cfg.random_state,
         ),
+        "extra_trees": lambda: ExtraTreesBaselineModel(
+            n_estimators=cfg.extra_trees_n_estimators,
+            max_depth=cfg.extra_trees_max_depth,
+            random_state=cfg.random_state,
+        ),
         "lightgbm": lambda: LightGBMBaselineModel(
             n_estimators=cfg.lightgbm_n_estimators,
             learning_rate=cfg.lightgbm_learning_rate,
             num_leaves=cfg.lightgbm_num_leaves,
+            random_state=cfg.random_state,
+        ),
+        "xgboost": lambda: XGBoostBaselineModel(
+            n_estimators=cfg.xgboost_n_estimators,
+            learning_rate=cfg.xgboost_learning_rate,
+            max_depth=cfg.xgboost_max_depth,
             random_state=cfg.random_state,
         ),
     }
@@ -140,6 +152,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         "models": {},
         "validation": asdict(cfg.validation),
     }
+    model_oof_predictions: dict[str, pd.DataFrame] = {}
 
     for model_name, factory in model_factories.items():
         fold_metrics: list[dict[str, float]] = []
@@ -201,7 +214,11 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
                 oof_frame["y_pred"],
             ),
         }
+        model_oof_predictions[model_name] = oof_frame
 
+    summary["model_comparison"] = {
+        "pairwise_prediction_agreement": pairwise_prediction_agreement(model_oof_predictions)
+    }
     return summary
 
 

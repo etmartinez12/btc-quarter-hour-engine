@@ -119,3 +119,30 @@ def accuracy_by_boundary_slot(timestamps, y_true, y_pred) -> list[dict[str, Any]
             }
         )
     return rows
+
+
+def pairwise_prediction_agreement(model_predictions: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
+    model_names = list(model_predictions)
+    rows: list[dict[str, Any]] = []
+
+    for idx, left_name in enumerate(model_names):
+        left = model_predictions[left_name][["timestamp", "y_pred", "y_proba"]].rename(
+            columns={"y_pred": f"{left_name}_pred", "y_proba": f"{left_name}_proba"}
+        )
+        for right_name in model_names[idx + 1 :]:
+            right = model_predictions[right_name][["timestamp", "y_pred", "y_proba"]].rename(
+                columns={"y_pred": f"{right_name}_pred", "y_proba": f"{right_name}_proba"}
+            )
+            merged = left.merge(right, on="timestamp", how="inner")
+            agreement = (merged[f"{left_name}_pred"] == merged[f"{right_name}_pred"]).mean()
+            proba_corr = merged[f"{left_name}_proba"].corr(merged[f"{right_name}_proba"])
+            rows.append(
+                {
+                    "left_model": left_name,
+                    "right_model": right_name,
+                    "n_common_predictions": int(len(merged)),
+                    "prediction_agreement": float(agreement) if len(merged) else float("nan"),
+                    "probability_correlation": float(proba_corr) if pd.notna(proba_corr) else float("nan"),
+                }
+            )
+    return rows

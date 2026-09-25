@@ -43,6 +43,8 @@ def test_walk_forward_benchmark_includes_phase_two_diagnostics():
     assert "feature_family_counts" in summary
     assert summary["feature_family_counts"]["regime"] > 0
     assert summary["feature_family_counts"]["microstructure"] > 0
+    assert {"logistic_regression", "lightgbm", "extra_trees", "xgboost"} <= set(summary["models"])
     assert len(model_summary["confidence_accuracy"]) >= 2
     assert len(model_summary["accuracy_by_move_size"]) == 6
     assert len(model_summary["accuracy_by_boundary_slot"]) == 4
+    assert len(summary["model_comparison"]["pairwise_prediction_agreement"]) == 6

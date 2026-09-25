@@ -16,7 +16,8 @@ dependencies = [
   "numpy>=1.26,<3",
   "pandas>=2.2,<3",
   "scikit-learn>=1.5,<2",
-  "lightgbm>=4.5,<5"
+  "lightgbm>=4.5,<5",
+  "xgboost>=2.1,<4"
 ]
 
 [project.optional-dependencies]

@@ -8,14 +8,14 @@ Bitcoin quarter-hour prediction baseline focused on one reproducible research pr
 - **Prediction target:** whether `P[t+15m] > P[t]`
 - **Leakage rule:** every feature for timestamp `t` uses only information available at or before `t`
 
-This repository now covers the Phase 1 baseline, the Phase 2 feature-engineering expansion, and the first Phase 3 microstructure layer:
+This repository now covers the Phase 1 baseline, the Phase 2 feature-engineering expansion, the Phase 3 microstructure layer, and the first Phase 4 model-diversity step:
 
 1. historical raw BTC market data ingestion skeleton
 2. exact quarter-hour boundary extraction
 3. leakage-safe feature engineering with momentum, volatility, volume, technical, regime, and microstructure families
-4. baseline models (logistic regression and LightGBM)
+4. baseline model set spanning logistic regression, ExtraTrees, LightGBM, and XGBoost
 5. walk-forward validation
-6. minimal evaluation pipeline on bundled sample data, including confidence, move-size, and boundary-slot diagnostics
+6. minimal evaluation pipeline on bundled sample data, including confidence, move-size, boundary-slot, and cross-model agreement diagnostics
 7. microstructure-ready sample schema with order-book and trade-flow style inputs
 
 ## Canonical price definition
@@ -75,8 +75,9 @@ The sample pipeline will:
 - build leakage-safe features aligned to boundary `t`
 - construct targets from `t` to `t+15m`
 - run expanding walk-forward validation
-- print aggregate metrics for logistic regression and LightGBM
+- print aggregate metrics for logistic regression, ExtraTrees, LightGBM, and XGBoost
 - report accuracy by confidence threshold, move-size bucket, and quarter-hour slot
+- report pairwise prediction agreement and probability correlation across model families
 
 ## Testing
 
@@ -91,13 +92,14 @@ The unit tests cover:
 - zero-fold walk-forward benchmark rejection
 - live predictor boundary freshness checks
 - Phase 2/3 feature-family generation on boundary rows
-- Phase 2 benchmark diagnostics in the walk-forward summary
+- Phase 4 multi-model benchmark coverage and comparison outputs
 - Phase 3 microstructure sample-data coverage
 
 ## Design notes
 
 - Phase 2 expands the feature space while keeping every feature computable from information available at or before boundary `t`.
 - Phase 3 adds microstructure-style features such as order-book imbalance, trade-flow imbalance, and average trade size using only contemporaneous or historical values up to boundary `t`.
+- Phase 4 begins the model-diversity stage from the original roadmap by comparing linear, bagged-tree, boosted-tree, and gradient-boosted baselines under the same walk-forward protocol.
 - Features are computed from historical windows ending at `t`; no feature reaches into `t+15m`.
 - Flat moves where `P[t+15m] == P[t]` are left unlabeled and excluded from supervised training.
 - The package layout is designed for later expansion into XGBoost, sequence models, microstructure models, and ensembles without changing the target definition.

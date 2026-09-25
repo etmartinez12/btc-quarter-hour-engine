@@ -31,7 +31,12 @@ class BaselineConfig:
     feature: FeatureConfig = field(default_factory=FeatureConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     logistic_max_iter: int = 1000
+    extra_trees_n_estimators: int = 300
+    extra_trees_max_depth: int | None = 6
     lightgbm_n_estimators: int = 200
     lightgbm_learning_rate: float = 0.05
     lightgbm_num_leaves: int = 31
+    xgboost_n_estimators: int = 250
+    xgboost_learning_rate: float = 0.05
+    xgboost_max_depth: int = 4
     random_state: int = 42
