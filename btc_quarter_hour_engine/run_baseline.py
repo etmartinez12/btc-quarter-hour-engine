@@ -74,6 +74,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
 
     for model_name, factory in model_factories.items():
         fold_metrics: list[dict[str, float]] = []
+        skipped_folds = 0
 
         for train_idx, test_idx in splitter.split(X):
             model = factory()
@@ -82,14 +83,25 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
             X_test = X.iloc[test_idx]
             y_test = y.iloc[test_idx]
 
+            if y_train.nunique() < 2:
+                skipped_folds += 1
+                continue
+
             model.fit(X_train, y_train)
             probabilities = model.predict_proba(X_test)[:, 1]
             predictions = (probabilities >= 0.5).astype(int)
             fold_metrics.append(classification_metrics(y_test, predictions, probabilities))
 
+        if not fold_metrics:
+            raise ValueError(
+                f"walk-forward validation produced no trainable folds for {model_name}; "
+                "at least one training split must contain both classes"
+            )
+
         metrics_frame = pd.DataFrame(fold_metrics)
         summary["models"][model_name] = {
             "folds": len(fold_metrics),
+            "skipped_folds": skipped_folds,
             "mean_metrics": metrics_frame.mean(numeric_only=True).to_dict(),
         }
 

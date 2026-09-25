@@ -26,6 +26,7 @@ def build_boundary_price_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """
 
     market = frame.copy()
+    market["timestamp"] = pd.to_datetime(market["timestamp"], utc=True)
     market["midpoint"] = compute_midpoint(market)
     mask = is_quarter_hour_boundary(market["timestamp"])
     boundaries = market.loc[mask, ["timestamp", "bid", "ask", "midpoint", "volume"]].copy()
