@@ -14,6 +14,19 @@ from .targets import build_direction_target
 from .validation import ExpandingWindowSplit, classification_metrics
 
 
+def _to_builtin(value):
+    if isinstance(value, dict):
+        return {key: _to_builtin(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_builtin(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
 def build_training_dataset(config: BaselineConfig | None = None) -> tuple[pd.DataFrame, list[str]]:
     cfg = config or BaselineConfig()
     raw = load_sample_market_data()
@@ -110,7 +123,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
 
 def main() -> None:
     summary = run_walk_forward_benchmark()
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    print(json.dumps(_to_builtin(summary), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

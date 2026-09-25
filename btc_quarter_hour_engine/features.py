@@ -20,7 +20,11 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
     valid_midpoint = market["midpoint"].gt(0)
     market["log_midpoint"] = np.nan
     market.loc[valid_midpoint, "log_midpoint"] = np.log(market.loc[valid_midpoint, "midpoint"])
-    market["spread_bps"] = ((market["ask"] - market["bid"]) / market["midpoint"]) * 10_000.0
+    market["spread_bps"] = np.nan
+    market.loc[valid_midpoint, "spread_bps"] = (
+        (market.loc[valid_midpoint, "ask"] - market.loc[valid_midpoint, "bid"])
+        / market.loc[valid_midpoint, "midpoint"]
+    ) * 10_000.0
     market["return_1m"] = market["log_midpoint"].diff()
 
     for window in cfg.momentum_windows_minutes:

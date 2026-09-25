@@ -50,7 +50,6 @@ btc_quarter_hour_engine/
 ## Installation
 
 ```bash
-pip install -e .
 pip install -e .[dev]
 ```
 
