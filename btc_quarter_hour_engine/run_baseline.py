@@ -16,9 +16,11 @@ from .validation import (
     ExpandingWindowSplit,
     accuracy_by_boundary_slot,
     accuracy_by_move_size,
+    build_common_oof_evaluation_frame,
     classification_metrics,
     confidence_accuracy_table,
     pairwise_prediction_agreement,
+    score_naive_baselines,
 )
 
 
@@ -181,6 +183,8 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         "validation": asdict(cfg.validation),
     }
     model_oof_predictions: dict[str, pd.DataFrame] = {}
+    dataset_with_history = dataset.copy()
+    dataset_with_history["price_t_minus_15m"] = dataset_with_history["midpoint"].shift(1)
 
     for model_name, factory in model_factories.items():
         fold_metrics: list[dict[str, float]] = []
@@ -206,11 +210,15 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
                 pd.DataFrame(
                     {
                         "fold_number": [len(fold_metrics) + skipped_folds] * len(X_test),
-                        "timestamp": dataset.iloc[test_idx]["timestamp"].to_numpy(),
+                        "timestamp": dataset_with_history.iloc[test_idx]["timestamp"].to_numpy(),
                         "y_true": y_test.to_numpy(),
                         "y_pred": predictions,
                         "y_proba": probabilities,
-                        "log_return_15m": dataset.iloc[test_idx]["log_return_15m"].to_numpy(),
+                        "log_return_15m": dataset_with_history.iloc[test_idx]["log_return_15m"].to_numpy(),
+                        "midpoint": dataset_with_history.iloc[test_idx]["midpoint"].to_numpy(),
+                        "price_t_minus_15m": dataset_with_history.iloc[test_idx]["price_t_minus_15m"].to_numpy(),
+                        "return_1m": dataset_with_history.iloc[test_idx]["return_1m"].to_numpy(),
+                        "return_5m": dataset_with_history.iloc[test_idx]["return_5m"].to_numpy(),
                     }
                 )
             )
@@ -246,6 +254,14 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         model_oof_predictions[model_name] = oof_frame
 
     aligned_oof = _align_oof_predictions(model_oof_predictions)
+    common_oof = build_common_oof_evaluation_frame(model_oof_predictions, random_state=cfg.random_state)
+    summary["common_oof_population"] = {
+        "n_observations": int(len(common_oof)),
+        "n_folds": int(common_oof["fold_number"].nunique()) if len(common_oof) else 0,
+        "timestamp_min": str(common_oof["timestamp"].min()) if len(common_oof) else None,
+        "timestamp_max": str(common_oof["timestamp"].max()) if len(common_oof) else None,
+    }
+    summary["naive_baselines"] = score_naive_baselines(common_oof)
     ensemble_model_names = list(model_oof_predictions)
     simple_average_oof = build_simple_average_ensemble(aligned_oof, ensemble_model_names)
     weighted_average_oof, weight_history = build_validation_weighted_ensemble(
