@@ -67,17 +67,74 @@ This requirement is enforced through the shared `normalize_market_frame()` contr
 
 ```text
 btc_quarter_hour_engine/
-  acquisition/   raw/sample data loading
-  boundaries/    exact quarter-hour boundary extraction
-  features.py    leakage-safe feature engineering
-  targets.py     quarter-hour labels and returns
-  models/        logistic regression, ExtraTrees, LightGBM, and XGBoost baselines
-  ensemble/      simple-average and weighted ensemble utilities
-  validation/    OOF integrity, naïve benchmarks, row-based demo validation, and time-based research splitting
-  live/          minimal live prediction interface
-  config.py      shared configuration dataclasses
+  acquisition/
+    loader.py        raw/sample data loading
+    coinbase_rest.py Coinbase Advanced Trade public REST client
+    config.py        acquisition configuration
+    chunking.py      historical candle chunk planning
+  storage/
+    raw.py           immutable content-addressed raw payload store
+    parquet.py       normalized Parquet output
+    manifest.py      acquisition manifests and dataset IDs
+  boundaries/         exact quarter-hour boundary extraction
+  features.py         leakage-safe feature engineering
+  targets.py          quarter-hour labels and returns
+  models/             logistic regression, ExtraTrees, LightGBM, and XGBoost baselines
+  ensemble/           simple-average and weighted ensemble utilities
+  validation/         OOF integrity, naïve benchmarks, row-based demo validation, and time-based research splitting
+  live/               minimal live prediction interface
+  config.py           shared configuration dataclasses
   run_baseline.py
+
+data_lake/            local-only acquisition output, gitignored
 ```
+
+## Real Coinbase Data Acquisition
+
+The project now includes a public Coinbase Advanced Trade REST acquisition layer for research context and backfill data. Historical `ONE_MINUTE` candles are acquired as `historical_context_only` observations and remain separate from the canonical exact-boundary target definition. Source payloads are preserved immutably and content-addressed via SHA-256, while normalized analytical outputs are stored as Parquet datasets with manifest provenance for reproducibility.
+
+## Canonical Price Eligibility
+
+The canonical project price remains the exact midpoint of Coinbase best bid and best ask at quarter-hour boundaries:
+
+`P_t = (best_bid_t + best_ask_t) / 2`
+
+Historical OHLCV candle closes are not substituted for this exact canonical midpoint. Therefore:
+
+```text
+historical candle data:
+    canonical_target_eligible = false
+
+REST one-shot book snapshot:
+    canonical_target_eligible = false
+    purpose = connectivity/schema validation
+
+future WebSocket BBO observations:
+    intended canonical target source
+```
+
+This distinction is preserved in manifest metadata and in the normalized data model so the scientific benchmark remains unchanged.
+
+## Local Data Lake
+
+Real acquisition output is kept under a local `data_lake/` directory instead of the packaged synthetic fixture area.
+
+```text
+data_lake/
+  raw/
+    coinbase_advanced/
+      candles/
+      product_book/
+      market_trades/
+      server_time/
+  normalized/
+    coinbase_advanced/
+      candles/
+      product_book/
+  manifests/
+```
+
+`raw` is the immutable source-of-truth record, `normalized` stores derived analytical datasets, and `manifests` keeps acquisition provenance and reproducibility metadata.
 
 ## Benchmark and OOF Evaluation
 

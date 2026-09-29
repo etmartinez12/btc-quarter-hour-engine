@@ -17,7 +17,9 @@ dependencies = [
   "pandas>=2.2,<3",
   "scikit-learn>=1.5,<2",
   "lightgbm>=4.5,<5",
-  "xgboost>=2.1,<4"
+  "xgboost>=2.1,<4",
+  "httpx>=0.27,<1",
+  "pyarrow>=16.0,<18"
 ]
 
 [project.optional-dependencies]
@@ -27,6 +29,8 @@ dev = [
 
 [project.scripts]
 btc-qh-baseline = "btc_quarter_hour_engine.run_baseline:main"
+btc-qh-fetch-coinbase-candles = "btc_quarter_hour_engine.acquisition.cli:fetch_candles_main"
+btc-qh-snapshot-coinbase-book = "btc_quarter_hour_engine.acquisition.cli:snapshot_book_main"
 
 [tool.setuptools]
 include-package-data = true
