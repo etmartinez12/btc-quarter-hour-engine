@@ -36,6 +36,33 @@ The code treats this midpoint as the single source of truth for both labels and 
 
 Minute-bar inputs must be sampled on a strict 1-minute cadence with no gaps. The project defines all minute-level aggregates as trailing intervals ending at the row's timestamp, so a value at `13:00` represents the interval `(12:59:00, 13:00:00]` rather than a forward-looking window.
 
+## Market Data Contract
+
+The project enforces a strict minute-level data contract before any feature generation or training step.
+
+- Timestamps are normalized to UTC before validation.
+- Minute input represents exact one-minute observations, not forward-filled intervals.
+- Exactly one row must exist for each minute in the current baseline pipeline.
+- Missing minutes are rejected before model training or inference.
+- Duplicate timestamps are rejected before model training or inference.
+- Valid out-of-order rows are sorted chronologically and accepted.
+- Minute aggregates are trailing and end-stamped; a row labeled `13:00` represents `(12:59:00, 13:00:00]`.
+- `bid > 0`
+- `ask > 0`
+- `last_trade > 0`
+- `volume >= 0`
+- `bid <= ask`
+- Optional microstructure fields may be absent, but if present they must be finite and nonnegative.
+- Malformed source data fails fast.
+- The baseline does not silently forward-fill missing minutes.
+- The baseline does not silently remove duplicate timestamps.
+- All feature construction must use information available at or before prediction timestamp `t`.
+- Changing future observations after `t` must not alter features at `t`.
+
+This requirement is enforced through the shared `normalize_market_frame()` contract used by file loading, training-data construction, feature generation, and live inference.
+
+> The bundled Coinbase-style CSV is synthetic/mock data used to exercise the research pipeline. Accuracy from this sample must not be interpreted as evidence of real Bitcoin predictive performance.
+
 ## Architecture
 
 ```text
