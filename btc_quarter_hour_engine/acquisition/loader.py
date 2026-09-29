@@ -18,6 +18,29 @@ OPTIONAL_MICROSTRUCTURE_COLUMNS = (
 )
 
 
+def _validate_minute_cadence(frame: pd.DataFrame) -> pd.DataFrame:
+    """Enforce the project contract for minute-bar market data.
+
+    Every minute-based aggregate is trailing and end-stamped: the row at 13:00 represents
+    the interval (12:59:00, 13:00:00]. Therefore the raw input must be a strict 1-minute grid.
+    """
+
+    normalized = frame.copy().sort_values("timestamp").reset_index(drop=True)
+    if normalized.empty:
+        return normalized
+
+    timestamps = pd.to_datetime(normalized["timestamp"], utc=True)
+    deltas = timestamps.diff().dropna()
+    expected = pd.Timedelta(minutes=1)
+    if not deltas.eq(expected).all():
+        bad_rows = deltas.index[~deltas.eq(expected)].tolist()
+        raise ValueError(
+            "Market data must be sampled on a strict 1-minute cadence; found non-1-minute gaps at rows "
+            f"{bad_rows}."
+        )
+    return normalized
+
+
 def _normalize_market_frame(frame: pd.DataFrame) -> pd.DataFrame:
     missing = [column for column in REQUIRED_COLUMNS if column not in frame.columns]
     if missing:
@@ -29,6 +52,7 @@ def _normalize_market_frame(frame: pd.DataFrame) -> pd.DataFrame:
         if column in normalized.columns:
             normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
     normalized = normalized.sort_values("timestamp").drop_duplicates("timestamp")
+    normalized = _validate_minute_cadence(normalized)
     return normalized.reset_index(drop=True)
 
 
