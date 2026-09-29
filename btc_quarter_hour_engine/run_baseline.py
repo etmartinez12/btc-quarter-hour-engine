@@ -5,7 +5,7 @@ from dataclasses import asdict
 
 import pandas as pd
 
-from .acquisition import load_sample_market_data
+from .acquisition import load_sample_market_data, normalize_market_frame
 from .boundaries import build_boundary_price_frame
 from .config import BaselineConfig
 from .ensemble import build_consensus_diagnostics, build_simple_average_ensemble, build_validation_weighted_ensemble
@@ -68,7 +68,7 @@ def _feature_family_summary(feature_columns: list[str]) -> dict[str, int]:
             "rolling_extrema_distance_",
             "price_vs_ema_",
             "ema_spread_",
-            "price_vs_vwap_",
+            "price_vs_volume_weighted_midpoint_",
         ),
         "regime": ("regime_trend_",),
         "time": ("tod_", "dow_", "is_weekend"),
@@ -111,7 +111,8 @@ def build_training_dataset(
     config: BaselineConfig | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     cfg = config or BaselineConfig()
-    raw = market_data if market_data is not None else load_sample_market_data()
+    source = market_data if market_data is not None else load_sample_market_data()
+    raw = normalize_market_frame(source)
     boundaries = build_boundary_price_frame(raw)
     features = build_feature_frame(raw, cfg.feature)
     targets = build_direction_target(boundaries)
