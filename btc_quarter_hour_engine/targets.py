@@ -13,7 +13,19 @@ def build_direction_target(boundary_prices: pd.DataFrame, price_column: str = "m
     """
 
     dataset = boundary_prices[["timestamp", price_column]].copy()
+    dataset = dataset.sort_values("timestamp").reset_index(drop=True)
     dataset = dataset.rename(columns={price_column: "price_t"})
+
+    timestamps = pd.to_datetime(dataset["timestamp"], utc=True)
+    deltas_seconds = timestamps.diff().dt.total_seconds()
+    invalid_deltas = deltas_seconds.dropna()
+    if not invalid_deltas.empty and not invalid_deltas.eq(15 * 60).all():
+        bad_rows = invalid_deltas.index[~invalid_deltas.eq(15 * 60)].tolist()
+        raise ValueError(
+            "Boundary timestamps must be exactly 15 minutes apart; found non-15-minute gaps at rows "
+            f"{bad_rows}."
+        )
+
     dataset["price_t_plus_15m"] = dataset["price_t"].shift(-1)
     dataset["price_change"] = dataset["price_t_plus_15m"] - dataset["price_t"]
     valid_prices = dataset["price_t"].gt(0) & dataset["price_t_plus_15m"].gt(0)

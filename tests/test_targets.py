@@ -52,3 +52,25 @@ def test_build_direction_target_avoids_infinite_returns_for_non_positive_prices(
 
     assert pd.isna(actual.loc[0, "log_return_15m"])
     assert pd.isna(actual.loc[0, "target"])
+
+
+def test_build_direction_target_rejects_missing_quarter_hour_boundary():
+    boundaries = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:30:00Z",
+                    "2026-01-01T00:45:00Z",
+                ],
+                utc=True,
+            ),
+            "midpoint": [100.0, 101.0, 99.0],
+        }
+    )
+
+    try:
+        build_direction_target(boundaries)
+        raise AssertionError("Expected ValueError for non-15-minute boundary gap")
+    except ValueError as exc:
+        assert "exactly 15 minutes apart" in str(exc)
