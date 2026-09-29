@@ -359,13 +359,14 @@ def run_walk_forward_benchmark(
     }
 
     benchmark_rows: list[dict[str, object]] = []
+    common_prediction_count = summary["n_common_oof_predictions"]
     for baseline_name, baseline_summary in summary["naive_baselines"].items():
         metrics = baseline_summary["metrics"]
         benchmark_rows.append(
             {
                 "name": baseline_name,
                 "benchmark_type": "naive",
-                "n_predictions": baseline_summary["n_predictions"],
+                "n_predictions": common_prediction_count,
                 "accuracy": metrics["accuracy"],
                 "precision": metrics["precision"],
                 "recall": metrics["recall"],
@@ -376,13 +377,18 @@ def run_walk_forward_benchmark(
             }
         )
 
-    for model_name, model_summary in summary["models"].items():
-        metrics = model_summary["pooled_oof_metrics"]
+    for model_name in summary["models"]:
+        model_columns = common_oof[["y_true", f"{model_name}_pred", f"{model_name}_proba"]].copy()
+        metrics = classification_metrics(
+            model_columns["y_true"],
+            model_columns[f"{model_name}_pred"],
+            model_columns[f"{model_name}_proba"],
+        )
         benchmark_rows.append(
             {
                 "name": model_name,
                 "benchmark_type": "model",
-                "n_predictions": int(len(model_oof_predictions[model_name])),
+                "n_predictions": common_prediction_count,
                 "accuracy": metrics["accuracy"],
                 "precision": metrics["precision"],
                 "recall": metrics["recall"],
@@ -393,13 +399,31 @@ def run_walk_forward_benchmark(
             }
         )
 
-    for ensemble_name, ensemble_summary in summary["ensembles"].items():
-        metrics = ensemble_summary["pooled_oof_metrics"]
+    simple_average_common = simple_average_oof[["timestamp", "fold_number", "y_true", "y_pred", "y_proba"]].merge(
+        common_oof[["timestamp", "fold_number"]],
+        on=["timestamp", "fold_number"],
+        how="inner",
+    )
+    weighted_average_common = weighted_average_oof[["timestamp", "fold_number", "y_true", "y_pred", "y_proba"]].merge(
+        common_oof[["timestamp", "fold_number"]],
+        on=["timestamp", "fold_number"],
+        how="inner",
+    )
+    ensemble_frames = {
+        "simple_average": simple_average_common,
+        "validation_weighted_average": weighted_average_common,
+    }
+    for ensemble_name, ensemble_frame in ensemble_frames.items():
+        metrics = classification_metrics(
+            ensemble_frame["y_true"],
+            ensemble_frame["y_pred"],
+            ensemble_frame["y_proba"],
+        )
         benchmark_rows.append(
             {
                 "name": ensemble_name,
                 "benchmark_type": "ensemble",
-                "n_predictions": int(len(simple_average_oof if ensemble_name == "simple_average" else weighted_average_oof)),
+                "n_predictions": common_prediction_count,
                 "accuracy": metrics["accuracy"],
                 "precision": metrics["precision"],
                 "recall": metrics["recall"],
@@ -409,6 +433,10 @@ def run_walk_forward_benchmark(
                 "roc_auc": metrics.get("roc_auc"),
             }
         )
+
+    for row in benchmark_rows:
+        if row["n_predictions"] != common_prediction_count:
+            raise ValueError("benchmark_comparison rows must all use the common OOF population size")
 
     summary["benchmark_comparison"] = benchmark_rows
     return summary

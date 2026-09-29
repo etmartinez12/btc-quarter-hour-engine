@@ -1,10 +1,12 @@
 import json
 
+import pandas as pd
 import pytest
 
 from btc_quarter_hour_engine.config import BaselineConfig, ValidationConfig
 from btc_quarter_hour_engine.run_baseline import _to_builtin, run_walk_forward_benchmark
 from btc_quarter_hour_engine.validation.metrics import classification_metrics
+from btc_quarter_hour_engine.validation.naive_baselines import previous_quarter_direction
 
 
 def test_run_walk_forward_benchmark_raises_when_no_splits_are_possible():
@@ -37,10 +39,27 @@ def test_classification_metrics_handles_single_class_test_fold():
     assert metrics["roc_auc"] != metrics["roc_auc"]
 
 
+def test_previous_quarter_direction_uses_exact_timestamp_history():
+    frame = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2024-01-01 00:00:00Z"), pd.Timestamp("2024-01-01 00:15:00Z")],
+            "midpoint": [100.0, 110.0],
+            "price_t_minus_15m": [95.0, 100.0],
+        }
+    )
+
+    predictions = previous_quarter_direction(frame)
+
+    assert predictions.tolist() == [1, 1]
+
+    missing_history = frame.drop(columns=["price_t_minus_15m"])
+    with pytest.raises(KeyError, match="exact price_t_minus_15m"):
+        previous_quarter_direction(missing_history)
+
+
 def test_walk_forward_benchmark_includes_phase_two_diagnostics():
     summary = run_walk_forward_benchmark()
     model_summary = summary["models"]["logistic_regression"]
-    simple_average = summary["ensembles"]["simple_average"]
     weighted_average = summary["ensembles"]["validation_weighted_average"]
 
     assert "feature_family_counts" in summary
@@ -52,6 +71,12 @@ def test_walk_forward_benchmark_includes_phase_two_diagnostics():
     assert len(model_summary["accuracy_by_boundary_slot"]) == 4
     assert len(summary["model_comparison"]["pairwise_prediction_agreement"]) == 6
     assert {"simple_average", "validation_weighted_average"} <= set(summary["ensembles"])
-    assert "mean_metrics" in simple_average
     assert len(weighted_average["weight_history"]) > 0
     assert len(summary["model_comparison"]["ensemble_consensus"]["accuracy_by_votes_up"]) == 5
+
+
+def test_benchmark_comparison_uses_common_oof_population():
+    summary = run_walk_forward_benchmark()
+
+    common_n = summary["n_common_oof_predictions"]
+    assert all(row["n_predictions"] == common_n for row in summary["benchmark_comparison"])

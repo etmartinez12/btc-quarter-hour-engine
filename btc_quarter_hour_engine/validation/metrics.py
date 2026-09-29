@@ -25,18 +25,18 @@ def classification_metrics(y_true, y_pred, y_proba=None) -> dict[str, Any]:
         metrics["brier_score"] = None
 
     if len(unique_classes) < 2:
-        metrics["log_loss"] = None
-        metrics["roc_auc"] = None
+        metrics["log_loss"] = float("nan")
+        metrics["roc_auc"] = float("nan")
         return metrics
 
     try:
         metrics["log_loss"] = log_loss(y_true, np.column_stack([1.0 - y_proba, y_proba]), labels=[0, 1])
     except ValueError:
-        metrics["log_loss"] = None
+        metrics["log_loss"] = float("nan")
     try:
         metrics["roc_auc"] = roc_auc_score(y_true, y_proba)
     except ValueError:
-        metrics["roc_auc"] = None
+        metrics["roc_auc"] = float("nan")
     return metrics
 
 
