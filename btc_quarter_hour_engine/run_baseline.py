@@ -87,25 +87,9 @@ def _feature_family_summary(feature_columns: list[str]) -> dict[str, int]:
 
 
 def _align_oof_predictions(model_oof_predictions: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    model_names = list(model_oof_predictions)
-    first_name = model_names[0]
-    aligned = model_oof_predictions[first_name][["timestamp", "fold_number", "y_true", "log_return_15m"]].copy()
-    aligned = aligned.rename(
-        columns={
-            "y_true": "y_true",
-            "log_return_15m": "log_return_15m",
-        }
-    )
+    from .validation.oof import align_oof_predictions
 
-    for model_name in model_names:
-        model_frame = model_oof_predictions[model_name][["timestamp", "fold_number", "y_pred", "y_proba"]].rename(
-            columns={
-                "y_pred": f"{model_name}_pred",
-                "y_proba": f"{model_name}_proba",
-            }
-        )
-        aligned = aligned.merge(model_frame, on=["timestamp", "fold_number"], how="inner")
-    return aligned.sort_values(["fold_number", "timestamp"]).reset_index(drop=True)
+    return align_oof_predictions(model_oof_predictions)
 
 
 def build_training_dataset(
@@ -118,22 +102,42 @@ def build_training_dataset(
     boundaries = build_boundary_price_frame(raw)
     features = build_feature_frame(raw, cfg.feature)
     targets = build_direction_target(boundaries)
+
+    previous_prices = boundaries[["timestamp", "midpoint"]].copy()
+    previous_prices["timestamp"] = previous_prices["timestamp"] + pd.Timedelta(minutes=15)
+    previous_prices = previous_prices.rename(columns={"midpoint": "price_t_minus_15m"})
+
     dataset = features.merge(targets, on="timestamp", how="inner")
+    dataset = dataset.merge(previous_prices, on="timestamp", how="left")
     dataset = dataset.dropna(subset=["target"]).copy()
+    dataset["label_available_time"] = dataset["timestamp"] + pd.Timedelta(minutes=15)
     dataset["target"] = dataset["target"].astype(int)
 
     feature_columns = [
         column
         for column in dataset.columns
-        if column not in {"timestamp", "target", "price_t", "price_t_plus_15m", "price_change", "log_return_15m"}
+        if column
+        not in {
+            "timestamp",
+            "target",
+            "price_t",
+            "price_t_plus_15m",
+            "price_change",
+            "log_return_15m",
+            "label_available_time",
+            "price_t_minus_15m",
+        }
     ]
     dataset = dataset.dropna(subset=feature_columns).reset_index(drop=True)
     return dataset, feature_columns
 
 
-def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str, object]:
+def run_walk_forward_benchmark(
+    config: BaselineConfig | None = None,
+    market_data: pd.DataFrame | None = None,
+) -> dict[str, object]:
     cfg = config or BaselineConfig()
-    dataset, feature_columns = build_training_dataset(config=cfg)
+    dataset, feature_columns = build_training_dataset(market_data=market_data, config=cfg)
     X = dataset[feature_columns]
     y = dataset["target"]
 
@@ -147,6 +151,28 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         raise ValueError(
             "walk-forward validation produced zero folds; reduce initial_train_size/test_size "
             "or provide more quarter-hour observations"
+        )
+
+    fold_summaries: list[dict[str, object]] = []
+    for fold_number, (train_idx, test_idx) in enumerate(splitter.split(X)):
+        train_df = dataset.iloc[train_idx].copy()
+        test_df = dataset.iloc[test_idx].copy()
+        test_start_time = test_df["timestamp"].min()
+        train_df = train_df.loc[train_df["label_available_time"] <= test_start_time].copy()
+        if not train_df.empty:
+            assert train_df["label_available_time"].max() <= test_start_time
+        fold_summaries.append(
+            {
+                "fold_number": int(fold_number),
+                "train_start": str(train_df["timestamp"].min()) if not train_df.empty else None,
+                "train_end": str(train_df["timestamp"].max()) if not train_df.empty else None,
+                "test_start": str(test_df["timestamp"].min()),
+                "test_end": str(test_df["timestamp"].max()),
+                "n_train": int(len(train_df)),
+                "n_test": int(len(test_df)),
+                "train_up_rate": float(train_df["target"].mean()) if not train_df.empty else None,
+                "test_up_rate": float(test_df["target"].mean()) if not test_df.empty else None,
+            }
         )
 
     model_factories = {
@@ -176,27 +202,41 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
     summary: dict[str, object] = {
         "n_rows": len(dataset),
         "n_features": len(feature_columns),
+        "n_common_oof_predictions": 0,
         "feature_columns": feature_columns,
         "feature_family_counts": _feature_family_summary(feature_columns),
         "base_models": list(model_factories),
         "models": {},
         "validation": asdict(cfg.validation),
+        "validation_protocol": {
+            "mode": "demo_row_based",
+            "initial_train_size": cfg.validation.initial_train_size,
+            "test_size": cfg.validation.test_size,
+            "step_size": cfg.validation.step_size,
+            "test_overlap_allowed": False,
+            "label_availability_enforced": True,
+            "canonical_horizon_minutes": 15,
+            "n_common_oof_predictions": 0,
+        },
+        "folds": fold_summaries,
     }
     model_oof_predictions: dict[str, pd.DataFrame] = {}
-    dataset_with_history = dataset.copy()
-    dataset_with_history["price_t_minus_15m"] = dataset_with_history["midpoint"].shift(1)
 
     for model_name, factory in model_factories.items():
         fold_metrics: list[dict[str, float]] = []
         skipped_folds = 0
         oof_parts: list[pd.DataFrame] = []
 
-        for train_idx, test_idx in splitter.split(X):
+        for fold_number, (train_idx, test_idx) in enumerate(splitter.split(X)):
             model = factory()
-            X_train = X.iloc[train_idx]
-            y_train = y.iloc[train_idx]
-            X_test = X.iloc[test_idx]
-            y_test = y.iloc[test_idx]
+            train_df = dataset.iloc[train_idx].copy()
+            test_df = dataset.iloc[test_idx].copy()
+            test_start_time = test_df["timestamp"].min()
+            train_df = train_df.loc[train_df["label_available_time"] <= test_start_time].copy()
+            X_train = X.iloc[train_df.index]
+            y_train = y.iloc[train_df.index]
+            X_test = X.iloc[test_df.index]
+            y_test = y.iloc[test_df.index]
 
             if y_train.nunique() < 2:
                 skipped_folds += 1
@@ -209,16 +249,16 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
             oof_parts.append(
                 pd.DataFrame(
                     {
-                        "fold_number": [len(fold_metrics) + skipped_folds] * len(X_test),
-                        "timestamp": dataset_with_history.iloc[test_idx]["timestamp"].to_numpy(),
+                        "fold_number": [fold_number] * len(X_test),
+                        "timestamp": test_df["timestamp"].to_numpy(),
                         "y_true": y_test.to_numpy(),
                         "y_pred": predictions,
                         "y_proba": probabilities,
-                        "log_return_15m": dataset_with_history.iloc[test_idx]["log_return_15m"].to_numpy(),
-                        "midpoint": dataset_with_history.iloc[test_idx]["midpoint"].to_numpy(),
-                        "price_t_minus_15m": dataset_with_history.iloc[test_idx]["price_t_minus_15m"].to_numpy(),
-                        "return_1m": dataset_with_history.iloc[test_idx]["return_1m"].to_numpy(),
-                        "return_5m": dataset_with_history.iloc[test_idx]["return_5m"].to_numpy(),
+                        "log_return_15m": test_df["log_return_15m"].to_numpy(),
+                        "midpoint": test_df["midpoint"].to_numpy(),
+                        "price_t_minus_15m": test_df["price_t_minus_15m"].to_numpy(),
+                        "return_1m": test_df["return_1m"].to_numpy(),
+                        "return_5m": test_df["return_5m"].to_numpy(),
                     }
                 )
             )
@@ -230,11 +270,12 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
             )
 
         metrics_frame = pd.DataFrame(fold_metrics)
-        oof_frame = pd.concat(oof_parts, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+        oof_frame = pd.concat(oof_parts, ignore_index=True).sort_values(["fold_number", "timestamp"]).reset_index(drop=True)
         summary["models"][model_name] = {
             "folds": len(fold_metrics),
             "skipped_folds": skipped_folds,
-            "mean_metrics": metrics_frame.mean(numeric_only=True).to_dict(),
+            "mean_fold_metrics": metrics_frame.mean(numeric_only=True).to_dict(),
+            "pooled_oof_metrics": classification_metrics(oof_frame["y_true"], oof_frame["y_pred"], oof_frame["y_proba"]),
             "confidence_accuracy": confidence_accuracy_table(
                 oof_frame["timestamp"],
                 oof_frame["y_true"],
@@ -255,13 +296,25 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
 
     aligned_oof = _align_oof_predictions(model_oof_predictions)
     common_oof = build_common_oof_evaluation_frame(model_oof_predictions, random_state=cfg.random_state)
+    summary["n_common_oof_predictions"] = int(len(common_oof))
     summary["common_oof_population"] = {
         "n_observations": int(len(common_oof)),
         "n_folds": int(common_oof["fold_number"].nunique()) if len(common_oof) else 0,
         "timestamp_min": str(common_oof["timestamp"].min()) if len(common_oof) else None,
         "timestamp_max": str(common_oof["timestamp"].max()) if len(common_oof) else None,
     }
+    summary["validation_protocol"]["n_common_oof_predictions"] = int(len(common_oof))
+    y_true = common_oof["y_true"]
+    summary["oof_class_balance"] = {
+        "n_predictions": int(len(common_oof)),
+        "n_up": int((y_true == 1).sum()),
+        "n_down": int((y_true == 0).sum()),
+        "up_rate": float((y_true == 1).mean()) if len(common_oof) else 0.0,
+        "down_rate": float((y_true == 0).mean()) if len(common_oof) else 0.0,
+    }
+    assert summary["oof_class_balance"]["n_up"] + summary["oof_class_balance"]["n_down"] == summary["oof_class_balance"]["n_predictions"]
     summary["naive_baselines"] = score_naive_baselines(common_oof)
+
     ensemble_model_names = list(model_oof_predictions)
     simple_average_oof = build_simple_average_ensemble(aligned_oof, ensemble_model_names)
     weighted_average_oof, weight_history = build_validation_weighted_ensemble(
@@ -277,7 +330,7 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         "validation_weighted_average": weighted_average_oof,
     }.items():
         summary["ensembles"][ensemble_name] = {
-            "mean_metrics": classification_metrics(
+            "pooled_oof_metrics": classification_metrics(
                 ensemble_frame["y_true"],
                 ensemble_frame["y_pred"],
                 ensemble_frame["y_proba"],
@@ -304,6 +357,60 @@ def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str
         "pairwise_prediction_agreement": pairwise_prediction_agreement(model_oof_predictions),
         "ensemble_consensus": build_consensus_diagnostics(aligned_oof, ensemble_model_names),
     }
+
+    benchmark_rows: list[dict[str, object]] = []
+    for baseline_name, baseline_summary in summary["naive_baselines"].items():
+        metrics = baseline_summary["metrics"]
+        benchmark_rows.append(
+            {
+                "name": baseline_name,
+                "benchmark_type": "naive",
+                "n_predictions": baseline_summary["n_predictions"],
+                "accuracy": metrics["accuracy"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "brier_score": None,
+                "log_loss": None,
+                "roc_auc": None,
+            }
+        )
+
+    for model_name, model_summary in summary["models"].items():
+        metrics = model_summary["pooled_oof_metrics"]
+        benchmark_rows.append(
+            {
+                "name": model_name,
+                "benchmark_type": "model",
+                "n_predictions": int(len(model_oof_predictions[model_name])),
+                "accuracy": metrics["accuracy"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "brier_score": metrics.get("brier_score"),
+                "log_loss": metrics.get("log_loss"),
+                "roc_auc": metrics.get("roc_auc"),
+            }
+        )
+
+    for ensemble_name, ensemble_summary in summary["ensembles"].items():
+        metrics = ensemble_summary["pooled_oof_metrics"]
+        benchmark_rows.append(
+            {
+                "name": ensemble_name,
+                "benchmark_type": "ensemble",
+                "n_predictions": int(len(simple_average_oof if ensemble_name == "simple_average" else weighted_average_oof)),
+                "accuracy": metrics["accuracy"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "f1": metrics["f1"],
+                "brier_score": metrics.get("brier_score"),
+                "log_loss": metrics.get("log_loss"),
+                "roc_auc": metrics.get("roc_auc"),
+            }
+        )
+
+    summary["benchmark_comparison"] = benchmark_rows
     return summary
 
 

@@ -7,29 +7,36 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, log_loss, precision_score, recall_score, roc_auc_score
 
 
-def classification_metrics(y_true, y_pred, y_proba) -> dict[str, Any]:
-    unique_classes = np.unique(y_true)
+def classification_metrics(y_true, y_pred, y_proba=None) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
     }
+
+    if y_proba is None:
+        return metrics
+
+    unique_classes = np.unique(y_true)
     try:
         metrics["brier_score"] = brier_score_loss(y_true, y_proba)
     except ValueError:
-        metrics["brier_score"] = float("nan")
+        metrics["brier_score"] = None
 
     if len(unique_classes) < 2:
-        metrics["log_loss"] = float("nan")
-        metrics["roc_auc"] = float("nan")
+        metrics["log_loss"] = None
+        metrics["roc_auc"] = None
         return metrics
 
-    metrics["log_loss"] = log_loss(y_true, np.column_stack([1.0 - y_proba, y_proba]), labels=[0, 1])
+    try:
+        metrics["log_loss"] = log_loss(y_true, np.column_stack([1.0 - y_proba, y_proba]), labels=[0, 1])
+    except ValueError:
+        metrics["log_loss"] = None
     try:
         metrics["roc_auc"] = roc_auc_score(y_true, y_proba)
     except ValueError:
-        metrics["roc_auc"] = float("nan")
+        metrics["roc_auc"] = None
     return metrics
 
 
@@ -126,14 +133,14 @@ def pairwise_prediction_agreement(model_predictions: dict[str, pd.DataFrame]) ->
     rows: list[dict[str, Any]] = []
 
     for idx, left_name in enumerate(model_names):
-        left = model_predictions[left_name][["timestamp", "y_pred", "y_proba"]].rename(
+        left = model_predictions[left_name][["timestamp", "fold_number", "y_pred", "y_proba"]].rename(
             columns={"y_pred": f"{left_name}_pred", "y_proba": f"{left_name}_proba"}
         )
         for right_name in model_names[idx + 1 :]:
-            right = model_predictions[right_name][["timestamp", "y_pred", "y_proba"]].rename(
+            right = model_predictions[right_name][["timestamp", "fold_number", "y_pred", "y_proba"]].rename(
                 columns={"y_pred": f"{right_name}_pred", "y_proba": f"{right_name}_proba"}
             )
-            merged = left.merge(right, on="timestamp", how="inner")
+            merged = left.merge(right, on=["timestamp", "fold_number"], how="inner")
             agreement = (merged[f"{left_name}_pred"] == merged[f"{right_name}_pred"]).mean()
             proba_corr = merged[f"{left_name}_proba"].corr(merged[f"{right_name}_proba"])
             rows.append(
