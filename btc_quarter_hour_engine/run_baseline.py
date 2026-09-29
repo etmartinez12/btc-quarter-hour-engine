@@ -106,9 +106,12 @@ def _align_oof_predictions(model_oof_predictions: dict[str, pd.DataFrame]) -> pd
     return aligned.sort_values(["fold_number", "timestamp"]).reset_index(drop=True)
 
 
-def build_training_dataset(config: BaselineConfig | None = None) -> tuple[pd.DataFrame, list[str]]:
+def build_training_dataset(
+    market_data: pd.DataFrame | None = None,
+    config: BaselineConfig | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
     cfg = config or BaselineConfig()
-    raw = load_sample_market_data()
+    raw = market_data if market_data is not None else load_sample_market_data()
     boundaries = build_boundary_price_frame(raw)
     features = build_feature_frame(raw, cfg.feature)
     targets = build_direction_target(boundaries)
@@ -127,7 +130,7 @@ def build_training_dataset(config: BaselineConfig | None = None) -> tuple[pd.Dat
 
 def run_walk_forward_benchmark(config: BaselineConfig | None = None) -> dict[str, object]:
     cfg = config or BaselineConfig()
-    dataset, feature_columns = build_training_dataset(cfg)
+    dataset, feature_columns = build_training_dataset(config=cfg)
     X = dataset[feature_columns]
     y = dataset["target"]
 

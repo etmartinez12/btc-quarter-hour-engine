@@ -1,5 +1,34 @@
+import pandas as pd
+
 from btc_quarter_hour_engine.acquisition import load_sample_market_data
 from btc_quarter_hour_engine.features import build_feature_frame
+
+
+def test_market_data_loader_rejects_non_minute_cadence():
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:01:00Z",
+                    "2026-01-01T00:03:00Z",
+                ],
+                utc=True,
+            ),
+            "bid": [100.0, 101.0, 102.0],
+            "ask": [101.0, 102.0, 103.0],
+            "last_trade": [100.5, 101.5, 102.5],
+            "volume": [10.0, 11.0, 12.0],
+        }
+    )
+
+    try:
+        from btc_quarter_hour_engine.acquisition.loader import _normalize_market_frame
+
+        _normalize_market_frame(data)
+        raise AssertionError("Expected ValueError for non-1-minute cadence")
+    except ValueError as exc:
+        assert "strict 1-minute cadence" in str(exc)
 
 
 def test_build_feature_frame_adds_phase_two_feature_families_on_boundary_rows():

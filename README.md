@@ -34,6 +34,8 @@ The boundary timestamps are:
 
 The code treats this midpoint as the single source of truth for both labels and benchmark evaluation. Future variants can add alternate price definitions, but they should remain separate experiments.
 
+Minute-bar inputs must be sampled on a strict 1-minute cadence with no gaps. The project defines all minute-level aggregates as trailing intervals ending at the row's timestamp, so a value at `13:00` represents the interval `(12:59:00, 13:00:00]` rather than a forward-looking window.
+
 ## Architecture
 
 ```text
