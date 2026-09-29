@@ -81,16 +81,27 @@ def build_consensus_diagnostics(frame: pd.DataFrame, model_names: Sequence[str])
     diagnostics["votes_up"] = diagnostics[prediction_columns].sum(axis=1)
     diagnostics["votes_down"] = len(model_names) - diagnostics["votes_up"]
     diagnostics["vote_margin"] = (diagnostics["votes_up"] - diagnostics["votes_down"]).abs()
-    diagnostics["consensus_pred"] = (diagnostics["votes_up"] >= (len(model_names) / 2.0)).astype(int)
+    diagnostics["is_tie"] = diagnostics["votes_up"].eq(diagnostics["votes_down"])
+    diagnostics["consensus_pred"] = pd.Series(pd.NA, index=diagnostics.index, dtype="Int64")
+    non_tie_mask = ~diagnostics["is_tie"]
+    diagnostics.loc[non_tie_mask & diagnostics["votes_up"].gt(diagnostics["votes_down"]), "consensus_pred"] = 1
+    diagnostics.loc[non_tie_mask & diagnostics["votes_up"].lt(diagnostics["votes_down"]), "consensus_pred"] = 0
 
-    consensus_rows: list[dict[str, float | int]] = []
+    consensus_rows: list[dict[str, float | int | bool | None]] = []
     for votes_up in range(len(model_names) + 1):
-        subset = diagnostics.loc[diagnostics["votes_up"] == votes_up]
+        subset = diagnostics.loc[diagnostics["votes_up"] == votes_up].copy()
+        is_tie = votes_up == (len(model_names) - votes_up)
+        if len(subset):
+            scoreable_mask = subset["consensus_pred"].notna()
+            accuracy = None if is_tie else float(accuracy_score(subset.loc[scoreable_mask, "y_true"], subset.loc[scoreable_mask, "consensus_pred"]))
+        else:
+            accuracy = None
         consensus_rows.append(
             {
                 "votes_up": int(votes_up),
                 "n_predictions": int(len(subset)),
-                "accuracy": float(accuracy_score(subset["y_true"], subset["consensus_pred"])) if len(subset) else float("nan"),
+                "is_tie": bool(is_tie),
+                "accuracy": accuracy,
                 "mean_probability_std": float(subset["probability_std"].mean()) if len(subset) else float("nan"),
             }
         )

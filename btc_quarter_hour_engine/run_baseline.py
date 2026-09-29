@@ -159,8 +159,8 @@ def run_walk_forward_benchmark(
         test_df = dataset.iloc[test_idx].copy()
         test_start_time = test_df["timestamp"].min()
         train_df = train_df.loc[train_df["label_available_time"] <= test_start_time].copy()
-        if not train_df.empty:
-            assert train_df["label_available_time"].max() <= test_start_time
+        if not train_df.empty and train_df["label_available_time"].max() > test_start_time:
+            raise ValueError("training data for a fold includes labels that are not yet available at the test start time")
         fold_summaries.append(
             {
                 "fold_number": int(fold_number),
@@ -233,6 +233,8 @@ def run_walk_forward_benchmark(
             test_df = dataset.iloc[test_idx].copy()
             test_start_time = test_df["timestamp"].min()
             train_df = train_df.loc[train_df["label_available_time"] <= test_start_time].copy()
+            if not train_df.empty and train_df["label_available_time"].max() > test_start_time:
+                raise ValueError("training data for a fold includes labels that are not yet available at the test start time")
             X_train = X.iloc[train_df.index]
             y_train = y.iloc[train_df.index]
             X_test = X.iloc[test_df.index]
@@ -303,6 +305,13 @@ def run_walk_forward_benchmark(
         "timestamp_min": str(common_oof["timestamp"].min()) if len(common_oof) else None,
         "timestamp_max": str(common_oof["timestamp"].max()) if len(common_oof) else None,
     }
+    summary["research_validation_spec"] = {
+        "initial_train_period": "365D",
+        "test_period": "30D",
+        "step_period": "30D",
+        "expanding_training": True,
+        "test_overlap_allowed": False,
+    }
     summary["validation_protocol"]["n_common_oof_predictions"] = int(len(common_oof))
     y_true = common_oof["y_true"]
     summary["oof_class_balance"] = {
@@ -312,7 +321,8 @@ def run_walk_forward_benchmark(
         "up_rate": float((y_true == 1).mean()) if len(common_oof) else 0.0,
         "down_rate": float((y_true == 0).mean()) if len(common_oof) else 0.0,
     }
-    assert summary["oof_class_balance"]["n_up"] + summary["oof_class_balance"]["n_down"] == summary["oof_class_balance"]["n_predictions"]
+    if summary["oof_class_balance"]["n_up"] + summary["oof_class_balance"]["n_down"] != summary["oof_class_balance"]["n_predictions"]:
+        raise ValueError("Oof class balance does not sum to the common OOF population count")
     summary["naive_baselines"] = score_naive_baselines(common_oof)
 
     ensemble_model_names = list(model_oof_predictions)
@@ -404,11 +414,15 @@ def run_walk_forward_benchmark(
         on=["timestamp", "fold_number"],
         how="inner",
     )
+    if len(simple_average_common) != common_prediction_count:
+        raise ValueError("simple-average ensemble does not align to the common OOF population")
     weighted_average_common = weighted_average_oof[["timestamp", "fold_number", "y_true", "y_pred", "y_proba"]].merge(
         common_oof[["timestamp", "fold_number"]],
         on=["timestamp", "fold_number"],
         how="inner",
     )
+    if len(weighted_average_common) != common_prediction_count:
+        raise ValueError("validation-weighted ensemble does not align to the common OOF population")
     ensemble_frames = {
         "simple_average": simple_average_common,
         "validation_weighted_average": weighted_average_common,

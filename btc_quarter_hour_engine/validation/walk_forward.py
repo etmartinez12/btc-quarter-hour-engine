@@ -43,9 +43,29 @@ class ExpandingWindowSplit:
 
 @dataclass(slots=True)
 class ExpandingTimeWindowSplit:
-    initial_window: str | pd.Timedelta = "365D"
-    test_window: str | pd.Timedelta = "30D"
-    step_window: str | pd.Timedelta = "30D"
+    initial_train_period: str | pd.Timedelta = "365D"
+    test_period: str | pd.Timedelta = "30D"
+    step_period: str | pd.Timedelta = "30D"
+
+    @property
+    def initial_window(self) -> str | pd.Timedelta:
+        return self.initial_train_period
+
+    @property
+    def test_window(self) -> str | pd.Timedelta:
+        return self.test_period
+
+    @property
+    def step_window(self) -> str | pd.Timedelta:
+        return self.step_period
+
+    @classmethod
+    def from_config(cls, config) -> "ExpandingTimeWindowSplit":
+        return cls(
+            initial_train_period=getattr(config, "initial_train_period", "365D"),
+            test_period=getattr(config, "test_period", "30D"),
+            step_period=getattr(config, "step_period", "30D"),
+        )
 
     def _as_timedelta(self, value: str | pd.Timedelta) -> pd.Timedelta:
         if isinstance(value, pd.Timedelta):
@@ -58,7 +78,7 @@ class ExpandingTimeWindowSplit:
 
     def split(self, timestamps) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         if timestamps is None or len(timestamps) == 0:
-            return iter(())
+            return
 
         series = pd.Series(pd.to_datetime(timestamps, utc=True))
         if series.isna().any():
@@ -66,16 +86,15 @@ class ExpandingTimeWindowSplit:
         if not series.is_monotonic_increasing:
             raise ValueError("timestamps must be sorted chronologically")
 
-        initial = self._as_timedelta(self.initial_window)
-        test_period = self._as_timedelta(self.test_window)
-        step_period = self._as_timedelta(self.step_window)
+        initial = self._as_timedelta(self.initial_train_period)
+        test_period = self._as_timedelta(self.test_period)
+        step_period = self._as_timedelta(self.step_period)
         if step_period < test_period:
-            raise ValueError("step_window must be greater than or equal to test_window to prevent overlapping OOF test windows")
+            raise ValueError("step_period must be greater than or equal to test_period to prevent overlapping OOF test windows")
 
         first_ts = series.iloc[0]
         last_ts = series.iloc[-1]
         train_end = first_ts + initial
-        fold_count = 0
         while train_end + test_period <= last_ts + pd.Timedelta(0):
             train_mask = series < train_end
             test_mask = (series >= train_end) & (series < train_end + test_period)
@@ -85,7 +104,6 @@ class ExpandingTimeWindowSplit:
             test_idx = np.flatnonzero(test_mask.to_numpy())
             yield train_idx, test_idx
             train_end += step_period
-            fold_count += 1
 
     def get_n_splits(self, timestamps) -> int:
         return sum(1 for _ in self.split(timestamps))

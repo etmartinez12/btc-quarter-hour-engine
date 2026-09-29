@@ -22,8 +22,9 @@ def validate_oof_predictions(model_oof_predictions: Mapping[str, pd.DataFrame]) 
             dup_rows = frame.loc[duplicate_keys, ["timestamp", "fold_number"]].drop_duplicates().to_dict("records")
             raise ValueError(f"{model_name} OOF predictions contain duplicate (timestamp, fold_number) rows: {dup_rows}")
 
-        if frame["timestamp"].duplicated(keep=False).any():
-            duplicate_timestamps = frame.loc[frame["timestamp"].duplicated(keep=False), "timestamp"].drop_duplicates().tolist()
+        timestamp_fold_counts = frame.groupby("timestamp")["fold_number"].nunique()
+        duplicate_timestamps = timestamp_fold_counts[timestamp_fold_counts > 1].index.tolist()
+        if duplicate_timestamps:
             raise ValueError(f"{model_name} OOF predictions contain duplicate timestamps across folds: {duplicate_timestamps}")
 
 
