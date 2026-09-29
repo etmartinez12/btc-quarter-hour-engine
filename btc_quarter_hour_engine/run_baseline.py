@@ -7,7 +7,7 @@ import pandas as pd
 
 from .acquisition import load_sample_market_data, normalize_market_frame
 from .boundaries import build_boundary_price_frame
-from .config import BaselineConfig
+from .config import BaselineConfig, ResearchValidationConfig
 from .ensemble import build_consensus_diagnostics, build_simple_average_ensemble, build_validation_weighted_ensemble
 from .features import build_feature_frame
 from .models import ExtraTreesBaselineModel, LightGBMBaselineModel, LogisticBaselineModel, XGBoostBaselineModel
@@ -305,10 +305,9 @@ def run_walk_forward_benchmark(
         "timestamp_min": str(common_oof["timestamp"].min()) if len(common_oof) else None,
         "timestamp_max": str(common_oof["timestamp"].max()) if len(common_oof) else None,
     }
+    research_cfg = ResearchValidationConfig()
     summary["research_validation_spec"] = {
-        "initial_train_period": "365D",
-        "test_period": "30D",
-        "step_period": "30D",
+        **asdict(research_cfg),
         "expanding_training": True,
         "test_overlap_allowed": False,
     }
