@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .acquisition import normalize_market_frame
 from .boundaries import compute_midpoint, is_quarter_hour_boundary
 from .config import FeatureConfig
 
@@ -26,7 +27,7 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
     """
 
     cfg = config or FeatureConfig()
-    market = frame.copy().sort_values("timestamp").reset_index(drop=True)
+    market = normalize_market_frame(frame)
     market["midpoint"] = compute_midpoint(market)
     valid_midpoint = market["midpoint"].gt(0)
     market["log_midpoint"] = np.nan
@@ -59,7 +60,7 @@ def build_feature_frame(frame: pd.DataFrame, config: FeatureConfig | None = None
         rolling_notional = (market["midpoint"] * market["volume"]).rolling(window=window, min_periods=window).sum()
         rolling_volume = market["volume"].rolling(window=window, min_periods=window).sum()
         vwap = rolling_notional / rolling_volume
-        market[f"price_vs_vwap_{window}m"] = market["midpoint"] / vwap - 1.0
+        market[f"price_vs_volume_weighted_midpoint_{window}m"] = market["midpoint"] / vwap - 1.0
 
     volume_zscore_window = cfg.volume_zscore_window_minutes
     volume_mean = market["volume"].rolling(window=volume_zscore_window, min_periods=volume_zscore_window).mean()

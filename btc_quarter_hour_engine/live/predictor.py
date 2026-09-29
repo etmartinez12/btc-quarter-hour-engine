@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from ..acquisition import normalize_market_frame
 from ..boundaries import is_quarter_hour_boundary
 from ..config import FeatureConfig
 from ..features import build_feature_frame
@@ -19,14 +20,15 @@ class LivePredictor:
         if market_frame.empty:
             raise ValueError("market_frame must contain at least one row")
 
-        latest_timestamp = pd.to_datetime(market_frame["timestamp"], utc=True).iloc[-1]
+        market = normalize_market_frame(market_frame)
+        latest_timestamp = market["timestamp"].iloc[-1]
         boundary_check = pd.Series([latest_timestamp])
         if not is_quarter_hour_boundary(boundary_check).iloc[0]:
             raise ValueError(
                 "latest market timestamp must be an exact quarter-hour boundary to avoid stale predictions"
             )
 
-        features = build_feature_frame(market_frame, self.feature_config)
+        features = build_feature_frame(market, self.feature_config)
         latest_row = features.loc[features["timestamp"].eq(latest_timestamp)].drop(
             columns=["timestamp"], errors="ignore"
         )
