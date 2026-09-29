@@ -44,8 +44,8 @@ def _validate_minute_cadence(frame: pd.DataFrame) -> pd.DataFrame:
     expected = pd.Timedelta(minutes=1)
     deltas = timestamps.diff().dropna()
     if not deltas.eq(expected).all():
-        first_bad = deltas[~deltas.eq(expected)].iloc[0]
-        index = deltas[~deltas.eq(expected)].index[0]
+        bad_mask = ~deltas.eq(expected)
+        index = deltas[bad_mask].index[0]
         previous_ts = timestamps.iloc[index - 1]
         current_ts = timestamps.iloc[index]
         raise ValueError(
