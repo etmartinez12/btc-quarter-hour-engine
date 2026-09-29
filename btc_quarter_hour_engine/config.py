@@ -19,10 +19,20 @@ class FeatureConfig:
 
 
 @dataclass(slots=True)
-class ValidationConfig:
+class DemoValidationConfig:
     initial_train_size: int = 64
     test_size: int = 16
     step_size: int = 16
+
+
+@dataclass(slots=True)
+class ResearchValidationConfig:
+    initial_train_period: str = "365D"
+    test_period: str = "30D"
+    step_period: str = "30D"
+
+
+ValidationConfig = DemoValidationConfig
 
 
 @dataclass(slots=True)

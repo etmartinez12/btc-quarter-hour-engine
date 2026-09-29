@@ -73,11 +73,75 @@ btc_quarter_hour_engine/
   targets.py     quarter-hour labels and returns
   models/        logistic regression, ExtraTrees, LightGBM, and XGBoost baselines
   ensemble/      simple-average and weighted ensemble utilities
-  validation/    walk-forward splits and metrics
+  validation/    OOF integrity, naïve benchmarks, row-based demo validation, and time-based research splitting
   live/          minimal live prediction interface
   config.py      shared configuration dataclasses
   run_baseline.py
 ```
+
+## Benchmark and OOF Evaluation
+
+The project compares ML models against a small set of credible, legally available baselines rather than treating raw model accuracy as the full story. The current benchmark includes:
+
+- always UP
+- always DOWN
+- deterministic seeded 50/50 random
+- previous exact quarter-hour direction
+- 1-minute momentum
+- 5-minute momentum
+
+Beating 50% accuracy alone is not sufficient. A model must outperform simple rules using only information that was actually available at prediction time.
+
+All headline benchmark comparisons use the exact same common OOF population. This keeps the comparison fair by ensuring every model and baseline is evaluated on identical unseen timestamps and fold coverage.
+
+### `mean_fold_metrics`
+
+Metrics are calculated independently for each fold and then averaged across folds.
+
+### `pooled_oof_metrics`
+
+All unseen OOF predictions are concatenated and metrics are calculated once across the full pooled evaluation set.
+
+The pooled/common OOF metrics are the primary direct benchmark comparison because they preserve the same legal population across all baselines and models.
+
+Hard naïve rules report:
+
+- accuracy
+- precision
+- recall
+- F1
+
+But they do not receive fabricated Brier score, log loss, or ROC-AUC values because they do not emit calibrated probabilities.
+
+## Validation Protocols
+
+### Demo validation
+
+The bundled row-based validation defaults are:
+
+```text
+initial_train_size = 64
+test_size = 16
+step_size = 16
+```
+
+This is used for synthetic bundled data, CI, and smoke testing. It is not evidence of real-world predictive performance.
+
+### Research validation
+
+The intended future research protocol uses timestamp windows rather than fixed row counts:
+
+```text
+initial training period = 365 days
+test period = 30 days
+step period = 30 days
+expanding training history = yes
+overlapping test windows = no
+```
+
+For this research protocol, the prediction timestamp is `t`, and `label_available_time = t + 15 minutes`. A training observation can only be used once `label_available_time <= current prediction/test start`, which prevents the model from using an outcome before it would have been known in live operation.
+
+> The bundled Coinbase-style CSV is synthetic/mock data used to exercise the research pipeline. Accuracy from this sample must not be interpreted as evidence of real Bitcoin predictive performance.
 
 ## Installation
 
@@ -121,7 +185,12 @@ The unit tests cover:
 
 - quarter-hour target construction behavior
 - walk-forward split ordering and non-overlap
-- zero-fold walk-forward benchmark rejection
+- naive baseline correctness
+- OOF uniqueness and alignment checks
+- overlapping-fold rejection
+- research time splitter behavior
+- label availability enforcement
+- consensus tie behavior
 - live predictor boundary freshness checks
 - Phase 2/3 feature-family generation on boundary rows
 - Phase 4 multi-model benchmark coverage and comparison outputs
