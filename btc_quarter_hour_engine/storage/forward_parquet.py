@@ -17,9 +17,16 @@ class ForwardParquetStore:
         if not records:
             raise ValueError("Forward collection requires at least one row")
         frame = pd.DataFrame(records)
-        if "timestamp_utc" not in frame.columns and "event_time_utc" not in frame.columns:
-            raise ValueError("Forward collection rows require a timestamp field")
-        timestamp_field = "timestamp_utc" if "timestamp_utc" in frame.columns else "event_time_utc"
+        timestamp_field = "source_time_utc"
+        if timestamp_field not in frame.columns:
+            for alias in ("event_time_utc", "timestamp_utc"):
+                if alias in frame.columns:
+                    frame = frame.rename(columns={alias: timestamp_field})
+                    break
+        if timestamp_field not in frame.columns:
+            raise ValueError(
+                "Forward collection rows require a 'source_time_utc' (or 'event_time_utc'/'timestamp_utc') field"
+            )
         frame[timestamp_field] = pd.to_datetime(frame[timestamp_field], utc=True)
         return self.store.write_dataframe(
             dataframe=frame,

@@ -5,10 +5,16 @@ from datetime import datetime
 
 from btc_quarter_hour_engine.storage.parquet import NormalizedParquetStore
 from btc_quarter_hour_engine.storage.raw import ImmutableRawStore
+from btc_quarter_hour_engine.storage.forward_parquet import ForwardParquetStore
+from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
 
 from .coinbase_rest import CoinbasePublicRESTClient
-from .config import CoinbaseRESTConfig
+from .coinbase_websocket import CoinbaseWebSocketClient
+from .collector import WebSocketCollector
+from .config import CoinbaseRESTConfig, CoinbaseWebSocketConfig
 from .service import acquire_coinbase_book_snapshot, acquire_coinbase_candles
+from .websocket_service import CoinbaseWebSocketService
+from .websocket_transport import WebsocketsTransport
 
 
 def _parse_utc(value: str) -> datetime:
@@ -74,3 +80,35 @@ def snapshot_book_main() -> None:
 
 if __name__ == "__main__":
     fetch_candles_main()
+
+
+def run_websocket_collector_main() -> None:
+    parser = argparse.ArgumentParser(description="Run the forward Coinbase WebSocket L2/BBO collector.")
+    parser.add_argument("--product", default="BTC-USD")
+    parser.add_argument("--output-root", default="data_lake")
+    parser.add_argument("--max-messages", type=int, default=None, help="Stop after this many websocket messages (omit to run indefinitely).")
+    parser.add_argument("--max-duration-seconds", type=float, default=None, help="Stop after this many wall-clock seconds (omit to run indefinitely).")
+    args = parser.parse_args()
+
+    config = CoinbaseWebSocketConfig(product_id=args.product)
+    client = CoinbaseWebSocketClient(config=config, transport=WebsocketsTransport())
+    service = CoinbaseWebSocketService(config=config, client=client)
+    raw_segment_writer = RawSegmentWriter(
+        args.output_root, product_id=args.product, max_frames=config.raw_segment_max_frames
+    )
+    forward_store = ForwardParquetStore(args.output_root)
+    collector = WebSocketCollector(
+        service=service,
+        raw_segment_writer=raw_segment_writer,
+        forward_store=forward_store,
+        output_root=args.output_root,
+    )
+    result = collector.run(max_messages=args.max_messages, max_duration_seconds=args.max_duration_seconds)
+    print(f"dataset_id={result.manifest['dataset_id']}")
+    print(f"manifest_path={result.manifest_path}")
+    print(f"raw_segment_count={len(result.raw_segments)}")
+    print(f"observation_count={result.observation_count}")
+    print(f"eligible_observation_count={result.eligible_observation_count}")
+    print(f"connection_count={result.connection_count}")
+    print(f"reconnect_count={result.reconnect_count}")
+    print(f"canonical_target_eligible={str(result.manifest['canonical_target_eligible']).lower()}")

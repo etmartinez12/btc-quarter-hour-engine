@@ -65,6 +65,19 @@ class Level2OrderBook:
         self.state = OrderBookState.UNINITIALIZED
         self.last_error = None
 
+    def reset_for_new_connection(self) -> None:
+        """Full reset used when starting a brand new connection epoch.
+
+        Unlike :meth:`reset` (used for an in-band resnapshot on the *same*
+        connection, where sequence numbers must remain continuous),
+        this also clears ``last_sequence_num`` because Coinbase sequence
+        numbers are scoped per websocket connection: a sequence number from
+        a prior connection must never be compared against one from a new
+        connection for gap detection.
+        """
+        self.reset()
+        self.last_sequence_num = None
+
     def _require_valid_price(self, price: Any, *, field_name: str = "price") -> float:
         try:
             numeric = float(price)
