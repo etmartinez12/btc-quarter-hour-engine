@@ -66,6 +66,9 @@ def test_acquisition_preserves_exact_bytes_real_coverage_and_schema(tmp_path):
         assert artifact["records_received"] == 1
         assert artifact["first_returned_timestamp"] == artifact["last_returned_timestamp"]
         assert artifact["sha256"] == hashlib.sha256(payloads[index]).hexdigest()
+        assert artifact["http_status_code"] == 200
+        assert artifact["content_type"] == "application/json"
+        assert artifact["retrieved_at_utc"].endswith("Z")
         assert ImmutableRawStore(tmp_path).read_response(artifact["path"]) == payloads[index]
         metadata = json.loads(Path(artifact["path"]).with_name(
             Path(artifact["path"]).name.replace(".json.gz", ".meta.json")

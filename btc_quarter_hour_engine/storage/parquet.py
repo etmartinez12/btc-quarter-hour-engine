@@ -59,7 +59,7 @@ class NormalizedParquetStore:
                 try:
                     os.link(temporary, target)
                 except FileExistsError:
-                    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                    if target.read_bytes() != temporary.read_bytes():
                         raise ValueError(f"Normalized artifact conflict: {target}")
                 artifacts.append({
                     "path": str(target),
