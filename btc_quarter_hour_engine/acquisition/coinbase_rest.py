@@ -1,26 +1,59 @@
 from __future__ import annotations
 
-import json
+import math
+import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
+from urllib.parse import quote
 
 import httpx
 import pandas as pd
 
+from .chunking import _SUPPORTED_GRANULARITIES, _coerce_utc, _normalize_granularity
 from .config import CoinbaseRESTConfig
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-PERMANENT_ERROR_CODES = {400, 401, 403, 404}
+TIME_PATH = "/api/v3/brokerage/time"
+PRODUCT_PATH = "/api/v3/brokerage/market/products/{product_id}"
+CANDLES_PATH = PRODUCT_PATH + "/candles"
+BOOK_PATH = "/api/v3/brokerage/market/product_book"
+TICKER_PATH = PRODUCT_PATH + "/ticker"
 
 
-def _as_utc_iso(value: datetime) -> str:
-    utc_value = value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    return utc_value.isoformat().replace("+00:00", "Z")
+def validate_product_id(product_id: str) -> str:
+    if not isinstance(product_id, str) or not re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+", product_id):
+        raise ValueError("product_id must be a safe Coinbase product identifier (for example BTC-USD)")
+    return product_id
+
+
+def _product_path(template: str, product_id: str) -> str:
+    validate_product_id(product_id)
+    return template.format(product_id=quote(product_id, safe="-"))
+
+
+def _unix_seconds(value: datetime) -> str:
+    utc = _coerce_utc(value)
+    if utc.microsecond:
+        raise ValueError("Unix timestamp must have whole-second precision")
+    return str(int(utc.timestamp()))
+
+
+@dataclass(frozen=True, slots=True)
+class CoinbaseHTTPResult:
+    response_bytes: bytes
+    json_payload: Any
+    status_code: int
+    content_type: str | None
+    retrieved_at_utc: datetime
+    request_path: str
+    request_params: dict[str, Any]
 
 
 class CoinbasePublicRESTClient:
-    """Minimal Coinbase Advanced Trade public REST client with injectable HTTP transport."""
+    """Public Advanced Trade transport with exact response-byte provenance."""
 
     def __init__(
         self,
@@ -31,319 +64,248 @@ class CoinbasePublicRESTClient:
     ) -> None:
         self.config = config or CoinbaseRESTConfig()
         self.sleep_fn = sleep_fn or time.sleep
-        if client is None:
-            self.client = httpx.Client(
-                base_url=self.config.base_url,
-                timeout=self.config.timeout_seconds,
-                follow_redirects=True,
-                headers={"User-Agent": self.config.user_agent, "Accept": "application/json"},
-            )
-        else:
-            self.client = client
+        self.client = client or httpx.Client(
+            base_url=self.config.base_url,
+            timeout=self.config.timeout_seconds,
+            headers={"User-Agent": self.config.user_agent, "Accept": "application/json"},
+        )
 
-    def _request_json(self, path: str, *, params: dict[str, Any] | None = None, method: str = "GET") -> Any:
-        max_attempts = max(1, self.config.max_retries + 1)
-        for attempt in range(1, max_attempts + 1):
+    def request(self, path: str, *, params: dict[str, Any] | None = None) -> CoinbaseHTTPResult:
+        attempts = self.config.max_retries + 1
+        if attempts < 1:
+            raise ValueError("max_retries must be nonnegative")
+        for attempt in range(1, attempts + 1):
             try:
-                response = self.client.request(
-                    method,
+                response = self.client.get(
                     path,
                     params=params,
                     headers={"User-Agent": self.config.user_agent, "Accept": "application/json"},
                 )
-            except httpx.HTTPError as exc:
-                if attempt >= max_attempts or not self._is_retryable_transport_error(exc):
+            except (httpx.TimeoutException, httpx.NetworkError):
+                if attempt == attempts:
                     raise
                 self._sleep_before_retry(attempt)
                 continue
-
-            if response.status_code in RETRYABLE_STATUS_CODES:
-                if attempt >= max_attempts:
-                    raise httpx.HTTPStatusError(
-                        f"Retry budget exhausted for {path}: HTTP {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
+            if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts:
                 self._sleep_before_retry(attempt, response=response)
                 continue
-
-            if response.status_code >= 400:
-                if response.status_code in PERMANENT_ERROR_CODES:
-                    raise httpx.HTTPStatusError(
-                        f"Permanent HTTP error for {path}: {response.status_code}",
-                        request=response.request,
-                        response=response,
-                    )
-                raise httpx.HTTPStatusError(
-                    f"HTTP error for {path}: {response.status_code}",
-                    request=response.request,
-                    response=response,
-                )
-
+            response.raise_for_status()
             try:
                 payload = response.json()
-            except ValueError as exc:  # pragma: no cover - defensive path
+            except ValueError as exc:
                 raise ValueError(f"Malformed JSON response from {path}") from exc
-            return payload
-
-        raise RuntimeError(f"Request to {path} failed without producing a response")
+            return CoinbaseHTTPResult(
+                response_bytes=response.content,
+                json_payload=payload,
+                status_code=response.status_code,
+                content_type=response.headers.get("Content-Type"),
+                retrieved_at_utc=datetime.now(timezone.utc),
+                request_path=path,
+                request_params=dict(params or {}),
+            )
+        raise RuntimeError(f"Request to {path} exhausted retries")
 
     def _sleep_before_retry(self, attempt: int, *, response: httpx.Response | None = None) -> None:
-        retry_after = None
-        if response is not None:
-            retry_after_header = response.headers.get("Retry-After")
-            if retry_after_header:
+        delay = self.config.initial_backoff_seconds * 2 ** (attempt - 1)
+        if response is not None and response.headers.get("Retry-After"):
+            header = response.headers["Retry-After"]
+            try:
+                delay = max(0.0, float(header))
+            except ValueError:
                 try:
-                    retry_after = float(retry_after_header)
-                except ValueError:
-                    retry_after = None
-        delay = retry_after if retry_after is not None else self.config.initial_backoff_seconds * (2 ** (attempt - 1))
+                    delay = max(0.0, (parsedate_to_datetime(header).astimezone(timezone.utc) -
+                                      datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, OverflowError, ValueError):
+                    pass
         if self.config.max_backoff_seconds is not None:
             delay = min(delay, self.config.max_backoff_seconds)
         self.sleep_fn(delay)
 
-    @staticmethod
-    def _is_retryable_transport_error(exc: Exception) -> bool:
-        return isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.NetworkError))
+    def fetch_server_time(self) -> CoinbaseHTTPResult:
+        return self.request(TIME_PATH)
 
     def get_server_time(self) -> dict[str, Any]:
-        payload = self._request_json("/v2/time")
-        data = payload.get("data") if isinstance(payload, dict) else payload
-        if isinstance(data, dict):
-            return data
-        raise ValueError("server-time payload is not a dictionary")
+        payload = self.fetch_server_time().json_payload
+        if not isinstance(payload, dict):
+            raise ValueError("server-time payload is not an object")
+        return payload
+
+    def fetch_product(self, product_id: str) -> CoinbaseHTTPResult:
+        return self.request(_product_path(PRODUCT_PATH, product_id))
 
     def get_product(self, product_id: str) -> dict[str, Any]:
-        payload = self._request_json(f"/products/{product_id}")
-        if isinstance(payload, dict):
-            return payload
-        raise ValueError(f"Unexpected product response for {product_id!r}: {type(payload).__name__}")
+        payload = self.fetch_product(product_id).json_payload
+        if not isinstance(payload, dict):
+            raise ValueError("product payload is not an object")
+        return payload
 
-    def get_candles(
-        self,
-        product_id: str,
-        start: datetime,
-        end: datetime,
-        granularity: str = "ONE_MINUTE",
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
+    def fetch_candles(
+        self, product_id: str, start: datetime, end: datetime,
+        granularity: str = "ONE_MINUTE", limit: int | None = None,
+    ) -> CoinbaseHTTPResult:
+        if _coerce_utc(end) <= _coerce_utc(start):
+            raise ValueError("Candle end must be after start")
         params: dict[str, Any] = {
-            "start": _as_utc_iso(start),
-            "end": _as_utc_iso(end),
-            "granularity": granularity,
+            "start": _unix_seconds(start),
+            # Coinbase may include an end-boundary bucket; use the last second in [start, end).
+            "end": str(int(_coerce_utc(end).timestamp()) - 1),
+            "granularity": _normalize_granularity(granularity),
         }
         if limit is not None:
             params["limit"] = int(limit)
-        payload = self._request_json(f"/products/{product_id}/candles", params=params)
-        candles = self.parse_candle_payload(payload)
-        return candles
+        return self.request(_product_path(CANDLES_PATH, product_id), params=params)
 
-    def get_product_book(self, product_id: str, limit: int | None = None) -> dict[str, Any]:
-        params = {"limit": int(limit)} if limit is not None else None
-        payload = self._request_json(f"/products/{product_id}/book", params=params)
-        return self.parse_product_book_response(payload)
+    def get_candles(
+        self, product_id: str, start: datetime, end: datetime,
+        granularity: str = "ONE_MINUTE", limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return parse_coinbase_candle_records(
+            self.fetch_candles(product_id, start, end, granularity, limit).json_payload
+        )
 
-    def get_market_trades(self, product_id: str, limit: int | None = None, after: int | None = None) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {}
+    def fetch_product_book(self, product_id: str, limit: int | None = None) -> CoinbaseHTTPResult:
+        params: dict[str, Any] = {"product_id": validate_product_id(product_id)}
         if limit is not None:
             params["limit"] = int(limit)
-        if after is not None:
-            params["after"] = int(after)
-        payload = self._request_json(f"/products/{product_id}/trades", params=params or None)
-        return self.parse_trade_payload(payload)
+        return self.request(BOOK_PATH, params=params)
 
-    @staticmethod
-    def parse_candle_payload(payload: Any) -> list[dict[str, Any]]:
-        return parse_coinbase_candle_records(payload)
+    def get_product_book(self, product_id: str, limit: int | None = None) -> dict[str, Any]:
+        return parse_product_book_response(self.fetch_product_book(product_id, limit).json_payload)
 
-    @staticmethod
-    def parse_product_book_response(payload: Any) -> dict[str, Any]:
-        if isinstance(payload, dict):
-            bids = payload.get("bids") or payload.get("best_bid_levels") or []
-            asks = payload.get("asks") or payload.get("best_ask_levels") or []
-            if not bids or not asks:
-                candidates = payload.get("data")
-                if isinstance(candidates, dict):
-                    bids = candidates.get("bids") or []
-                    asks = candidates.get("asks") or []
-            if not bids or not asks:
-                raise ValueError("Product book payload missing bid/ask levels")
+    def fetch_market_trades(self, product_id: str, limit: int | None = None) -> CoinbaseHTTPResult:
+        params = {"limit": int(limit)} if limit is not None else None
+        return self.request(_product_path(TICKER_PATH, product_id), params=params)
 
-            best_bid = float(bids[0][0]) if isinstance(bids[0], (list, tuple)) else float(bids[0]["price"])
-            best_bid_size = float(bids[0][1]) if isinstance(bids[0], (list, tuple)) else float(bids[0].get("size", 0.0))
-            best_ask = float(asks[0][0]) if isinstance(asks[0], (list, tuple)) else float(asks[0]["price"])
-            best_ask_size = float(asks[0][1]) if isinstance(asks[0], (list, tuple)) else float(asks[0].get("size", 0.0))
-            return {
-                "best_bid": best_bid,
-                "best_bid_size": best_bid_size,
-                "best_ask": best_ask,
-                "best_ask_size": best_ask_size,
-                "spread": best_ask - best_bid,
-                "midpoint": (best_bid + best_ask) / 2.0,
-            }
-        raise ValueError(f"Could not parse product book payload from {type(payload).__name__}")
+    def get_market_trades(self, product_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        payload = self.fetch_market_trades(product_id, limit).json_payload
+        if not isinstance(payload, dict) or not isinstance(payload.get("trades"), list):
+            raise ValueError("Ticker payload missing trades array")
+        return payload["trades"]
 
-    @staticmethod
-    def parse_trade_payload(payload: Any) -> list[dict[str, Any]]:
-        if isinstance(payload, dict):
-            trades = payload.get("trades") or payload.get("data")
-            if isinstance(trades, list):
-                return trades
-        if isinstance(payload, list):
-            return payload
-        raise ValueError(f"Could not parse market-trade payload from {type(payload).__name__}")
+    parse_candle_payload = staticmethod(lambda payload: parse_coinbase_candle_records(payload))
+    parse_product_book_response = staticmethod(lambda payload: parse_product_book_response(payload))
 
     def close(self) -> None:
         self.client.close()
 
 
-def _extract_granularity_seconds(granularity: str) -> int:
-    mapping = {
-        "ONE_MINUTE": 60,
-        "FIVE_MINUTE": 300,
-        "FIFTEEN_MINUTE": 900,
-        "THIRTY_MINUTE": 1800,
-        "ONE_HOUR": 3600,
-        "SIX_HOUR": 21600,
-        "ONE_DAY": 86400,
-    }
-    normalized = str(granularity).upper()
-    if normalized not in mapping:
-        raise ValueError(f"Unsupported candle granularity: {granularity!r}")
-    return mapping[normalized]
+def _bucket_timestamp(value: Any) -> datetime:
+    if isinstance(value, str) and value.isdecimal() or isinstance(value, int):
+        try:
+            return datetime.fromtimestamp(int(value), timezone.utc)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError(f"Invalid candle timestamp: {value!r}") from exc
+    if isinstance(value, datetime):
+        return _coerce_utc(value)
+    if isinstance(value, str):
+        try:
+            return _coerce_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        except ValueError as exc:
+            raise ValueError(f"Invalid candle timestamp: {value!r}") from exc
+    raise ValueError(f"Invalid candle timestamp: {value!r}")
 
 
 def parse_coinbase_candle_records(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        normalized = []
-        for item in payload:
-            if isinstance(item, (list, tuple)) and len(item) >= 6:
-                timestamp, low, high, open_, close, volume = item[:6]
-                normalized.append(
-                    {
-                        "time": timestamp,
-                        "low": float(low),
-                        "high": float(high),
-                        "open": float(open_),
-                        "close": float(close),
-                        "volume": float(volume),
-                    }
-                )
-        return normalized
-
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if data is None and isinstance(payload, dict):
-        data = payload.get("candles")
-    if isinstance(data, list):
-        records: list[dict[str, Any]] = []
-        for item in data:
-            if isinstance(item, dict):
-                if "time" not in item and "bucket_start" in item:
-                    item = {**item, "time": item["bucket_start"]}
-                timestamp = item.get("time")
-                record = {
-                    "time": timestamp,
-                    "low": float(item.get("low", 0.0)),
-                    "high": float(item.get("high", 0.0)),
-                    "open": float(item.get("open", 0.0)),
-                    "close": float(item.get("close", 0.0)),
-                    "volume": float(item.get("volume", 0.0)),
-                }
-                records.append(record)
-        return records
-    raise ValueError(f"Could not parse candle payload from response of type {type(payload).__name__}")
+    if not isinstance(payload, dict) or not isinstance(payload.get("candles"), list):
+        raise ValueError("Candle response missing candles array")
+    records = []
+    for index, item in enumerate(payload["candles"]):
+        if not isinstance(item, dict):
+            raise ValueError(f"Candle #{index} is not an object")
+        try:
+            records.append({
+                "bucket_start": _bucket_timestamp(item["start"]),
+                **{name: float(item[name]) for name in ("open", "high", "low", "close", "volume")},
+            })
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid candle #{index}: {exc}") from exc
+    return sorted(records, key=lambda record: record["bucket_start"])
 
 
 def validate_candle_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not isinstance(records, list):
-        raise TypeError("records must be a list of candle dictionaries")
-
+        raise TypeError("records must be a list")
     validated: list[dict[str, Any]] = []
     seen: set[datetime] = set()
     for index, record in enumerate(records):
         if not isinstance(record, dict):
-            raise ValueError(f"Candle record #{index} is not a dictionary")
-        required = ["time", "open", "high", "low", "close", "volume"]
-        missing = [name for name in required if name not in record]
-        if missing:
-            raise ValueError(f"Candle record #{index} missing required keys: {missing}")
-
-        bucket = pd.to_datetime(record["time"], utc=True, errors="coerce")
-        if pd.isna(bucket):
-            raise ValueError(f"Candle record #{index} has invalid timestamp: {record['time']!r}")
+            raise ValueError(f"Candle #{index} is not an object")
+        try:
+            bucket = _bucket_timestamp(record["bucket_start"])
+            values = {name: float(record[name]) for name in ("open", "high", "low", "close", "volume")}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid candle #{index}: {exc}") from exc
         if bucket in seen:
-            raise ValueError(f"Duplicate bucket timestamp in normalized candles: {bucket.isoformat()}")
+            raise ValueError(f"Duplicate bucket timestamp: {bucket.isoformat()}")
         seen.add(bucket)
-
-        values = {"open": float(record["open"]), "high": float(record["high"]), "low": float(record["low"]), "close": float(record["close"]), "volume": float(record["volume"])}
-        if not all(pd.notna(pd.Series(list(values.values())))):
-            raise ValueError(f"Candle record #{index} contains non-finite or NaN values")
-        if values["open"] <= 0 or values["high"] <= 0 or values["low"] <= 0 or values["close"] <= 0:
-            raise ValueError(f"Candle record #{index} contains nonpositive OHLC values")
+        if not all(math.isfinite(value) for value in values.values()):
+            raise ValueError(f"Candle #{index} has non-finite OHLCV")
+        if any(values[name] <= 0 for name in ("open", "high", "low", "close")):
+            raise ValueError(f"Candle #{index} has nonpositive OHLC")
         if values["volume"] < 0:
-            raise ValueError(f"Candle record #{index} has negative volume")
-        if values["high"] < values["low"]:
-            raise ValueError(f"Candle record #{index} has high < low")
-        if values["high"] < max(values["open"], values["close"]):
-            raise ValueError(f"Candle record #{index} has inconsistent high relative to open/close")
-        if values["low"] > min(values["open"], values["close"]):
-            raise ValueError(f"Candle record #{index} has inconsistent low relative to open/close")
-
-        validated.append({
-            "time": bucket.isoformat().replace("+00:00", "Z"),
-            "open": values["open"],
-            "high": values["high"],
-            "low": values["low"],
-            "close": values["close"],
-            "volume": values["volume"],
-        })
-
-    return sorted(validated, key=lambda x: x["time"])
+            raise ValueError(f"Candle #{index} has negative volume")
+        if values["high"] < values["low"] or values["high"] < max(values["open"], values["close"]) or \
+                values["low"] > min(values["open"], values["close"]):
+            raise ValueError(f"Candle #{index} has inconsistent OHLC")
+        validated.append({"bucket_start": bucket, **values})
+    return sorted(validated, key=lambda record: record["bucket_start"])
 
 
-def coverage_diagnostics_for_candles(
-    *,
-    records: list[dict[str, Any]],
-    start: datetime,
-    end: datetime,
-    granularity: str,
-) -> dict[str, Any]:
-    start_utc = start.astimezone(timezone.utc) if start.tzinfo else start.replace(tzinfo=timezone.utc)
-    end_utc = end.astimezone(timezone.utc) if end.tzinfo else end.replace(tzinfo=timezone.utc)
-    step_seconds = _extract_granularity_seconds(granularity)
-    expected_timestamps = pd.date_range(start=start_utc, end=end_utc, freq=pd.to_timedelta(step_seconds, unit="s"), tz="UTC")
-    observed_timestamps = pd.DatetimeIndex(
-        pd.to_datetime([record["time"] if isinstance(record.get("time"), str) else record["time"] for record in records], utc=True)
-    )
-    expected_keys = set(expected_timestamps)
-    observed_keys = set(observed_timestamps)
-    missing = sorted(expected_keys - observed_keys)
-    duplicate_count = len(records) - len(observed_timestamps.drop_duplicates()) if len(records) else 0
-    observed_bucket_count = len(observed_keys)
-    coverage_fraction = (observed_bucket_count / len(expected_keys)) if expected_keys else 0.0
+def parse_product_book_response(payload: Any) -> dict[str, Any]:
+    book = payload.get("pricebook") if isinstance(payload, dict) else None
+    if not isinstance(book, dict):
+        raise ValueError("Product book response missing pricebook")
+    if not isinstance(book.get("bids"), list) or not book["bids"]:
+        raise ValueError("Product book missing bids")
+    if not isinstance(book.get("asks"), list) or not book["asks"]:
+        raise ValueError("Product book missing asks")
+    try:
+        levels = {}
+        for side in ("bids", "asks"):
+            levels[side] = []
+            for level in book[side]:
+                price, size = float(level["price"]), float(level["size"])
+                if not math.isfinite(price) or not math.isfinite(size) or price <= 0 or size < 0:
+                    raise ValueError(f"Invalid {side} level price or size")
+                levels[side].append((price, size))
+        best_bid, bid_size = max(levels["bids"], key=lambda level: level[0])
+        best_ask, ask_size = min(levels["asks"], key=lambda level: level[0])
+        source_time = _bucket_timestamp(book["time"])
+        product_id = book["product_id"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid product book: {exc}") from exc
+    if not isinstance(product_id, str) or not product_id:
+        raise ValueError("Invalid product book product_id")
+    if best_bid > best_ask:
+        raise ValueError("Product book has invalid or crossed quotes")
     return {
-        "expected_bucket_count": len(expected_keys),
-        "observed_bucket_count": observed_bucket_count,
-        "missing_bucket_count": len(missing),
-        "duplicate_bucket_count": duplicate_count,
-        "first_bucket": expected_timestamps[0].isoformat() if len(expected_timestamps) else None,
-        "last_bucket": expected_timestamps[-1].isoformat() if len(expected_timestamps) else None,
-        "coverage_fraction": coverage_fraction,
-        "missing_timestamps": [value.isoformat() for value in missing[:50]],
+        "product_id": product_id, "source_time_utc": source_time,
+        "best_bid": best_bid, "best_bid_size": bid_size,
+        "best_ask": best_ask, "best_ask_size": ask_size,
+        "spread": best_ask - best_bid, "midpoint": (best_bid + best_ask) / 2,
     }
 
 
-def main() -> None:  # pragma: no cover
-    print("Coinbase public REST client is available for acquisition utilities.")
-
-
-__all__ = [
-    "CoinbasePublicRESTClient",
-    "CoinbaseRESTConfig",
-    "RETRYABLE_STATUS_CODES",
-    "PERMANENT_ERROR_CODES",
-    "parse_coinbase_candle_records",
-    "validate_candle_records",
-    "coverage_diagnostics_for_candles",
-    "main",
-]
+def coverage_diagnostics_for_candles(
+    *, records: list[dict[str, Any]], start: datetime, end: datetime, granularity: str,
+) -> dict[str, Any]:
+    start_utc, end_utc = _coerce_utc(start), _coerce_utc(end)
+    step = _SUPPORTED_GRANULARITIES[_normalize_granularity(granularity)]
+    if end_utc <= start_utc or start_utc.timestamp() % step or end_utc.timestamp() % step:
+        raise ValueError("Coverage interval must be aligned and nonempty")
+    expected = pd.date_range(start_utc, end_utc, freq=f"{step}s", inclusive="left")
+    observed = [pd.Timestamp(_bucket_timestamp(record["bucket_start"])) for record in records]
+    expected_set, observed_set = set(expected), set(observed)
+    if observed_set - expected_set:
+        raise ValueError("Returned candle timestamp outside requested interval or granularity")
+    missing = sorted(expected_set - observed_set)
+    return {
+        "expected_bucket_count": len(expected),
+        "observed_bucket_count": len(observed_set),
+        "missing_bucket_count": len(missing),
+        "duplicate_bucket_count": len(observed) - len(observed_set),
+        "first_bucket": min(observed).isoformat() if observed else None,
+        "last_bucket": max(observed).isoformat() if observed else None,
+        "coverage_fraction": len(observed_set) / len(expected),
+        "missing_timestamps": [value.isoformat() for value in missing[:50]],
+    }

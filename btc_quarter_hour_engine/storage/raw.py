@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -42,6 +42,8 @@ class ImmutableRawStore:
     ) -> RawArtifact:
         if not isinstance(response_bytes, (bytes, bytearray)):
             raise TypeError("response_bytes must be bytes-like")
+        if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
+            raise ValueError("retrieved_at must be timezone-aware")
         payload = bytes(response_bytes)
         digest = hashlib.sha256(payload).hexdigest()
         target_dir = self.raw_root / source / data_kind / product_id
@@ -58,6 +60,8 @@ class ImmutableRawStore:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 if metadata.get("sha256") != digest:
                     raise ValueError(f"Metadata hash mismatch for {metadata_path}")
+            else:
+                raise ValueError(f"Raw artifact metadata missing: {metadata_path}")
             return RawArtifact(
                 source=source,
                 data_kind=data_kind,
@@ -66,7 +70,7 @@ class ImmutableRawStore:
                 byte_count=len(payload),
                 path=compressed_path,
                 metadata_path=metadata_path,
-                retrieved_at=retrieved_at,
+                retrieved_at=retrieved_at.astimezone(timezone.utc),
             )
 
         compressed_payload = gzip.compress(payload, compresslevel=9, mtime=0)
@@ -77,9 +81,13 @@ class ImmutableRawStore:
             "data_kind": data_kind,
             "product_id": product_id,
             "request_metadata": request_metadata,
-            "retrieved_at_utc": retrieved_at.astimezone().isoformat() if retrieved_at.tzinfo else retrieved_at.isoformat(),
+            "retrieved_at_utc": retrieved_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
             "sha256": digest,
             "byte_count": len(payload),
+            "http_status_code": request_metadata.get("http_status_code"),
+            "content_type": request_metadata.get("content_type"),
+            "request_path": request_metadata.get("request_path"),
+            "request_params": request_metadata.get("request_params"),
             "raw_artifact_path": str(compressed_path),
         }
         self._atomic_write_bytes(metadata_path, json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8"))
@@ -92,7 +100,7 @@ class ImmutableRawStore:
             byte_count=len(payload),
             path=compressed_path,
             metadata_path=metadata_path,
-            retrieved_at=retrieved_at,
+            retrieved_at=retrieved_at.astimezone(timezone.utc),
         )
 
     def read_response(self, path: str | Path) -> bytes:
@@ -107,7 +115,13 @@ class ImmutableRawStore:
             tmp_file.write(payload)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        os.replace(tmp_filename, path)
+        try:
+            os.link(tmp_filename, path)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise ValueError(f"Existing immutable artifact differs: {path}")
+        finally:
+            tmp_filename.unlink(missing_ok=True)
 
     def verify_digest(self, path: str | Path, expected_sha256: str) -> bool:
         computed = hashlib.sha256(self.read_response(path)).hexdigest()

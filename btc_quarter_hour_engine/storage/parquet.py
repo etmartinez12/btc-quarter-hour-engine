@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import pandas as pd
 import pyarrow as pa
@@ -23,45 +24,54 @@ class NormalizedParquetStore:
         data_kind: str,
         granularity: str | None = None,
         schema_version: str = "1",
-    ) -> dict:
-        dataframe = dataframe.copy()
-        row_count = len(dataframe)
-        first_timestamp = None
-        last_timestamp = None
-        if "bucket_start" in dataframe.columns:
-            timestamps = pd.to_datetime(dataframe["bucket_start"], utc=True)
-            if not timestamps.empty:
-                first_timestamp = timestamps.min().isoformat()
-                last_timestamp = timestamps.max().isoformat()
-        elif "retrieved_at_utc" in dataframe.columns:
-            timestamps = pd.to_datetime(dataframe["retrieved_at_utc"], utc=True)
-            if not timestamps.empty:
-                first_timestamp = timestamps.min().isoformat()
-                last_timestamp = timestamps.max().isoformat()
-
-        partition_dir = self.normalized_root / source / f"product_id={product_id}" / f"data_kind={data_kind}"
+    ) -> list[dict]:
+        timestamp_field = "bucket_start" if data_kind == "candles" else "source_time_utc"
+        if dataframe.empty or timestamp_field not in dataframe:
+            raise ValueError(f"Nonempty normalized data requires {timestamp_field}")
+        frame = dataframe.copy()
+        if any(pd.Timestamp(value).tzinfo is None for value in frame[timestamp_field]):
+            raise ValueError(f"{timestamp_field} must be timezone-aware")
+        frame[timestamp_field] = pd.to_datetime(frame[timestamp_field], utc=True)
+        frame = frame.sort_values(timestamp_field).reset_index(drop=True)
+        if data_kind == "candles" and frame[timestamp_field].duplicated().any():
+            raise ValueError("Duplicate normalized candle bucket")
+        partition_root = self.normalized_root / source / product_id / data_kind
         if granularity is not None:
-            partition_dir = partition_dir / f"granularity={str(granularity).upper()}"
+            partition_root = partition_root / granularity.upper()
 
-        if first_timestamp is not None:
-            date_value = pd.to_datetime(first_timestamp, utc=True).strftime("%Y-%m-%d")
-            partition_dir = partition_dir / f"date={date_value}"
-
-        partition_dir.mkdir(parents=True, exist_ok=True)
-        target_path = partition_dir / "part-00000.parquet"
-
-        table = pa.Table.from_pandas(dataframe, preserve_index=False)
-        pq.write_table(table, target_path)
-
-        digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
-        return {
-            "path": str(target_path),
-            "sha256": digest,
-            "row_count": row_count,
-            "first_timestamp": first_timestamp,
-            "last_timestamp": last_timestamp,
-            "schema_version": schema_version,
-            "product_id": product_id,
-            "source": source,
-            "data_kind": data_kind,
-        }
+        artifacts: list[dict] = []
+        for day, partition in frame.groupby(frame[timestamp_field].dt.strftime("%Y-%m-%d"), sort=True):
+            destination = partition_root / f"date={day}"
+            destination.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(dir=destination, prefix=".part-", suffix=".parquet", delete=False) as handle:
+                temporary = Path(handle.name)
+            try:
+                table = pa.Table.from_pandas(partition.reset_index(drop=True), preserve_index=False)
+                table = table.replace_schema_metadata({
+                    **(table.schema.metadata or {}),
+                    b"schema_version": schema_version.encode("ascii"),
+                })
+                pq.write_table(table, temporary)
+                with temporary.open("rb+") as handle:
+                    os.fsync(handle.fileno())
+                digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+                target = destination / f"part-{digest}.parquet"
+                try:
+                    os.link(temporary, target)
+                except FileExistsError:
+                    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                        raise ValueError(f"Normalized artifact conflict: {target}")
+                artifacts.append({
+                    "path": str(target),
+                    "sha256": digest,
+                    "row_count": len(partition),
+                    "first_timestamp": partition[timestamp_field].min().isoformat(),
+                    "last_timestamp": partition[timestamp_field].max().isoformat(),
+                    "schema_version": schema_version,
+                    "product_id": product_id,
+                    "source": source,
+                    "data_kind": data_kind,
+                })
+            finally:
+                temporary.unlink(missing_ok=True)
+        return artifacts

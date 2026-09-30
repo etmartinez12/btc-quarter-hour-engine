@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -18,8 +18,8 @@ def _utc_isotime(value: datetime | None) -> str | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.isoformat()
-    return value.astimezone().isoformat()
+        raise ValueError("Manifest timestamps must be timezone-aware")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _git_sha() -> str | None:
@@ -28,7 +28,7 @@ def _git_sha() -> str | None:
         return env_sha
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip() or None
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return None
 
 
@@ -51,7 +51,7 @@ def build_dataset_id(
         "requested_start": _utc_isotime(requested_start) if isinstance(requested_start, datetime) else requested_start,
         "requested_end": _utc_isotime(requested_end) if isinstance(requested_end, datetime) else requested_end,
         "granularity": granularity,
-        "raw_artifact_hashes": sorted(raw_artifact_hashes),
+        "raw_artifact_hashes": raw_artifact_hashes,
     }
     serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
@@ -75,6 +75,7 @@ def build_manifest(
     request_count: int = 0,
     schema_version: str = COINBASE_CANDLE_SCHEMA_VERSION,
     dataset_id: str | None = None,
+    purpose: str | None = None,
 ) -> dict[str, Any]:
     raw_hashes = [artifact.get("sha256") for artifact in raw_artifacts if artifact.get("sha256")]
     resolved_id = dataset_id or build_dataset_id(
@@ -109,6 +110,7 @@ def build_manifest(
         "coverage": coverage,
         "canonical_target_eligible": canonical_target_eligible,
         "canonical_target_ineligibility_reason": canonical_target_ineligibility_reason,
+        "purpose": purpose,
         "schema_version": schema_version,
         "software": {
             "package_version": package_version,
@@ -122,7 +124,24 @@ def write_manifest(manifest: dict[str, Any], output_root: str | Path) -> Path:
     root = Path(output_root)
     manifest_dir = root / "manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
-    dataset_id = str(manifest.get("dataset_id", "unknown"))
+    dataset_id = str(manifest["dataset_id"])
+    if len(dataset_id) != 64 or any(character not in "0123456789abcdef" for character in dataset_id):
+        raise ValueError("Invalid dataset_id")
     target_path = manifest_dir / f"{dataset_id}.json"
-    target_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    from tempfile import NamedTemporaryFile
+
+    payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+    with NamedTemporaryFile(dir=manifest_dir, prefix=f".{dataset_id}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        try:
+            os.link(temporary, target_path)
+        except FileExistsError:
+            if target_path.read_bytes() != payload:
+                raise ValueError(f"Manifest conflict for dataset ID {dataset_id}")
+    finally:
+        temporary.unlink(missing_ok=True)
     return target_path

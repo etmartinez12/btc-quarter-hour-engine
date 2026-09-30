@@ -21,7 +21,6 @@ class CandleChunk:
     chunk_number: int
     requested_start: datetime
     requested_end: datetime
-    endpoint: str
 
 
 def _coerce_utc(dt: datetime) -> datetime:
@@ -56,6 +55,8 @@ def build_candle_chunk_plan(
         raise ValueError("max_candles_per_request must be positive.")
 
     max_window_seconds = max_candles_per_request * chunk_seconds
+    if start_utc.timestamp() % chunk_seconds or end_utc.timestamp() % chunk_seconds:
+        raise ValueError("Candle range boundaries must align with the requested granularity.")
     chunks: list[CandleChunk] = []
     cursor = start_utc
     chunk_number = 1
@@ -66,7 +67,6 @@ def build_candle_chunk_plan(
                 chunk_number=chunk_number,
                 requested_start=cursor,
                 requested_end=chunk_end,
-                endpoint="/products/BTC-USD/candles",
             )
         )
         cursor = chunk_end

@@ -1,50 +1,63 @@
-from __future__ import annotations
-
 from datetime import datetime, timezone
 
-import pandas as pd
+import numpy as np
 import pytest
 
 from btc_quarter_hour_engine.acquisition.coinbase_rest import (
-    coverage_diagnostics_for_candles,
-    parse_coinbase_candle_records,
-    validate_candle_records,
+    coverage_diagnostics_for_candles, parse_coinbase_candle_records, validate_candle_records,
 )
 
-
-def test_parse_and_validate_candle_records():
-    payload = {
-        "candles": [
-            {"time": "2024-01-01T12:00:00Z", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume": 10.0},
-            {"time": "2024-01-01T12:01:00Z", "open": 100.5, "high": 101.5, "low": 100.0, "close": 101.0, "volume": 12.5},
-        ]
-    }
-    records = parse_coinbase_candle_records(payload)
-    validated = validate_candle_records(records)
-    assert len(validated) == 2
-    assert validated[0]["time"].endswith("Z")
-    assert pd.to_datetime(validated[0]["time"], utc=True).tzinfo is not None
+START = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
 
-def test_missing_bucket_diagnostics_count_missing_ranges():
-    start = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
-    end = datetime(2024, 1, 1, 12, 4, tzinfo=timezone.utc)
-    records = [
-        {"time": "2024-01-01T12:00:00Z", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0},
-        {"time": "2024-01-01T12:01:00Z", "open": 101.0, "high": 102.0, "low": 100.0, "close": 101.0, "volume": 2.0},
-        {"time": "2024-01-01T12:03:00Z", "open": 103.0, "high": 104.0, "low": 102.0, "close": 103.0, "volume": 3.0},
-        {"time": "2024-01-01T12:04:00Z", "open": 104.0, "high": 105.0, "low": 103.0, "close": 104.0, "volume": 4.0},
-    ]
-    coverage = coverage_diagnostics_for_candles(records=records, start=start, end=end, granularity="ONE_MINUTE")
-    assert coverage["expected_bucket_count"] == 5
-    assert coverage["observed_bucket_count"] == 4
-    assert coverage["missing_bucket_count"] == 1
-    assert coverage["coverage_fraction"] == pytest.approx(0.8)
-    assert "2024-01-01T12:02:00+00:00" in coverage["missing_timestamps"][0]
+def candle(start="1704067200", **overrides):
+    return {"start": start, "low": "99", "high": "102", "open": "100", "close": "101", "volume": "0.5", **overrides}
 
 
-def test_validate_rejects_inconsistent_ohlc():
+def test_current_candle_shape_sorted_and_utc():
+    parsed = parse_coinbase_candle_records({"candles": [candle("1704067260"), candle()]})
+    validated = validate_candle_records(parsed)
+    assert validated[0]["bucket_start"] == START
+    assert validated[0]["bucket_start"].tzinfo is timezone.utc
+    assert validated[0]["open"] == 100.0
+    assert validated[1]["bucket_start"] > validated[0]["bucket_start"]
+    assert set(validated[0]) == {"bucket_start", "open", "high", "low", "close", "volume"}
+
+
+@pytest.mark.parametrize("overrides", [
+    {"open": 0}, {"high": 0}, {"low": 0}, {"close": 0},
+    {"open": -1}, {"volume": -1}, {"open": np.nan},
+    {"high": np.inf}, {"low": -np.inf}, {"high": 98},
+    {"high": 99}, {"high": 100}, {"low": 101}, {"low": 102},
+])
+def test_invalid_ohlcv_rejected(overrides):
     with pytest.raises(ValueError):
-        validate_candle_records([
-            {"time": "2024-01-01T12:00:00Z", "open": 100.0, "high": 99.0, "low": 98.0, "close": 99.5, "volume": 1.0}
-        ])
+        validate_candle_records([{**parse_coinbase_candle_records({"candles": [candle()]})[0], **overrides}])
+
+
+def test_invalid_and_duplicate_timestamp_rejected():
+    with pytest.raises(ValueError, match="Invalid candle"):
+        parse_coinbase_candle_records({"candles": [candle("not-a-timestamp")]})
+    record = parse_coinbase_candle_records({"candles": [candle()]})[0]
+    with pytest.raises(ValueError, match="Duplicate"):
+        validate_candle_records([record, record])
+
+
+def test_half_open_coverage_and_missing_bucket():
+    records = validate_candle_records(parse_coinbase_candle_records({
+        "candles": [candle(), candle("1704067320")],
+    }))
+    coverage = coverage_diagnostics_for_candles(
+        records=records, start=START,
+        end=datetime(2024, 1, 1, 0, 3, tzinfo=timezone.utc), granularity="ONE_MINUTE",
+    )
+    assert coverage["expected_bucket_count"] == 3
+    assert coverage["observed_bucket_count"] == 2
+    assert coverage["missing_bucket_count"] == 1
+    assert coverage["coverage_fraction"] == pytest.approx(2 / 3)
+    assert "00:01:00" in coverage["missing_timestamps"][0]
+    with pytest.raises(ValueError, match="outside"):
+        coverage_diagnostics_for_candles(
+            records=[*records, {"bucket_start": datetime(2024, 1, 1, 0, 3, tzinfo=timezone.utc)}],
+            start=START, end=datetime(2024, 1, 1, 0, 3, tzinfo=timezone.utc), granularity="ONE_MINUTE",
+        )
