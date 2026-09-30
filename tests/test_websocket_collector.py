@@ -41,28 +41,46 @@ class FakeTransport:
         self.close_count += 1
 
 
-def _msg(message_type, **kw):
-    payload = {"type": message_type}
-    payload.update(kw)
-    return json.dumps(payload)
+def _l2_message(event_type, seq, timestamp, updates):
+    return json.dumps(
+        {
+            "channel": "l2_data",
+            "client_id": "",
+            "timestamp": timestamp,
+            "sequence_num": seq,
+            "events": [{"type": event_type, "product_id": "BTC-USD", "updates": updates}],
+        }
+    )
 
 
 def _snapshot(seq, time, bid=100.0, ask=101.0):
-    return _msg(
-        "snapshot", product_id="BTC-USD", sequence_num=seq, time=time,
-        bids=[{"price": bid, "quantity": 1.0}], asks=[{"price": ask, "quantity": 1.0}],
+    return _l2_message(
+        "snapshot",
+        seq,
+        time,
+        [
+            {"side": "bid", "price_level": str(bid), "new_quantity": "1.0", "event_time": time},
+            {"side": "offer", "price_level": str(ask), "new_quantity": "1.0", "event_time": time},
+        ],
     )
 
 
 def _update(seq, time, side, price, quantity):
-    return _msg(
-        "l2_data", product_id="BTC-USD", sequence_num=seq, time=time,
-        changes=[{"side": side, "price": price, "new_quantity": quantity}],
+    return _l2_message(
+        "update", seq, time, [{"side": side, "price_level": str(price), "new_quantity": str(quantity), "event_time": time}]
     )
 
 
 def _heartbeat(seq, time):
-    return _msg("heartbeat", sequence=seq, time=time)
+    return json.dumps(
+        {
+            "channel": "heartbeats",
+            "client_id": "",
+            "timestamp": time,
+            "sequence_num": seq,
+            "events": [{"current_time": time, "heartbeat_counter": str(seq)}],
+        }
+    )
 
 
 def _build_collector(tmp_path, messages, *, heartbeat_timeout_seconds=30.0, config_kwargs=None, transport_kwargs=None):
@@ -110,18 +128,34 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert manifest["normalized_artifacts"] == result.normalized_artifacts
     assert manifest["coverage"]["observation_count"] == 1
     assert manifest["coverage"]["eligible_observation_count"] == 1
+    assert manifest["coverage"]["level2_update_row_count"] == result.level2_update_row_count
+    assert manifest["coverage"]["bbo_state_row_count"] == result.bbo_state_row_count
     assert manifest["acquisition_started_at_utc"] is not None
     assert manifest["acquisition_completed_at_utc"] is not None
     assert result.manifest_path.exists()
     assert json.loads(result.manifest_path.read_text())["dataset_id"] == manifest["dataset_id"]
 
-    # Normalized parquet output.
-    assert len(result.normalized_artifacts) == 1
-    frame = pd.read_parquet(result.normalized_artifacts[0]["path"])
+    # Normalized parquet output: quarter-hour BBO, plus normalized
+    # level2_updates (one row per individual book mutation across the
+    # snapshot + update messages) and bbo_state (one row per successfully
+    # applied mutation) artifacts.
+    assert len(result.bbo_normalized_artifacts) == 1
+    assert len(result.level2_update_artifacts) == 1
+    assert len(result.bbo_state_artifacts) == 1
+    assert len(result.normalized_artifacts) == 3
+    frame = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"])
     assert list(frame["eligible"]) == [True]
     assert frame["best_bid"].iloc[0] == 100.0
     assert frame["best_ask"].iloc[0] == 101.0
     assert frame["product_id"].iloc[0] == "BTC-USD"
+
+    level2_frame = pd.read_parquet(result.level2_update_artifacts[0]["path"])
+    assert len(level2_frame) == 3  # 2 snapshot levels + 1 incremental update
+    assert set(level2_frame["side"]) == {"bid", "ask"}
+
+    bbo_state_frame = pd.read_parquet(result.bbo_state_artifacts[0]["path"])
+    assert len(bbo_state_frame) == 2  # one per successfully applied message (snapshot, update)
+    assert bbo_state_frame["state"].iloc[-1] == "SYNCED"
 
     # Raw segment: exact bytes are sealed and independently readable/verifiable.
     segment = result.raw_segments[0]

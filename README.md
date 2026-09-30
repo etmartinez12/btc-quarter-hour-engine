@@ -139,15 +139,16 @@ future WebSocket BBO observations:
 
 ### Components
 
-- `acquisition/coinbase_websocket.py` — envelope parsing for `snapshot`, `l2_data`, and `heartbeat` message types (current Coinbase Advanced Trade `level2`/`heartbeats` channel shapes).
+- `acquisition/coinbase_websocket.py` — explicit dataclasses (`CoinbaseMessageEnvelope`, `Level2Event`, `Level2UpdateEntry`, `HeartbeatEvent`) modeling the *real* Coinbase Advanced Trade websocket wire shape: one outer envelope (`channel`, `sequence_num`, `timestamp`, `events`) shared by every message, with `channel: "l2_data"` events carrying `type: "snapshot"|"update"` plus an `updates` array (`side: "bid"|"offer"`, `price_level`, `new_quantity`, `event_time`), and `channel: "heartbeats"` events carrying `current_time`/`heartbeat_counter`. Malformed frames never raise inside the receive path: `CoinbaseWebSocketClient.receive_message()` always returns a frame with the exact raw bytes, setting `message=None`/`parse_error=...` on a parse failure instead, so raw capture happens strictly *before* (and independent of) parsing.
 - `acquisition/websocket_transport.py` — concrete `WebsocketsTransport`, a thin wrapper over `websockets.sync.client.connect` (blocking, no asyncio required).
-- `market_data/order_book.py` — `Level2OrderBook`, a sequence-validated L2 book. `reset()` (in-band resnapshot, same connection, sequence continuity preserved) is distinct from `reset_for_new_connection()` (genuine reconnect; Coinbase sequence numbers are scoped per-connection, so the old connection's last sequence number must not be compared against the new one).
-- `market_data/replay.py` — `BoundaryEventProcessor`/`process_parsed_event`/`replay_events`: the single shared implementation of quarter-hour boundary crossing and eligibility, used identically by live collection and offline replay so the two paths are provably deterministic and consistent with each other.
-- `acquisition/websocket_service.py` — `CoinbaseWebSocketService`: connection lifecycle, sequence-gap detection, heartbeat-health tracking, and reconnect-with-backoff, all routed through the shared boundary processor above.
-- `storage/websocket_raw.py` — `RawSegmentWriter`: buffers exact raw frame bytes (no re-serialization) and seals them into immutable, content-addressed, gzip-compressed segments (length-prefixed framing so original bytes round-trip exactly).
-- `storage/forward_parquet.py` — `ForwardParquetStore`: writes derived quarter-hour BBO observations to dated, normalized Parquet.
-- `storage/forward_manifest.py` — `build_forward_manifest`: a complete manifest (raw segment artifacts, normalized artifacts, coverage, canonical eligibility, acquisition window) for every collector run.
-- `acquisition/collector.py` — `WebSocketCollector`: the runnable receive loop tying all of the above together, with finite stop conditions (`max_messages` / `max_duration_seconds` / `stop_fn`) for testability, and reconnect handling on `ConnectionError`/stale heartbeat.
+- `market_data/order_book.py` — `Level2OrderBook`, a sequence-validated L2 book. `classify_sequence()`/`validate_sequence()` return a `SequenceDisposition` (`IN_ORDER` / `STALE` / `GAP`): a `STALE` (duplicate/redelivered) sequence number is dropped safely without raising or invalidating the book, while only a genuine `GAP` raises `SequenceGapError` and invalidates it — previously both were treated identically. `reset()` (in-band resnapshot, same connection, sequence continuity preserved) is distinct from `reset_for_new_connection()` (genuine reconnect; Coinbase sequence numbers are scoped per-connection, so the old connection's last sequence number must not be compared against the new one).
+- `market_data/replay.py` — `BoundaryEventProcessor`/`process_parsed_event`/`replay_events`: the single shared implementation of quarter-hour boundary crossing and eligibility, used identically by live collection and offline replay so the two paths are provably deterministic and consistent with each other. Replay sorts strictly by event time (inclusive of every boundary crossed, including multi-boundary jumps across quiet periods) so late-arriving/out-of-order recorded frames still land at their true event time.
+- `acquisition/websocket_service.py` — `CoinbaseWebSocketService`: connection lifecycle, stale-vs-gap sequence handling, heartbeat-health tracking, and reconnect-with-wait-for-snapshot, all routed through the shared boundary processor above. `now_fn`/`monotonic_fn` are both injectable for fully deterministic tests. Every superseded connection's diagnostics are retained in `connection_history` (not overwritten) so past reconnects remain auditable. In addition to quarter-hour BBO observations, every applied book mutation is accumulated as a normalized `level2_update_rows` entry (one row per individual price-level change, full per-update event time) and a `bbo_state_rows` entry (the resulting best-bid/ask snapshot), drained via `drain_level2_update_rows()`/`drain_bbo_state_rows()`.
+- `storage/websocket_raw.py` — `RawSegmentWriter`: buffers exact raw frame bytes (no re-serialization) and seals them into immutable, content-addressed, gzip-compressed segments (length-prefixed framing so original bytes round-trip exactly), including malformed/unparseable frames.
+- `storage/forward_schema.py` — the single source of truth for every forward-collection `data_kind`/schema-version/source constant (`quarter_hour_bbo`, `level2_updates`, `bbo_state`, `websocket_segments`, `websocket_frames`), imported everywhere those values are needed instead of being hard-coded.
+- `storage/forward_parquet.py` — `ForwardParquetStore`: writes derived quarter-hour BBO, `level2_updates`, and `bbo_state` rows to dated, normalized Parquet partitions.
+- `storage/forward_manifest.py` — `build_forward_manifest`: a complete manifest (raw segment artifacts, normalized artifacts across all three normalized kinds, coverage including `level2_update_row_count`/`bbo_state_row_count`, canonical eligibility, acquisition window) for every collector run.
+- `acquisition/collector.py` — `WebSocketCollector`: the runnable receive loop tying all of the above together, with finite stop conditions (`max_messages` / `max_duration_seconds` / `stop_fn`) for testability, and reconnect handling on `ConnectionError`/stale heartbeat. On completion it drains and persists all three normalized artifact kinds (`bbo_normalized_artifacts`, `level2_update_artifacts`, `bbo_state_artifacts` on the returned `CollectorResult`, plus their union in `normalized_artifacts` for the manifest).
 
 ### Eligibility rule
 
@@ -159,24 +160,36 @@ A quarter-hour boundary observation is `eligible = True` only if, at the moment 
 
 Ineligible observations are still recorded (with a reason implied by the unmet condition) except when the book was never synced at all for that boundary, in which case no observation is emitted for it.
 
+A sequence number that duplicates or precedes the last-applied one (`STALE`) is dropped without penalty — the book stays synced and no reconnect is triggered. Only a true forward `GAP` invalidates the book and forces a reconnect.
+
+### Reconnect and wait-for-snapshot
+
+On a connection error or a genuine sequence gap, the service reconnects and then blocks — draining and discarding any non-snapshot messages that arrive in the meantime — until a fresh `l2_data` snapshot is received or `snapshot_wait_timeout_seconds` (`CoinbaseWebSocketConfig`) elapses, at which point it gives up and surfaces the failure rather than running with a desynced book. `now_fn`/`monotonic_fn` are injectable on both `CoinbaseWebSocketClient` and `CoinbaseWebSocketService`, so this deadline logic is fully deterministic under test. Every reconnect's outcome is appended to `connection_history` rather than overwriting prior state, giving a complete audit trail of every connection attempt across a run.
+
 ### Running the collector
 
 ```bash
-btc-qh-run-coinbase-websocket-collector \
+btc-qh-collect-coinbase-bbo \
   --product BTC-USD \
   --output-root data_lake \
   --max-duration-seconds 3600
 ```
 
-Omit `--max-messages`/`--max-duration-seconds` to run indefinitely (e.g. under a supervisor process); the collector reconnects automatically on connection errors or a stale heartbeat, up to `CoinbaseWebSocketConfig.max_reconnect_attempts` (default: unlimited).
+(`btc-qh-run-coinbase-websocket-collector` remains available as a deprecated backward-compatible alias for the same entry point.)
 
-On completion (or an external stop signal), the collector seals any buffered raw frames, writes all drained observations to normalized Parquet, and writes a complete forward manifest under `data_lake/manifests/`.
+Omit `--max-messages`/`--max-duration-seconds` to run indefinitely (e.g. under a supervisor process); the collector reconnects automatically on connection errors, a genuine sequence gap, or a stale heartbeat, up to `CoinbaseWebSocketConfig.max_reconnect_attempts` (default: unlimited).
+
+On completion (or an external stop signal), the collector seals any buffered raw frames (including any malformed/unparseable ones, recorded with `message_type=malformed`), writes all drained quarter-hour BBO, `level2_updates`, and `bbo_state` rows to normalized Parquet, and writes a complete forward manifest under `data_lake/manifests/`.
 
 ### Raw segment layout and replay
 
-Sealed raw segments live under `data_lake/raw/coinbase_advanced/websocket_segments/BTC-USD/<sha256>.json.gz` (content-addressed, exact original bytes preserved via 8-byte-length-prefixed framing). Given a sealed segment, `RawSegmentWriter.read_segment_frames(path)` recovers the exact original frame byte strings, and `market_data.replay.replay_events(...)` deterministically replays them (sorted by event time) through a fresh order book and boundary processor — producing byte-for-byte the same observations (same eligibility, same values) that were derived live. This is verified directly in `tests/test_websocket_collector.py::test_collector_raw_segments_replay_to_same_observations_as_live`.
+Sealed raw segments live under `data_lake/raw/coinbase_advanced/websocket_segments/BTC-USD/<sha256>.json.gz` (content-addressed, exact original bytes preserved via 8-byte-length-prefixed framing) — including any malformed frames that failed to parse, so no wire data is ever lost to a parse error. Given a sealed segment, `RawSegmentWriter.read_segment_frames(path)` recovers the exact original frame byte strings, and `market_data.replay.replay_events(...)` deterministically replays them (sorted strictly by event time, inclusive of every boundary crossed and correctly placing late-arriving/out-of-order recorded frames at their true event time) through a fresh order book and boundary processor — producing byte-for-byte the same observations (same eligibility, same values) that were derived live. This is verified directly in `tests/test_websocket_collector.py::test_collector_raw_segments_replay_to_same_observations_as_live` and `tests/test_boundary_replay.py`.
 
-Normalized quarter-hour BBO output lives under `data_lake/normalized/coinbase_advanced/BTC-USD/quarter_hour_bbo/date=YYYY-MM-DD/part-<sha256>.parquet`, with columns `source_time_utc`, `product_id`, `best_bid`, `best_ask`, `best_bid_size`, `best_ask_size`, `midpoint`, `eligible`.
+Normalized output lives under `data_lake/normalized/coinbase_advanced/BTC-USD/<data_kind>/date=YYYY-MM-DD/part-<sha256>.parquet` for three `data_kind` values:
+
+- `quarter_hour_bbo` — one row per quarter-hour boundary observation: `source_time_utc`, `product_id`, `best_bid`, `best_ask`, `best_bid_size`, `best_ask_size`, `midpoint`, `eligible`.
+- `level2_updates` — one row per individual applied price-level change (full wire fidelity, including snapshot-seeded levels): `source_time_utc`, `product_id`, `side`, `price_level`, `new_quantity`, `sequence_num`.
+- `bbo_state` — one row per book mutation capturing the resulting best-bid/ask state: `source_time_utc`, `product_id`, `best_bid`, `best_ask`, `best_bid_size`, `best_ask_size`, `sequence_num`.
 
 ## Local Data Lake
 
@@ -328,13 +341,15 @@ The unit tests cover:
 - Phase 4 multi-model benchmark coverage and comparison outputs
 - Phase 3 microstructure sample-data coverage
 - Phase 5 ensemble benchmark outputs and leakage-safe weighting behavior
-- Coinbase WebSocket envelope parsing (snapshot/l2_data/heartbeat, malformed input)
-- L2 order-book sequence validation, crossed-book invalidation, and reset-vs-reconnect semantics
-- deterministic quarter-hour boundary eligibility (healthy/stale heartbeat, sequence gap and resync, shuffled-order replay, live-vs-replay parity)
-- WebSocket service subscribe/parse/heartbeat/reconnect behavior
-- exact-byte raw segment sealing, content-addressing, and corrupt-framing detection
+- Coinbase WebSocket real envelope parsing (`channel`/`events` for `l2_data` snapshot/update and `heartbeats`, malformed frames/envelopes)
+- L2 order-book stale-vs-gap sequence disposition (non-fatal duplicate/redelivered sequence numbers vs. fatal true gaps), crossed-book invalidation, and reset-vs-reconnect semantics
+- deterministic quarter-hour boundary eligibility (healthy/stale heartbeat, sequence gap and resync, shuffled-order replay, multi-boundary retention across quiet periods, late-arriving/out-of-order recorded events, live-vs-replay parity)
+- WebSocket service subscribe/parse/heartbeat/reconnect-with-wait-for-snapshot behavior, injected clocks, and `connection_history` accumulation
+- normalized `level2_updates`/`bbo_state` row capture and draining alongside quarter-hour BBO observations
+- exact-byte raw segment sealing, content-addressing, and corrupt-framing detection, including malformed frames
 - concrete websocket transport round-trip behavior against a loopback echo server (no internet access)
-- end-to-end collector manifest completeness, normalized Parquet output, reconnect-on-error handling, and live-vs-replay determinism over a sealed raw segment
+- end-to-end collector manifest completeness, normalized Parquet output for all three data kinds, reconnect-on-error handling, and live-vs-replay determinism over a sealed raw segment
+- collector CLI operational summary output for both the preferred (`btc-qh-collect-coinbase-bbo`) and deprecated alias entry points
 
 All WebSocket/collector tests are network-independent: the transport tests use a `websockets` server bound to `127.0.0.1:0`, and all other tests use an in-memory fake transport.
 

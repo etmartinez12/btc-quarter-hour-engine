@@ -16,153 +16,328 @@ class WebSocketTransport(Protocol):
     def close(self) -> None: ...
 
 
-@dataclass(frozen=True, slots=True)
-class CoinbaseWebSocketFrame:
-    raw: str
-    message: dict[str, Any]
-    received_at_utc: datetime
-    connection_id: str | None = None
+# ---------------------------------------------------------------------------
+# Real Coinbase Advanced Trade websocket envelope
+#
+# Every server -> client message shares one outer envelope: a `channel`
+# identifying the subscription ("l2_data", "heartbeats", "subscriptions",
+# ...), a channel-scoped monotonically increasing `sequence_num`, a
+# server-assigned `timestamp`, and a list of channel-specific `events`. See:
+# https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/level2
+#
+#   {
+#     "channel": "l2_data",
+#     "client_id": "",
+#     "timestamp": "2023-02-09T20:32:50.714964855Z",
+#     "sequence_num": 0,
+#     "events": [
+#       {
+#         "type": "snapshot",
+#         "product_id": "BTC-USD",
+#         "updates": [
+#           {"side": "bid", "event_time": "1970-01-01T00:00:00Z",
+#            "price_level": "21921.73", "new_quantity": "0.30000000"}
+#         ]
+#       }
+#     ]
+#   }
+#
+# Both "snapshot" and "update" events share the exact same `updates` shape
+# (there is no separate `bids`/`asks`/`changes` list as in the legacy
+# Coinbase Exchange feed); `side` is "bid" or "offer" on the wire (not
+# "ask"). Heartbeats carry their own per-channel sequence/timestamp and a
+# `current_time`/`heartbeat_counter` pair per event.
+# ---------------------------------------------------------------------------
+
+CHANNEL_LEVEL2 = "l2_data"
+CHANNEL_HEARTBEATS = "heartbeats"
+CHANNEL_SUBSCRIPTIONS = "subscriptions"
+
+LEVEL2_EVENT_TYPE_SNAPSHOT = "snapshot"
+LEVEL2_EVENT_TYPE_UPDATE = "update"
+
+# Internal normalized event-type tags used by market_data.order_book /
+# market_data.replay / acquisition.websocket_service. These are decoupled
+# from Coinbase's own wire-level event `type` (see `_flatten_level2_envelope`)
+# so downstream book/replay logic never has to know about envelope framing.
+NORMALIZED_TYPE_SNAPSHOT = "snapshot"
+NORMALIZED_TYPE_LEVEL2_UPDATE = "l2_data"
+NORMALIZED_TYPE_HEARTBEAT = "heartbeat"
+
+# Coinbase's wire-level `side` uses "offer" for the ask side; "buy"/"sell"
+# aliases are also accepted defensively even though the documented schema
+# only emits "bid"/"offer".
+_SIDE_ALIASES = {"bid": "bid", "buy": "bid", "offer": "ask", "ask": "ask", "sell": "ask"}
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _is_mapping(value: Any) -> bool:
-    return isinstance(value, Mapping)
-
-
 def _normalize_side(value: Any) -> str:
     normalized = str(value).lower()
-    mapping = {"bid": "bid", "ask": "ask", "buy": "bid", "sell": "ask"}
-    if normalized not in mapping:
+    if normalized not in _SIDE_ALIASES:
         raise ValueError(f"Unsupported side: {value!r}")
-    return mapping[normalized]
+    return _SIDE_ALIASES[normalized]
 
 
-def parse_level2_event(message: Mapping[str, Any]) -> dict[str, Any]:
-    if not _is_mapping(message):
-        raise ValueError("Level 2 message must be a mapping")
-    event_type = message.get("type")
-    if event_type not in {"snapshot", "l2_data"}:
+def _require_utc_datetime(value: Any, *, field_name: str) -> datetime:
+    if value is None:
+        raise ValueError(f"Missing {field_name}")
+    text = str(value).strip()
+    normalized = text.replace("Z", "+00:00")
+    if " " in normalized and "T" not in normalized:
+        # Coinbase heartbeats' `current_time` uses a space-separated
+        # "YYYY-MM-DD HH:MM:SS.ffffff" form rather than ISO-8601 with "T".
+        normalized = normalized.replace(" ", "T", 1)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Malformed {field_name}: {value!r}") from exc
+    if parsed.tzinfo is None:
+        # Heartbeat `current_time` is documented without an explicit offset;
+        # Coinbase always reports it in UTC.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _optional_utc_datetime(value: Any, *, field_name: str) -> datetime | None:
+    if value is None:
+        return None
+    return _require_utc_datetime(value, field_name=field_name)
+
+
+@dataclass(frozen=True, slots=True)
+class Level2UpdateEntry:
+    """One book mutation within an `l2_data` event's `updates` array."""
+
+    side: str
+    price_level: float
+    new_quantity: float
+    event_time_utc: datetime | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "side": self.side,
+            "price": self.price_level,
+            "quantity": self.new_quantity,
+            "event_time_utc": self.event_time_utc,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Level2Event:
+    """One `events[]` entry of a `channel: "l2_data"` message."""
+
+    type: str  # "snapshot" | "update"
+    product_id: str
+    updates: tuple[Level2UpdateEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HeartbeatEvent:
+    """One `events[]` entry of a `channel: "heartbeats"` message."""
+
+    current_time_utc: datetime | None
+    heartbeat_counter: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class CoinbaseMessageEnvelope:
+    """The outer envelope shared by every Coinbase Advanced Trade websocket message."""
+
+    channel: str
+    client_id: str | None
+    timestamp_utc: datetime
+    sequence_num: int
+    events: tuple[Any, ...]
+
+
+def _parse_level2_update_entry(entry: Any) -> Level2UpdateEntry:
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"Level 2 update entry must be an object: {entry!r}")
+    price = entry.get("price_level")
+    quantity = entry.get("new_quantity")
+    if price is None or quantity is None:
+        raise ValueError(f"Level 2 update entry missing price_level/new_quantity: {entry!r}")
+    try:
+        price_value = float(price)
+        quantity_value = float(quantity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Malformed Level 2 update entry: {entry!r}") from exc
+    if not (price_value > 0 and quantity_value >= 0 and price_value == price_value and quantity_value == quantity_value):
+        raise ValueError(f"Invalid Level 2 update entry: {entry!r}")
+    side = _normalize_side(entry.get("side"))
+    event_time = _optional_utc_datetime(entry.get("event_time"), field_name="update event_time")
+    return Level2UpdateEntry(side=side, price_level=price_value, new_quantity=quantity_value, event_time_utc=event_time)
+
+
+def parse_level2_event(event: Any) -> Level2Event:
+    """Parse one `events[]` entry of a `channel: "l2_data"` message."""
+    if not isinstance(event, Mapping):
+        raise ValueError(f"Level 2 event must be a mapping: {event!r}")
+    event_type = event.get("type")
+    if event_type not in {LEVEL2_EVENT_TYPE_SNAPSHOT, LEVEL2_EVENT_TYPE_UPDATE}:
         raise ValueError(f"Unsupported Level 2 event type: {event_type!r}")
-    product_id = message.get("product_id")
+    product_id = event.get("product_id")
     if not isinstance(product_id, str) or not product_id:
         raise ValueError("Level 2 event missing product_id")
-    sequence_num = message.get("sequence_num")
-    if sequence_num is None:
-        raise ValueError("Level 2 event missing sequence_num")
+    updates_payload = event.get("updates")
+    if not isinstance(updates_payload, list) or not updates_payload:
+        raise ValueError("Level 2 event missing non-empty updates list")
+    updates = tuple(_parse_level2_update_entry(entry) for entry in updates_payload)
+    return Level2Event(type=event_type, product_id=product_id, updates=updates)
+
+
+def parse_heartbeat_event(event: Any) -> HeartbeatEvent:
+    """Parse one `events[]` entry of a `channel: "heartbeats"` message."""
+    if not isinstance(event, Mapping):
+        raise ValueError(f"Heartbeat event must be a mapping: {event!r}")
+    counter = event.get("heartbeat_counter")
+    if counter is not None:
+        try:
+            counter = int(counter)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Malformed heartbeat_counter: {counter!r}") from exc
+    current_time = _optional_utc_datetime(event.get("current_time"), field_name="heartbeat current_time")
+    return HeartbeatEvent(current_time_utc=current_time, heartbeat_counter=counter)
+
+
+def parse_coinbase_envelope(payload: Mapping[str, Any]) -> CoinbaseMessageEnvelope:
+    """Parse one already-JSON-decoded message into the real Advanced Trade envelope."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("WebSocket message payload is not a JSON object")
+    channel = payload.get("channel")
+    if not isinstance(channel, str) or not channel:
+        raise ValueError(f"WebSocket message missing channel: {payload!r}")
+    sequence_num = payload.get("sequence_num")
     try:
         sequence_num = int(sequence_num)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Malformed sequence_num: {sequence_num!r}") from exc
     if sequence_num < 0:
         raise ValueError(f"Negative sequence_num: {sequence_num!r}")
-    envelope_time = message.get("time") or message.get("timestamp")
-    if envelope_time is None:
-        raise ValueError("Level 2 event missing envelope timestamp")
-    try:
-        parsed_time = datetime.fromisoformat(str(envelope_time).replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"Malformed Level 2 timestamp: {envelope_time!r}") from exc
-    if parsed_time.tzinfo is None:
-        raise ValueError(f"Timezone-naive Level 2 timestamp: {envelope_time!r}")
-    event_time_utc = None
-    raw_event_time = message.get("event_time") or message.get("event_time_utc") or message.get("time")
-    if raw_event_time is not None:
-        try:
-            event_time_utc = datetime.fromisoformat(str(raw_event_time).replace("Z", "+00:00")).astimezone(timezone.utc)
-        except ValueError as exc:
-            raise ValueError(f"Malformed Level 2 event time: {raw_event_time!r}") from exc
-    updates = []
-    if event_type == "snapshot":
-        for side in ("bids", "asks"):
-            entries = message.get(side, [])
-            if not isinstance(entries, list):
-                raise ValueError(f"Snapshot {side} entries must be a list")
-            for entry in entries:
-                if not _is_mapping(entry):
-                    raise ValueError(f"Snapshot {side} item must be an object")
-                price = entry.get("price")
-                qty = entry.get("quantity", entry.get("size"))
-                if price is None or qty is None:
-                    raise ValueError(f"Snapshot {side} item missing price/quantity")
-                price_value = float(price)
-                qty_value = float(qty)
-                if not (price_value > 0 and qty_value >= 0 and price_value == price_value):
-                    raise ValueError(f"Invalid snapshot level for {side}: {entry!r}")
-                updates.append({"side": "bid" if side == "bids" else "ask", "price": price_value, "quantity": qty_value})
+    timestamp_utc = _require_utc_datetime(payload.get("timestamp"), field_name="envelope timestamp")
+    raw_events = payload.get("events")
+    if not isinstance(raw_events, list):
+        raise ValueError("WebSocket message missing events list")
+    events: tuple[Any, ...]
+    if channel == CHANNEL_LEVEL2:
+        events = tuple(parse_level2_event(event) for event in raw_events)
+    elif channel == CHANNEL_HEARTBEATS:
+        events = tuple(parse_heartbeat_event(event) for event in raw_events)
     else:
-        changes = message.get("changes") or message.get("updates") or []
-        if not isinstance(changes, list):
-            raise ValueError("Level 2 update missing changes list")
-        for change in changes:
-            if not _is_mapping(change):
-                raise ValueError("Level 2 update change must be an object")
-            price = change.get("price")
-            size = change.get("new_quantity", change.get("quantity", change.get("size")))
-            if price is None or size is None:
-                raise ValueError(f"Malformed Level 2 update: {change!r}")
-            side = _normalize_side(change.get("side"))
-            price_value = float(price)
-            quantity_value = float(size)
-            if not (price_value > 0 and quantity_value >= 0 and price_value == price_value):
-                raise ValueError(f"Invalid Level 2 update: {change!r}")
-            updates.append({"side": side, "price": price_value, "quantity": quantity_value})
+        events = tuple(raw_events)
+    return CoinbaseMessageEnvelope(
+        channel=channel,
+        client_id=payload.get("client_id"),
+        timestamp_utc=timestamp_utc,
+        sequence_num=sequence_num,
+        events=events,
+    )
+
+
+def _flatten_level2_envelope(envelope: CoinbaseMessageEnvelope) -> dict[str, Any]:
+    if not envelope.events:
+        raise ValueError("l2_data message contains no events")
+    first: Level2Event = envelope.events[0]
+    event_type = first.type
+    product_id = first.product_id
+    updates: list[dict[str, Any]] = []
+    event_times: list[datetime] = []
+    for event in envelope.events:
+        if event.type != event_type:
+            raise ValueError("l2_data message mixes snapshot and update event types")
+        if event.product_id != product_id:
+            raise ValueError("l2_data message mixes multiple product_ids")
+        for update in event.updates:
+            updates.append(update.as_dict())
+            if update.event_time_utc is not None:
+                event_times.append(update.event_time_utc)
+    normalized_type = NORMALIZED_TYPE_SNAPSHOT if event_type == LEVEL2_EVENT_TYPE_SNAPSHOT else NORMALIZED_TYPE_LEVEL2_UPDATE
+    # Coinbase's own per-update `event_time` is a known-unreliable placeholder
+    # for snapshot events (historically pinned to the Unix epoch), so
+    # snapshot event time always uses the envelope `timestamp` instead. For
+    # incremental updates we prefer the latest per-update `event_time` when
+    # present, falling back to the envelope timestamp otherwise.
+    if normalized_type == NORMALIZED_TYPE_SNAPSHOT or not event_times:
+        event_time_utc = envelope.timestamp_utc
+    else:
+        event_time_utc = max(event_times)
     return {
-        "type": event_type,
+        "type": normalized_type,
+        "channel": envelope.channel,
         "product_id": product_id,
-        "sequence_num": sequence_num,
-        "envelope_time_utc": parsed_time.astimezone(timezone.utc),
+        "sequence_num": envelope.sequence_num,
+        "envelope_time_utc": envelope.timestamp_utc,
         "event_time_utc": event_time_utc,
         "updates": updates,
+        "envelope": envelope,
     }
 
 
-def parse_heartbeat_message(message: Mapping[str, Any]) -> dict[str, Any]:
-    if not _is_mapping(message):
-        raise ValueError("Heartbeat message must be a mapping")
-    if message.get("type") != "heartbeat":
-        raise ValueError("Not a heartbeat message")
-    heartbeat_counter = message.get("sequence")
-    if heartbeat_counter is not None:
-        try:
-            heartbeat_counter = int(heartbeat_counter)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Malformed heartbeat sequence: {heartbeat_counter!r}") from exc
-    server_time = message.get("time") or message.get("timestamp")
-    if server_time is not None:
-        try:
-            server_time = datetime.fromisoformat(str(server_time).replace("Z", "+00:00")).astimezone(timezone.utc)
-        except ValueError as exc:
-            raise ValueError(f"Malformed heartbeat timestamp: {server_time!r}") from exc
+def _flatten_heartbeat_envelope(envelope: CoinbaseMessageEnvelope) -> dict[str, Any]:
+    heartbeat_counter: int | None = None
+    current_time_utc: datetime | None = None
+    if envelope.events:
+        first: HeartbeatEvent = envelope.events[0]
+        heartbeat_counter = first.heartbeat_counter
+        current_time_utc = first.current_time_utc
     return {
-        "type": "heartbeat",
+        "type": NORMALIZED_TYPE_HEARTBEAT,
+        "channel": envelope.channel,
         "sequence": heartbeat_counter,
-        "time_utc": server_time,
+        "time_utc": current_time_utc or envelope.timestamp_utc,
+        "envelope": envelope,
     }
 
 
 def parse_coinbase_ws_message(raw: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
+    """Parse one raw websocket frame into the normalized internal event dict.
+
+    Accepts the exact bytes/text received over the wire (or an already
+    JSON-decoded mapping), validates it against the real Coinbase Advanced
+    Trade envelope (see module docstring), and flattens it into the internal
+    shape consumed by ``market_data.order_book``/``market_data.replay``:
+    ``{"type", "product_id", "sequence_num", "envelope_time_utc",
+    "event_time_utc", "updates"}`` for level2 events, or
+    ``{"type": "heartbeat", "sequence", "time_utc"}`` for heartbeats. The
+    parsed ``CoinbaseMessageEnvelope`` (with full per-update fidelity,
+    including individual ``event_time``s) is always attached under the
+    ``"envelope"`` key for callers that need full wire fidelity (e.g.
+    normalized ``level2_updates`` storage).
+    """
     if isinstance(raw, (bytes, bytearray)):
         data = raw.decode("utf-8")
-    elif isinstance(raw, Mapping):
-        payload = dict(raw)
-    else:
-        data = str(raw)
-    if isinstance(raw, (str, bytes, bytearray)):
         try:
             payload = json.loads(data)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Malformed websocket JSON payload: {raw!r}") from exc
-    if not _is_mapping(payload):
+    elif isinstance(raw, Mapping):
+        payload = dict(raw)
+    else:
+        data = str(raw)
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Malformed websocket JSON payload: {raw!r}") from exc
+    if not isinstance(payload, Mapping):
         raise ValueError("WebSocket message payload is not a JSON object")
-    message_type = payload.get("type")
-    if message_type == "heartbeat":
-        return parse_heartbeat_message(payload)
-    if message_type in {"snapshot", "l2_data"}:
-        return parse_level2_event(payload)
-    return {"type": message_type, "payload": payload}
+    envelope = parse_coinbase_envelope(payload)
+    if envelope.channel == CHANNEL_LEVEL2:
+        return _flatten_level2_envelope(envelope)
+    if envelope.channel == CHANNEL_HEARTBEATS:
+        return _flatten_heartbeat_envelope(envelope)
+    return {"type": envelope.channel, "channel": envelope.channel, "envelope": envelope, "payload": dict(payload)}
+
+
+@dataclass(frozen=True, slots=True)
+class CoinbaseWebSocketFrame:
+    raw: str
+    message: dict[str, Any] | None
+    received_at_utc: datetime
+    connection_id: str | None = None
+    parse_error: str | None = None
 
 
 class CoinbaseWebSocketClient:
@@ -175,11 +350,13 @@ class CoinbaseWebSocketClient:
         transport: WebSocketTransport | None = None,
         sleep_fn: Any | None = None,
         monotonic_fn: Any | None = None,
+        now_fn: Any | None = None,
     ) -> None:
         self.config = config or CoinbaseWebSocketConfig()
         self.transport = transport
         self.sleep_fn = sleep_fn or time.sleep
         self.monotonic_fn = monotonic_fn or time.monotonic
+        self.now_fn = now_fn or _utcnow
         self._connected = False
         self._last_message_at = self.monotonic_fn()
 
@@ -212,19 +389,45 @@ class CoinbaseWebSocketClient:
         self.transport.send(json.dumps({"type": "subscribe", "channel": "heartbeats"}))
 
     def receive_message(self, *, timeout: float | None = None) -> CoinbaseWebSocketFrame:
+        """Receive exactly one raw frame and attempt to parse it.
+
+        The raw bytes/text are always preserved on the returned frame,
+        *independent of whether parsing succeeds* -- a malformed frame still
+        comes back as a frame (with ``message=None`` and ``parse_error``
+        set) rather than raising, so callers can seal the exact original
+        bytes into an immutable raw segment before (and regardless of)
+        attempting to interpret them.
+        """
         if self.transport is None:
             raise RuntimeError("No websocket transport configured")
         raw = self.transport.recv(timeout=timeout if timeout is not None else self.config.receive_timeout_seconds)
-        payload = parse_coinbase_ws_message(raw)
         self._last_message_at = self.monotonic_fn()
-        return CoinbaseWebSocketFrame(raw=str(raw), message=payload, received_at_utc=_utcnow())
+        received_at_utc = self.now_fn()
+        try:
+            payload = parse_coinbase_ws_message(raw)
+        except ValueError as exc:
+            return CoinbaseWebSocketFrame(raw=str(raw), message=None, received_at_utc=received_at_utc, parse_error=str(exc))
+        return CoinbaseWebSocketFrame(raw=str(raw), message=payload, received_at_utc=received_at_utc)
 
 
 __all__ = [
+    "CHANNEL_HEARTBEATS",
+    "CHANNEL_LEVEL2",
+    "CHANNEL_SUBSCRIPTIONS",
+    "CoinbaseMessageEnvelope",
     "CoinbaseWebSocketClient",
     "CoinbaseWebSocketConfig",
     "CoinbaseWebSocketFrame",
+    "HeartbeatEvent",
+    "LEVEL2_EVENT_TYPE_SNAPSHOT",
+    "LEVEL2_EVENT_TYPE_UPDATE",
+    "Level2Event",
+    "Level2UpdateEntry",
+    "NORMALIZED_TYPE_HEARTBEAT",
+    "NORMALIZED_TYPE_LEVEL2_UPDATE",
+    "NORMALIZED_TYPE_SNAPSHOT",
+    "parse_coinbase_envelope",
     "parse_coinbase_ws_message",
-    "parse_heartbeat_message",
+    "parse_heartbeat_event",
     "parse_level2_event",
 ]

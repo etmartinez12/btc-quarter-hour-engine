@@ -6,13 +6,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from btc_quarter_hour_engine.storage.forward_schema import (
+    DATA_KIND_WEBSOCKET_FRAMES,
+    DATA_KIND_WEBSOCKET_SEGMENTS,
+    FORWARD_SOURCE,
+)
 from btc_quarter_hour_engine.storage.raw import ImmutableRawStore
 
 
 class WebSocketRawStore:
     """Persist raw websocket frames and associated metadata in the same immutable raw store."""
 
-    def __init__(self, root: str, *, source: str = "coinbase_advanced") -> None:
+    def __init__(self, root: str, *, source: str = FORWARD_SOURCE) -> None:
         self.root = root
         self.source = source
         self.raw_store = ImmutableRawStore(root)
@@ -33,7 +38,7 @@ class WebSocketRawStore:
         recorded_at = datetime.now(timezone.utc)
         artifact = self.raw_store.write_response(
             source=self.source,
-            data_kind="websocket_frames",
+            data_kind=DATA_KIND_WEBSOCKET_FRAMES,
             product_id=product_id,
             response_bytes=payload,
             retrieved_at=recorded_at,
@@ -88,7 +93,7 @@ class RawSegmentWriter:
         self,
         root: str,
         *,
-        source: str = "coinbase_advanced",
+        source: str = FORWARD_SOURCE,
         product_id: str = "BTC-USD",
         max_frames: int = 10000,
     ) -> None:
@@ -143,7 +148,7 @@ class RawSegmentWriter:
         sequence_nums = [frame.sequence_num for frame in frames if frame.sequence_num is not None]
         artifact = self.raw_store.write_response(
             source=self.source,
-            data_kind="websocket_segments",
+            data_kind=DATA_KIND_WEBSOCKET_SEGMENTS,
             product_id=self.product_id,
             response_bytes=body,
             retrieved_at=last.received_at_utc,

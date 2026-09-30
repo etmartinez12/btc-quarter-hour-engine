@@ -51,3 +51,58 @@ def test_candle_cli_prints_operational_summary_from_manifest(monkeypatch, capsys
         "canonical_target_eligible=false",
     ):
         assert expected in output
+
+
+def test_collect_coinbase_bbo_cli_prints_operational_summary_from_manifest(monkeypatch, capsys, tmp_path):
+    manifest = {"dataset_id": "ws-dataset-hash", "canonical_target_eligible": True}
+    fake_result = type(
+        "Result",
+        (),
+        {
+            "manifest": manifest,
+            "manifest_path": Path(tmp_path) / "manifest.json",
+            "raw_segments": [{"path": "segment-1"}],
+            "observation_count": 4,
+            "eligible_observation_count": 3,
+            "level2_update_row_count": 7,
+            "bbo_state_row_count": 5,
+            "connection_count": 1,
+            "reconnect_count": 0,
+        },
+    )()
+
+    class FakeCollector:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            return fake_result
+
+    monkeypatch.setattr(cli, "CoinbaseWebSocketClient", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "WebsocketsTransport", lambda *a, **kw: object())
+    monkeypatch.setattr(cli, "CoinbaseWebSocketService", lambda **kwargs: object())
+    monkeypatch.setattr(cli, "RawSegmentWriter", lambda *a, **kw: object())
+    monkeypatch.setattr(cli, "ForwardParquetStore", lambda *a, **kw: object())
+    monkeypatch.setattr(cli, "WebSocketCollector", FakeCollector)
+    monkeypatch.setattr("sys.argv", ["btc-qh-collect-coinbase-bbo", "--output-root", str(tmp_path)])
+
+    cli.collect_coinbase_bbo_main()
+
+    output = capsys.readouterr().out
+    for expected in (
+        "dataset_id=ws-dataset-hash",
+        f"manifest_path={tmp_path / 'manifest.json'}",
+        "raw_segment_count=1",
+        "observation_count=4",
+        "eligible_observation_count=3",
+        "level2_update_row_count=7",
+        "bbo_state_row_count=5",
+        "connection_count=1",
+        "reconnect_count=0",
+        "canonical_target_eligible=true",
+    ):
+        assert expected in output
+
+
+def test_run_websocket_collector_main_is_a_backward_compatible_alias():
+    assert cli.run_websocket_collector_main is cli.collect_coinbase_bbo_main

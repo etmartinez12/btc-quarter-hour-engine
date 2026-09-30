@@ -82,7 +82,7 @@ if __name__ == "__main__":
     fetch_candles_main()
 
 
-def run_websocket_collector_main() -> None:
+def collect_coinbase_bbo_main() -> None:
     parser = argparse.ArgumentParser(description="Run the forward Coinbase WebSocket L2/BBO collector.")
     parser.add_argument("--product", default="BTC-USD")
     parser.add_argument("--output-root", default="data_lake")
@@ -109,6 +109,14 @@ def run_websocket_collector_main() -> None:
     print(f"raw_segment_count={len(result.raw_segments)}")
     print(f"observation_count={result.observation_count}")
     print(f"eligible_observation_count={result.eligible_observation_count}")
+    print(f"level2_update_row_count={result.level2_update_row_count}")
+    print(f"bbo_state_row_count={result.bbo_state_row_count}")
     print(f"connection_count={result.connection_count}")
     print(f"reconnect_count={result.reconnect_count}")
     print(f"canonical_target_eligible={str(result.manifest['canonical_target_eligible']).lower()}")
+
+
+# Deprecated alias retained for backward compatibility with earlier installs
+# of this CLI entry point; prefer `btc-qh-collect-coinbase-bbo`
+# (`collect_coinbase_bbo_main`) for new usage.
+run_websocket_collector_main = collect_coinbase_bbo_main

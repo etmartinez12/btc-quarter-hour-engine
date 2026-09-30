@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook, OrderBookState
+from btc_quarter_hour_engine.market_data.order_book import (
+    Level2OrderBook,
+    OrderBookState,
+    SequenceDisposition,
+    SequenceGapError,
+)
 
 
 def _synced_book() -> Level2OrderBook:
@@ -77,26 +82,41 @@ def test_snapshot_requires_two_sided_book():
 
 def test_sequence_validation_accepts_monotonic_increments():
     book = Level2OrderBook()
-    book.validate_sequence(5)
-    book.validate_sequence(6)
-    book.validate_sequence(7)
+    assert book.validate_sequence(5) is SequenceDisposition.IN_ORDER
+    assert book.validate_sequence(6) is SequenceDisposition.IN_ORDER
+    assert book.validate_sequence(7) is SequenceDisposition.IN_ORDER
     assert book.last_sequence_num == 7
 
 
 def test_sequence_validation_detects_gap():
     book = Level2OrderBook()
     book.validate_sequence(5)
-    with pytest.raises(ValueError, match="gap"):
+    with pytest.raises(SequenceGapError, match="gap"):
         book.validate_sequence(8)
+    # Gap detection does not silently advance the sequence epoch.
+    assert book.last_sequence_num == 5
 
 
-def test_sequence_validation_detects_out_of_order_or_duplicate():
+def test_sequence_validation_is_non_fatal_for_stale_or_duplicate_sequences():
+    """Stale/duplicate (redelivered) sequence numbers must be classified as
+    `STALE`, not raise, and must not advance `last_sequence_num` -- unlike a
+    real gap, no data was lost so the book/connection remain fully valid."""
     book = Level2OrderBook()
     book.validate_sequence(5)
-    with pytest.raises(ValueError, match="out of order"):
-        book.validate_sequence(5)
-    with pytest.raises(ValueError, match="out of order"):
-        book.validate_sequence(4)
+    assert book.validate_sequence(5) is SequenceDisposition.STALE
+    assert book.last_sequence_num == 5
+    assert book.validate_sequence(4) is SequenceDisposition.STALE
+    assert book.last_sequence_num == 5
+
+
+def test_classify_sequence_does_not_mutate_state():
+    book = Level2OrderBook()
+    book.validate_sequence(5)
+    assert book.classify_sequence(5) is SequenceDisposition.STALE
+    assert book.classify_sequence(6) is SequenceDisposition.IN_ORDER
+    assert book.classify_sequence(8) is SequenceDisposition.GAP
+    # None of the above classify_sequence calls advanced state.
+    assert book.last_sequence_num == 5
 
 
 def test_sequence_validation_ignores_none():

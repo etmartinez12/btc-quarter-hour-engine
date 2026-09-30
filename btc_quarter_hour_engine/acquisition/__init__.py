@@ -6,10 +6,15 @@ from .coinbase_rest import (
     validate_candle_records,
 )
 from .coinbase_websocket import (
+    CoinbaseMessageEnvelope,
     CoinbaseWebSocketClient,
     CoinbaseWebSocketFrame,
+    HeartbeatEvent,
+    Level2Event,
+    Level2UpdateEntry,
+    parse_coinbase_envelope,
     parse_coinbase_ws_message,
-    parse_heartbeat_message,
+    parse_heartbeat_event,
     parse_level2_event,
 )
 from .collector import CollectorResult, WebSocketCollector
@@ -35,8 +40,13 @@ __all__ = [
     "normalize_market_frame",
     "CoinbaseWebSocketClient",
     "CoinbaseWebSocketFrame",
+    "CoinbaseMessageEnvelope",
+    "HeartbeatEvent",
+    "Level2Event",
+    "Level2UpdateEntry",
+    "parse_coinbase_envelope",
     "parse_coinbase_ws_message",
-    "parse_heartbeat_message",
+    "parse_heartbeat_event",
     "parse_level2_event",
     "CoinbaseWebSocketService",
     "ConnectionDiagnostics",

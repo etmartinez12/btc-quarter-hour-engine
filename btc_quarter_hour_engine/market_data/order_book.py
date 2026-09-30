@@ -12,6 +12,32 @@ class OrderBookState(str, Enum):
     INVALID = "INVALID"
 
 
+class SequenceDisposition(str, Enum):
+    """Classification of an incoming message's sequence number relative to
+    the last one successfully applied to this book, within the current
+    connection epoch.
+
+    - ``IN_ORDER``: exactly the next expected sequence number (or the very
+      first one seen this epoch); apply normally.
+    - ``STALE``: less than or equal to the last applied sequence number --
+      a redelivered/duplicate message whose effect is already reflected in
+      the book. No data was lost, so it must be safely ignorable: it is
+      dropped without invalidating the book or the boundary processor's
+      eligibility tracking.
+    - ``GAP``: more than one greater than the last applied sequence number
+      -- one or more messages were dropped. The book can no longer be
+      trusted and must be invalidated until the next successful resync.
+    """
+
+    IN_ORDER = "in_order"
+    STALE = "stale"
+    GAP = "gap"
+
+
+class SequenceGapError(ValueError):
+    """Raised by :meth:`Level2OrderBook.validate_sequence` on a detected gap."""
+
+
 class Level2OrderBook:
     """Minimal, deterministic Coinbase L2 book state machine."""
 
@@ -162,19 +188,34 @@ class Level2OrderBook:
             self.invalidate(str(exc))
             raise
 
-    def validate_sequence(self, sequence_num: int | None) -> None:
-        if sequence_num is None:
-            return
-        if self.last_sequence_num is None:
-            self.last_sequence_num = sequence_num
-            return
+    def classify_sequence(self, sequence_num: int | None) -> SequenceDisposition:
+        """Classify ``sequence_num`` without mutating any state."""
+        if sequence_num is None or self.last_sequence_num is None:
+            return SequenceDisposition.IN_ORDER
         if sequence_num <= self.last_sequence_num:
-            raise ValueError(f"Sequence out of order: expected > {self.last_sequence_num}, received {sequence_num}")
+            return SequenceDisposition.STALE
         if sequence_num > self.last_sequence_num + 1:
-            raise ValueError(
+            return SequenceDisposition.GAP
+        return SequenceDisposition.IN_ORDER
+
+    def validate_sequence(self, sequence_num: int | None) -> SequenceDisposition:
+        """Classify and (for in-order messages) advance ``last_sequence_num``.
+
+        Raises :class:`SequenceGapError` on a detected gap (one or more
+        dropped messages); this is the only fatal disposition. A ``STALE``
+        disposition (a duplicate/redelivered message) is returned normally,
+        without raising and without advancing ``last_sequence_num`` -- the
+        caller is expected to drop the message's payload but otherwise
+        continue as if nothing happened.
+        """
+        disposition = self.classify_sequence(sequence_num)
+        if disposition is SequenceDisposition.GAP:
+            raise SequenceGapError(
                 f"Sequence gap detected: expected {self.last_sequence_num + 1}, received {sequence_num}"
             )
-        self.last_sequence_num = sequence_num
+        if disposition is SequenceDisposition.IN_ORDER and sequence_num is not None:
+            self.last_sequence_num = sequence_num
+        return disposition
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -194,4 +235,4 @@ class Level2OrderBook:
         return self.state == OrderBookState.SYNCED and self.best_bid is not None and self.best_ask is not None
 
 
-__all__ = ["Level2OrderBook", "OrderBookState"]
+__all__ = ["Level2OrderBook", "OrderBookState", "SequenceDisposition", "SequenceGapError"]

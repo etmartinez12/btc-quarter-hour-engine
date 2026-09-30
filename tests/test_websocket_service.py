@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 from btc_quarter_hour_engine.acquisition.coinbase_websocket import CoinbaseWebSocketClient
 from btc_quarter_hour_engine.acquisition.config import CoinbaseWebSocketConfig
 from btc_quarter_hour_engine.acquisition.websocket_service import CoinbaseWebSocketService
+from btc_quarter_hour_engine.market_data.order_book import OrderBookState
 
 
 class FakeTransport:
@@ -37,38 +39,74 @@ class FakeTransport:
         self.close_count += 1
 
 
-def _msg(message_type, **kw):
-    payload = {"type": message_type}
-    payload.update(kw)
-    return json.dumps(payload)
+def _l2_message(event_type, seq, timestamp, updates):
+    return json.dumps(
+        {
+            "channel": "l2_data",
+            "client_id": "",
+            "timestamp": timestamp,
+            "sequence_num": seq,
+            "events": [{"type": event_type, "product_id": "BTC-USD", "updates": updates}],
+        }
+    )
 
 
 def _snapshot(seq, time, bid=100.0, ask=101.0):
-    return _msg(
+    return _l2_message(
         "snapshot",
-        product_id="BTC-USD",
-        sequence_num=seq,
-        time=time,
-        bids=[{"price": bid, "quantity": 1.0}],
-        asks=[{"price": ask, "quantity": 1.0}],
+        seq,
+        time,
+        [
+            {"side": "bid", "price_level": str(bid), "new_quantity": "1.0", "event_time": time},
+            {"side": "offer", "price_level": str(ask), "new_quantity": "1.0", "event_time": time},
+        ],
     )
 
 
 def _update(seq, time, side, price, quantity):
-    return _msg(
-        "l2_data",
-        product_id="BTC-USD",
-        sequence_num=seq,
-        time=time,
-        changes=[{"side": side, "price": price, "new_quantity": quantity}],
+    return _l2_message(
+        "update", seq, time, [{"side": side, "price_level": str(price), "new_quantity": str(quantity), "event_time": time}]
     )
+
+
+def _heartbeat(seq, time):
+    return json.dumps(
+        {
+            "channel": "heartbeats",
+            "client_id": "",
+            "timestamp": time,
+            "sequence_num": seq,
+            "events": [{"current_time": time, "heartbeat_counter": str(seq)}],
+        }
+    )
+
+
+def _fake_monotonic(start: float = 0.0, step: float = 1.0):
+    """An incrementing fake monotonic clock: every call advances by ``step``.
+
+    Using a *constant* clock (e.g. ``lambda: 0.0``) would make any bounded
+    wait loop keyed off ``monotonic_fn`` (such as
+    :meth:`CoinbaseWebSocketService._wait_for_snapshot`) never observe its
+    deadline elapsing, spinning forever when no matching message ever
+    arrives. Every test in this module that can reach such a loop must use
+    this incrementing clock instead.
+    """
+    counter = {"value": start}
+
+    def _tick() -> float:
+        counter["value"] += step
+        return counter["value"]
+
+    return _tick
 
 
 def _service(messages, **config_kwargs):
     config = CoinbaseWebSocketConfig(receive_timeout_seconds=0.01, **config_kwargs)
     transport = FakeTransport(messages)
     client = CoinbaseWebSocketClient(config=config, transport=transport)
-    service = CoinbaseWebSocketService(config=config, client=client, sleep_fn=lambda *_: None, monotonic_fn=lambda: 0.0)
+    service = CoinbaseWebSocketService(
+        config=config, client=client, sleep_fn=lambda *_: None, monotonic_fn=_fake_monotonic()
+    )
     return service, transport
 
 
@@ -103,10 +141,26 @@ def test_handle_message_raises_and_invalidates_on_sequence_gap():
     assert service.diagnostics[0]["kind"] == "sequence_error"
 
 
+def test_handle_message_stale_or_duplicate_sequence_is_non_fatal():
+    """A redelivered/duplicate sequence number must be dropped without
+    raising, without invalidating the book, and without counting as a gap --
+    this is the key stale-vs-gap disposition distinction."""
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+    result = service.handle_message(_update(1, "2024-01-01T00:00:01Z", "bid", 999.0, 2.0))
+    assert result["status"] == "stale_sequence_ignored"
+    assert service.order_book.is_synced()
+    assert service.order_book.best_bid == 100.0  # the stale update's payload must not have been applied
+    assert service.connection.stale_sequence_count == 1
+    assert service.connection.sequence_gap_count == 0
+    assert service.diagnostics == []
+
+
 def test_handle_message_heartbeat_updates_health_tracking():
     service, _ = _service([], heartbeat_timeout_seconds=1000)
     assert service.heartbeat_is_healthy()
-    result = service.handle_message(_msg("heartbeat", sequence=3, time="2024-01-01T00:00:00Z"))
+    result = service.handle_message(_heartbeat(3, "2024-01-01T00:00:00Z"))
     assert result == {"status": "heartbeat", "heartbeat_counter": 3}
     assert service.connection is None  # heartbeat handling does not require an active connection record
     assert service.heartbeat_is_healthy()
@@ -124,12 +178,79 @@ def test_heartbeat_is_healthy_reports_false_after_timeout():
 def test_derived_observations_accumulate_and_drain():
     service, _ = _service([])
     service.handle_message(_snapshot(1, "2024-01-01T00:14:50Z"))
-    service.handle_message(_msg("heartbeat", sequence=1, time="2024-01-01T00:14:55Z"))
+    service.handle_message(_heartbeat(1, "2024-01-01T00:14:55Z"))
     service.handle_message(_update(2, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0))
     assert len(service.observations) == 1
     drained = service.drain_observations()
     assert len(drained) == 1
     assert service.observations == []
+
+
+def test_level2_update_rows_and_bbo_state_rows_accumulate_and_drain():
+    service, _ = _service([])
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+    service.handle_message(_update(2, "2024-01-01T00:00:01Z", "bid", 100.5, 2.0))
+    # Snapshot contributes 2 rows (bid + ask levels), the update contributes 1.
+    assert len(service.level2_update_rows) == 3
+    assert {row["side"] for row in service.level2_update_rows} == {"bid", "ask"}
+    assert len(service.bbo_state_rows) == 2  # one per successfully applied message
+    assert service.bbo_state_rows[-1]["best_bid"] == 100.5
+
+    drained_updates = service.drain_level2_update_rows()
+    drained_state = service.drain_bbo_state_rows()
+    assert len(drained_updates) == 3
+    assert len(drained_state) == 2
+    assert service.level2_update_rows == []
+    assert service.bbo_state_rows == []
+
+
+def test_level2_update_rows_and_bbo_state_rows_not_recorded_for_stale_or_gap():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+    service.drain_level2_update_rows()
+    service.drain_bbo_state_rows()
+
+    # Stale: dropped, no new rows.
+    service.handle_message(_update(1, "2024-01-01T00:00:01Z", "bid", 999.0, 2.0))
+    assert service.level2_update_rows == []
+    assert service.bbo_state_rows == []
+
+    # Gap: invalidates, no new rows either.
+    with pytest.raises(ValueError):
+        service.handle_message(_update(5, "2024-01-01T00:00:02Z", "bid", 999.0, 2.0))
+    assert service.level2_update_rows == []
+    assert service.bbo_state_rows == []
+
+
+def test_injectable_now_fn_controls_recorded_wall_clock_timestamps():
+    fixed_time = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    service, _ = _service([])
+    service.now_fn = lambda: fixed_time
+    connection = service.connect_and_subscribe()
+    assert connection.connected_at_utc == fixed_time
+    assert connection.subscribed_at_utc == fixed_time
+
+
+def test_new_connection_appends_prior_connection_to_history():
+    service, _ = _service([])
+    first = service.connect_and_subscribe()
+    assert service.connection_history == []
+    second = service.new_connection()
+    assert service.connection_history == [first]
+    assert service.connection is second
+    assert first is not second
+
+
+def test_reconnect_appends_every_superseded_connection_to_history():
+    messages = [_snapshot(1, "2024-01-01T00:00:00Z"), _snapshot(1, "2024-01-01T00:00:05Z")]
+    service, transport = _service(messages, max_reconnect_attempts=3, initial_reconnect_backoff_seconds=0)
+    first = service.connect_and_subscribe()
+    service.handle_message(messages[0])
+    second = service.reconnect()
+    assert first in service.connection_history
+    assert second not in service.connection_history
+    assert service.connection is second
 
 
 def test_reconnect_restarts_sequence_epoch_and_resyncs():
@@ -151,7 +272,64 @@ def test_reconnect_restarts_sequence_epoch_and_resyncs():
     assert transport.connect_count >= 2
 
 
+def test_reconnect_wait_for_snapshot_drains_non_snapshot_messages_first():
+    """A real reconnect does not necessarily receive a snapshot as its very
+    first message: heartbeats or other messages may arrive first. The wait
+    loop must keep receiving until a snapshot actually lands.
+
+    The initial sync is fed directly via ``handle_message`` (independent of
+    the transport's message queue) so the queue below -- which the
+    reconnect's ``_wait_for_snapshot`` drains from -- only ever contains the
+    post-reconnect heartbeats and the eventual resync snapshot.
+    """
+    initial_sync_message = _snapshot(1, "2024-01-01T00:00:00Z")
+    queued_messages = [
+        _heartbeat(1, "2024-01-01T00:00:01Z"),
+        _heartbeat(2, "2024-01-01T00:00:02Z"),
+        _snapshot(1, "2024-01-01T00:00:05Z"),
+    ]
+    service, transport = _service(
+        queued_messages, max_reconnect_attempts=3, initial_reconnect_backoff_seconds=0, snapshot_wait_timeout_seconds=1000.0
+    )
+    service.connect_and_subscribe()
+    service.handle_message(initial_sync_message)
+    assert service.order_book.is_synced()
+
+    connection = service.reconnect()
+    assert connection is not None
+    assert service.order_book.is_synced()
+    # Every buffered message must have been drained (2 heartbeats + the resync snapshot).
+    assert transport.messages == []
+
+
 def test_reconnect_raises_after_exhausting_attempts():
-    service, _ = _service([], max_reconnect_attempts=2, initial_reconnect_backoff_seconds=0)
+    # `snapshot_wait_timeout_seconds=0` keeps `_wait_for_snapshot` a no-op so
+    # this stays fast/deterministic even though the fake clock advances.
+    service, _ = _service(
+        [], max_reconnect_attempts=2, initial_reconnect_backoff_seconds=0, snapshot_wait_timeout_seconds=0.0
+    )
     with pytest.raises(RuntimeError, match="exhausted"):
         service.reconnect()
+
+
+def test_reconnect_gives_up_waiting_once_deadline_elapses_without_a_snapshot():
+    """Even with a bounded wait deadline, `_wait_for_snapshot` must not spin
+    forever receiving non-snapshot messages -- it must give up once its
+    monotonic deadline elapses and let the outer reconnect loop retry (and
+    eventually raise once attempts are exhausted)."""
+    messages = [_heartbeat(1, "2024-01-01T00:00:01Z"), _heartbeat(2, "2024-01-01T00:00:02Z")]
+    service, _ = _service(
+        messages, max_reconnect_attempts=1, initial_reconnect_backoff_seconds=0, snapshot_wait_timeout_seconds=1.5
+    )
+    with pytest.raises(RuntimeError, match="exhausted"):
+        service.reconnect()
+
+
+def test_mark_invalid_records_reason_and_invalidates_book():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+    service.mark_invalid("simulated failure")
+    assert service.order_book.state == OrderBookState.INVALID
+    assert service.connection.disconnect_reason == "simulated failure"
+    assert service.connection.invalidated_at_utc is not None

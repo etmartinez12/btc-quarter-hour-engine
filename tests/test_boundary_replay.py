@@ -157,3 +157,101 @@ def test_replay_events_matches_incremental_live_processing():
 
     replayed = replay_events(events, product_id="BTC-USD", heartbeat_timeout_seconds=30)
     assert replayed == live_observations
+
+
+def test_replay_events_retains_every_intermediate_boundary_on_a_multi_boundary_jump():
+    """If the event stream jumps straight from one quarter-hour to a point
+    several quarter-hours later (e.g. a quiet period with no updates), every
+    boundary crossed in between must still get its own observation -- none
+    may be silently skipped."""
+    events = [
+        _snapshot_event(1, datetime(2024, 1, 1, 0, 0, 5, tzinfo=timezone.utc)),
+        _heartbeat_event(datetime(2024, 1, 1, 0, 0, 10, tzinfo=timezone.utc)),
+        # A full quiet hour later: 4 quarter-hour boundaries (00:15, 00:30,
+        # 00:45, 01:00) are crossed by this single event's event time.
+        _update_event(2, datetime(2024, 1, 1, 1, 0, 1, tzinfo=timezone.utc), "bid", 100.5, 1.0),
+    ]
+    replayed = replay_events(events, product_id="BTC-USD", heartbeat_timeout_seconds=3600)
+    boundaries = [obs.timestamp_utc for obs in replayed]
+    assert boundaries == [
+        datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc),
+        datetime(2024, 1, 1, 0, 30, tzinfo=timezone.utc),
+        datetime(2024, 1, 1, 0, 45, tzinfo=timezone.utc),
+        datetime(2024, 1, 1, 1, 0, tzinfo=timezone.utc),
+    ]
+    # Every one of those boundaries is eligible: synced, no gap, and the
+    # single early heartbeat is still within the (generous) timeout of each.
+    assert all(obs.eligible for obs in replayed)
+
+
+def test_replay_events_handles_a_late_arriving_event_recorded_after_a_later_one():
+    """An event recorded to the raw log *after* a chronologically later one
+    (e.g. redelivered/out-of-order on the wire) must still be placed at its
+    own true event time during replay, contributing its own boundary
+    crossing rather than being dropped or misordered."""
+    early = _snapshot_event(1, datetime(2024, 1, 1, 0, 14, 50, tzinfo=timezone.utc))
+    late_arrival = _heartbeat_event(datetime(2024, 1, 1, 0, 14, 52, tzinfo=timezone.utc))
+    later = _update_event(2, datetime(2024, 1, 1, 0, 15, 5, tzinfo=timezone.utc), "bid", 100.5, 1.0)
+    # `late_arrival`'s event time precedes `later`'s, but it is appended to
+    # the recorded stream *after* `later` -- simulating network reordering.
+    recorded_order = [early, later, late_arrival]
+
+    replayed = replay_events(recorded_order, product_id="BTC-USD", heartbeat_timeout_seconds=30)
+    chronological_order = [early, late_arrival, later]
+    replayed_in_true_order = replay_events(chronological_order, product_id="BTC-USD", heartbeat_timeout_seconds=30)
+
+    assert replayed == replayed_in_true_order
+    assert len(replayed) == 1
+    assert replayed[0].eligible is True  # the late-arriving heartbeat still counts toward the 00:15 boundary's health
+
+
+def test_replay_events_treats_stale_duplicate_sequence_as_non_fatal():
+    """A duplicate/redelivered sequence number recorded in a replayed segment
+    must not be treated as a gap: the book stays synced and later events
+    keep producing eligible observations."""
+    events = [
+        _snapshot_event(1, datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)),
+        _heartbeat_event(datetime(2024, 1, 1, 0, 0, 1, tzinfo=timezone.utc)),
+        _update_event(2, datetime(2024, 1, 1, 0, 0, 2, tzinfo=timezone.utc), "bid", 100.5, 1.0),
+        # A redelivered duplicate of the already-applied update above.
+        _update_event(2, datetime(2024, 1, 1, 0, 0, 3, tzinfo=timezone.utc), "bid", 999.0, 1.0),
+        _heartbeat_event(datetime(2024, 1, 1, 0, 15, 1, tzinfo=timezone.utc)),
+    ]
+    replayed = replay_events(events, product_id="BTC-USD", heartbeat_timeout_seconds=3600)
+    assert len(replayed) == 1
+    assert replayed[0].eligible is True
+    # The duplicate's bogus price must never have been applied.
+    assert replayed[0].best_bid == 100.5
+    """An event recorded to the raw log *after* a chronologically later one
+    (e.g. redelivered/out-of-order on the wire) must still be placed at its
+    own true event time during replay, contributing its own boundary
+    crossing rather than being dropped or misordered."""
+    early = _snapshot_event(1, datetime(2024, 1, 1, 0, 14, 50, tzinfo=timezone.utc))
+    late_arrival = _heartbeat_event(datetime(2024, 1, 1, 0, 14, 52, tzinfo=timezone.utc))
+    later = _update_event(2, datetime(2024, 1, 1, 0, 15, 5, tzinfo=timezone.utc), "bid", 100.5, 1.0)
+    # `late_arrival`'s event time precedes `later`'s, but it is appended to
+    # the recorded stream *after* `later` -- simulating network reordering.
+    recorded_order = [early, later, late_arrival]
+
+    replayed = replay_events(recorded_order, product_id="BTC-USD", heartbeat_timeout_seconds=30)
+    chronological_order = [early, late_arrival, later]
+    replayed_in_true_order = replay_events(chronological_order, product_id="BTC-USD", heartbeat_timeout_seconds=30)
+
+    assert replayed == replayed_in_true_order
+    assert len(replayed) == 1
+    assert replayed[0].eligible is True  # the late-arriving heartbeat still counts toward the 00:15 boundary's health
+
+
+def test_replay_events_treats_stale_duplicate_sequence_as_non_fatal():
+    """A duplicate/redelivered sequence number recorded in a replayed segment
+    must not be treated as a gap: the book stays synced and later events
+    keep producing eligible observations."""
+    events = [
+        _snapshot_event(1, datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)),
+        _heartbeat_event(datetime(2024, 1, 1, 0, 0, 1, tzinfo=timezone.utc)),
+        _update_event(2, datetime(2024, 1, 1, 0, 0, 2, tzinfo=timezone.utc), "bid", 100.5, 1.0),
+        # A redelivered duplicate of the already-applied update above.
+        _update_event(2, datetime(2024, 1, 1, 0, 0, 3, tzinfo=timezone.utc), "bid", 999.0, 1.0),
+        _heartbeat_event(datetime(2024, 1, 1, 0, 15, 1, tzinfo=timezone.utc)),
+    ]
+    replayed = replay_events(events, product_id="BTC-USD", heartbeat_timeout_seconds=3600)

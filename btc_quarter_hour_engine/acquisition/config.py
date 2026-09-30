@@ -25,6 +25,11 @@ class CoinbaseWebSocketConfig:
     connect_timeout_seconds: float = 15.0
     receive_timeout_seconds: float = 5.0
 
+    # Bounds how long reconnect() actively receives messages while waiting
+    # for a fresh snapshot to arrive on a newly (re)subscribed connection,
+    # before giving up and backing off for another connect attempt.
+    snapshot_wait_timeout_seconds: float = 10.0
+
     initial_reconnect_backoff_seconds: float = 1.0
     max_reconnect_backoff_seconds: float = 30.0
     max_reconnect_attempts: int | None = None

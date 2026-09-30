@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .boundary_observations import QuarterHourObservation, derive_quarter_hour_observation
-from .order_book import Level2OrderBook
+from .order_book import Level2OrderBook, SequenceDisposition, SequenceGapError
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -115,10 +115,15 @@ def process_parsed_event(
         return observations
     sequence_num = event.get("sequence_num")
     try:
-        book.validate_sequence(sequence_num)
-    except ValueError:
+        disposition = book.validate_sequence(sequence_num)
+    except SequenceGapError:
         book.invalidate("sequence gap")
         processor.note_gap()
+        return observations
+    if disposition is SequenceDisposition.STALE:
+        # A redelivered/duplicate message for this connection epoch: its
+        # effect is already reflected in the book, so it is safely dropped
+        # without invalidating the book or marking a gap.
         return observations
     try:
         if event_type == "snapshot":
@@ -156,7 +161,7 @@ def replay_events(
     """
     ordered = sorted(
         (event for event in events if _event_time(event) is not None or event.get("type") == "heartbeat"),
-        key=lambda event: _event_time(event) or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda event: _event_time(event) or datetime.max.replace(tzinfo=timezone.utc),
     )
     book = Level2OrderBook(product_id=product_id)
     processor = BoundaryEventProcessor(product_id=product_id, heartbeat_timeout_seconds=heartbeat_timeout_seconds)

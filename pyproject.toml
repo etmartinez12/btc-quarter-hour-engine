@@ -32,6 +32,8 @@ dev = [
 btc-qh-baseline = "btc_quarter_hour_engine.run_baseline:main"
 btc-qh-fetch-coinbase-candles = "btc_quarter_hour_engine.acquisition.cli:fetch_candles_main"
 btc-qh-snapshot-coinbase-book = "btc_quarter_hour_engine.acquisition.cli:snapshot_book_main"
+btc-qh-collect-coinbase-bbo = "btc_quarter_hour_engine.acquisition.cli:collect_coinbase_bbo_main"
+# Deprecated alias retained for backward compatibility; prefer btc-qh-collect-coinbase-bbo.
 btc-qh-run-coinbase-websocket-collector = "btc_quarter_hour_engine.acquisition.cli:run_websocket_collector_main"
 
 [tool.setuptools]
