@@ -148,3 +148,87 @@ def test_book_snapshot_keeps_source_and_retrieval_time_separate(tmp_path):
     assert data["purpose"].iloc[0] == "connectivity_and_schema_validation"
     assert result.manifest["canonical_target_eligible"] is False
     assert result.manifest["purpose"] == "connectivity_and_schema_validation"
+
+
+def test_identical_candle_reacquisition_reuses_stable_dataset(tmp_path):
+    payloads = [
+        b'{"candles":[{"start":"1704067200","low":"99","high":"102","open":"100","close":"101","volume":"0.5"}]}',
+        b'{"candles":[{"start":"1704067320","low":"99","high":"102","open":"100","close":"101","volume":"0.5"}]}',
+    ]
+
+    def run():
+        index = 0
+
+        def handler(request):
+            nonlocal index
+            response_bytes = payloads[index % len(payloads)]
+            index += 1
+            return httpx.Response(200, content=response_bytes, headers={"Content-Type": "application/json"})
+
+        return acquire(tmp_path, make_client(handler))
+
+    first = run()
+    persisted_before = first.manifest_path.read_bytes()
+    second = run()
+    assert first.manifest["dataset_id"] == second.manifest["dataset_id"]
+    assert first.manifest_path == second.manifest_path
+    assert first.manifest == second.manifest
+    assert first.run_metadata["raw_responses"] != second.run_metadata["raw_responses"]
+    assert first.manifest_path.read_bytes() == persisted_before
+    fields = ("path", "sha256", "row_count", "first_timestamp", "last_timestamp")
+    assert [
+        tuple(item[field] for field in fields) for item in first.manifest["normalized_artifacts"]
+    ] == [
+        tuple(item[field] for field in fields) for item in second.manifest["normalized_artifacts"]
+    ]
+    normalized_paths = list((tmp_path / "normalized").rglob("*.parquet"))
+    assert len(normalized_paths) == len(first.manifest["normalized_artifacts"])
+    assert len(list((tmp_path / "raw").rglob("*.json.gz"))) == 2
+    assert json.loads(first.manifest_path.read_text()) == first.manifest
+
+
+def test_changed_candle_content_produces_new_dataset_identity(tmp_path):
+    def run(close):
+        payload = json.dumps({"candles": [{
+            "start": "1704067200", "low": "99", "high": "102", "open": "100",
+            "close": str(close), "volume": "0.5",
+        }]}).encode()
+        client = make_client(lambda request: httpx.Response(200, content=payload))
+        return acquire(tmp_path, client, end=START + timedelta(minutes=1), max_candles_per_request=2)
+
+    first = run(101)
+    changed = run(100.5)
+    first_raw = first.manifest["raw_artifacts"][0]["sha256"]
+    changed_raw = changed.manifest["raw_artifacts"][0]["sha256"]
+    assert first_raw != changed_raw
+    assert first.manifest["dataset_id"] != changed.manifest["dataset_id"]
+    assert first.manifest["normalized_artifacts"][0]["path"] != changed.manifest["normalized_artifacts"][0]["path"]
+    assert first.manifest["normalized_artifacts"][0]["sha256"] != changed.manifest["normalized_artifacts"][0]["sha256"]
+    assert first.manifest_path != changed.manifest_path
+
+
+def test_identical_book_reacquisition_reuses_stable_dataset(tmp_path):
+    payload = b'{"pricebook":{"product_id":"BTC-USD","bids":[{"price":"100","size":"1.2"}],"asks":[{"price":"101","size":"1.5"}],"time":"2026-01-01T00:00:00Z"}}'
+
+    def run():
+        client = make_client(lambda request: httpx.Response(
+            200, content=payload, headers={"Content-Type": "application/json"},
+        ))
+        return acquire_coinbase_book_snapshot(
+            client=client, raw_store=ImmutableRawStore(tmp_path),
+            normalized_store=NormalizedParquetStore(tmp_path), output_root=tmp_path,
+            product_id="BTC-USD",
+        )
+
+    first = run()
+    persisted_before = first.manifest_path.read_bytes()
+    second = run()
+    assert first.manifest["dataset_id"] == second.manifest["dataset_id"]
+    assert first.manifest_path == second.manifest_path
+    assert first.manifest == second.manifest
+    assert first.run_metadata["raw_responses"] != second.run_metadata["raw_responses"]
+    assert first.manifest_path.read_bytes() == persisted_before
+    assert first.manifest["normalized_artifacts"] == second.manifest["normalized_artifacts"]
+    assert len(list((tmp_path / "normalized").rglob("*.parquet"))) == 1
+    assert len(list((tmp_path / "raw").rglob("*.json.gz"))) == 1
+    assert json.loads(first.manifest_path.read_text()) == first.manifest

@@ -41,6 +41,7 @@ def build_dataset_id(
     requested_end: str | datetime | None,
     granularity: str | None,
     raw_artifact_hashes: list[str],
+    data_schema_version: str = COINBASE_CANDLE_SCHEMA_VERSION,
     manifest_schema_version: str = DATASET_MANIFEST_SCHEMA_VERSION,
 ) -> str:
     canonical = {
@@ -52,6 +53,7 @@ def build_dataset_id(
         "requested_end": _utc_isotime(requested_end) if isinstance(requested_end, datetime) else requested_end,
         "granularity": granularity,
         "raw_artifact_hashes": raw_artifact_hashes,
+        "data_schema_version": data_schema_version,
     }
     serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
@@ -86,6 +88,7 @@ def build_manifest(
         requested_end=requested_end,
         granularity=granularity,
         raw_artifact_hashes=raw_hashes,
+        data_schema_version=schema_version,
     )
     try:
         package_version = version("btc-quarter-hour-engine")
@@ -140,8 +143,29 @@ def write_manifest(manifest: dict[str, Any], output_root: str | Path) -> Path:
         try:
             os.link(temporary, target_path)
         except FileExistsError:
-            if target_path.read_bytes() != payload:
+            persisted = json.loads(target_path.read_text(encoding="utf-8"))
+            if _stable_manifest_content(persisted) != _stable_manifest_content(manifest):
                 raise ValueError(f"Manifest conflict for dataset ID {dataset_id}")
     finally:
         temporary.unlink(missing_ok=True)
     return target_path
+
+
+def _stable_manifest_content(manifest: dict[str, Any]) -> dict[str, Any]:
+    volatile_manifest_fields = {
+        "acquisition_started_at_utc",
+        "acquisition_completed_at_utc",
+    }
+    stable = {
+        key: value
+        for key, value in manifest.items()
+        if key not in volatile_manifest_fields and key not in {"software"}
+    }
+    raw_artifacts = []
+    for artifact in stable.get("raw_artifacts", []):
+        raw_artifacts.append({
+            key: value for key, value in artifact.items()
+            if key not in {"retrieved_at_utc"}
+        })
+    stable["raw_artifacts"] = raw_artifacts
+    return stable

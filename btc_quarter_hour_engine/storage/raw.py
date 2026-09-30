@@ -60,6 +60,16 @@ class ImmutableRawStore:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 if metadata.get("sha256") != digest:
                     raise ValueError(f"Metadata hash mismatch for {metadata_path}")
+                if metadata.get("byte_count") != len(payload):
+                    raise ValueError(f"Metadata byte-count mismatch for {metadata_path}")
+                try:
+                    persisted_retrieved_at = datetime.fromisoformat(
+                        metadata["retrieved_at_utc"].replace("Z", "+00:00")
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid retrieval timestamp in {metadata_path}") from exc
+                if persisted_retrieved_at.tzinfo is None or persisted_retrieved_at.utcoffset() is None:
+                    raise ValueError(f"Naive retrieval timestamp in {metadata_path}")
             else:
                 raise ValueError(f"Raw artifact metadata missing: {metadata_path}")
             return RawArtifact(
@@ -70,7 +80,7 @@ class ImmutableRawStore:
                 byte_count=len(payload),
                 path=compressed_path,
                 metadata_path=metadata_path,
-                retrieved_at=retrieved_at.astimezone(timezone.utc),
+                retrieved_at=persisted_retrieved_at.astimezone(timezone.utc),
             )
 
         compressed_payload = gzip.compress(payload, compresslevel=9, mtime=0)

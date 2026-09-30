@@ -39,7 +39,15 @@ def fetch_candles_main() -> None:
         )
         print(f"dataset_id={result.manifest['dataset_id']}")
         print(f"manifest_path={result.manifest_path}")
-        print(f"coverage={result.manifest['coverage']}")
+        coverage = result.manifest["coverage"]
+        print(f"raw_request_count={result.manifest['request_count']}")
+        print(f"normalized_row_count={sum(item['row_count'] for item in result.manifest['normalized_artifacts'])}")
+        print(f"requested_start={result.manifest['requested_start']}")
+        print(f"requested_end={result.manifest['requested_end']}")
+        print(f"observed_start={coverage['first_bucket']}")
+        print(f"observed_end={coverage['last_bucket']}")
+        print(f"missing_bucket_count={coverage['missing_bucket_count']}")
+        print(f"coverage_fraction={coverage['coverage_fraction']}")
         print("canonical_target_eligible=false")
     finally:
         client.close()

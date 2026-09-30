@@ -36,6 +36,7 @@ def test_raw_store_round_trip_and_idempotency(tmp_path):
     )
     assert same_artifact.sha256 == artifact.sha256
     assert same_artifact.path == artifact.path
+    assert same_artifact.retrieved_at == artifact.retrieved_at
 
     with gzip.open(artifact.path, "rb") as handle:
         assert handle.read() == payload

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,10 +43,19 @@ BOOK_PURPOSE = "connectivity_and_schema_validation"
 class AcquisitionResult:
     manifest: dict
     manifest_path: Path
+    run_metadata: dict
 
 
 def _iso(value: datetime) -> str:
     return _coerce_utc(value).isoformat().replace("+00:00", "Z")
+
+
+def _persist_manifest(
+    manifest: dict, output_root: str | Path, *, run_metadata: dict,
+) -> AcquisitionResult:
+    manifest_path = write_manifest(manifest, output_root)
+    persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return AcquisitionResult(persisted, manifest_path, run_metadata)
 
 
 def _store_raw(
@@ -114,7 +124,7 @@ def acquire_coinbase_candles(
                     raise ValueError(f"Candle {bucket.isoformat()} outside aligned chunk interval")
                 records.append({
                     "source": SOURCE, "product_id": product_id, "granularity": granularity,
-                    **record, "retrieved_at_utc": _coerce_utc(response.retrieved_at_utc),
+                    **record, "retrieved_at_utc": artifact.retrieved_at,
                 })
             raw_artifacts.append({
                 "chunk_number": chunk.chunk_number,
@@ -166,7 +176,14 @@ def acquire_coinbase_candles(
         request_count=len(chunks), schema_version=COINBASE_CANDLE_SCHEMA_VERSION,
         purpose="historical_context_only",
     )
-    return AcquisitionResult(manifest, write_manifest(manifest, output_root))
+    return _persist_manifest(
+        manifest, output_root,
+        run_metadata={
+            "acquisition_started_at_utc": manifest["acquisition_started_at_utc"],
+            "acquisition_completed_at_utc": manifest["acquisition_completed_at_utc"],
+            "raw_responses": raw_artifacts,
+        },
+    )
 
 
 def acquire_coinbase_book_snapshot(
@@ -188,7 +205,7 @@ def acquire_coinbase_book_snapshot(
     if book["product_id"] != product_id:
         raise ValueError(f"Book product {book['product_id']!r} differs from requested {product_id!r}")
     row = {
-        "source": SOURCE, **book, "retrieved_at_utc": _coerce_utc(response.retrieved_at_utc),
+        "source": SOURCE, **book, "retrieved_at_utc": artifact.retrieved_at,
         "canonical_target_eligible": False, "purpose": BOOK_PURPOSE,
     }
     normalized_artifacts = normalized_store.write_dataframe(
@@ -213,4 +230,11 @@ def acquire_coinbase_book_snapshot(
         acquisition_started_at_utc=started, acquisition_completed_at_utc=datetime.now(timezone.utc),
         request_count=1, schema_version=COINBASE_BOOK_SNAPSHOT_SCHEMA_VERSION, purpose=BOOK_PURPOSE,
     )
-    return AcquisitionResult(manifest, write_manifest(manifest, output_root))
+    return _persist_manifest(
+        manifest, output_root,
+        run_metadata={
+            "acquisition_started_at_utc": manifest["acquisition_started_at_utc"],
+            "acquisition_completed_at_utc": manifest["acquisition_completed_at_utc"],
+            "raw_responses": manifest["raw_artifacts"],
+        },
+    )
