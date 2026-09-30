@@ -67,17 +67,87 @@ This requirement is enforced through the shared `normalize_market_frame()` contr
 
 ```text
 btc_quarter_hour_engine/
-  acquisition/   raw/sample data loading
-  boundaries/    exact quarter-hour boundary extraction
-  features.py    leakage-safe feature engineering
-  targets.py     quarter-hour labels and returns
-  models/        logistic regression, ExtraTrees, LightGBM, and XGBoost baselines
-  ensemble/      simple-average and weighted ensemble utilities
-  validation/    OOF integrity, naïve benchmarks, row-based demo validation, and time-based research splitting
-  live/          minimal live prediction interface
-  config.py      shared configuration dataclasses
+  acquisition/
+    loader.py        raw/sample data loading
+    coinbase_rest.py Coinbase Advanced Trade public REST client
+    config.py        acquisition configuration
+    chunking.py      historical candle chunk planning
+    service.py       validated candle/book acquisition orchestration
+  storage/
+    raw.py           immutable content-addressed raw payload store
+    parquet.py       normalized Parquet output
+    manifest.py      acquisition manifests and dataset IDs
+  boundaries/         exact quarter-hour boundary extraction
+  features.py         leakage-safe feature engineering
+  targets.py          quarter-hour labels and returns
+  models/             logistic regression, ExtraTrees, LightGBM, and XGBoost baselines
+  ensemble/           simple-average and weighted ensemble utilities
+  validation/         OOF integrity, naïve benchmarks, row-based demo validation, and time-based research splitting
+  live/               minimal live prediction interface
+  config.py           shared configuration dataclasses
   run_baseline.py
+
+data_lake/            local-only acquisition output, gitignored
 ```
+
+## Real Coinbase Data Acquisition
+
+The public Coinbase Advanced Trade v3 market-data client acquires historical candles for research context. Requested candle intervals use aligned UTC half-open `[start, end)` bounds; the final request second is `end - 1 second` to exclude the next bucket. Returned gaps are reported in manifest coverage, never filled. Historical candles are `historical_context_only` and remain separate from the canonical exact-boundary target definition. Exact HTTP response bytes are preserved immutably under SHA-256 and gzip; validated normalized records are partitioned by source UTC date in Parquet, with acquisition and schema provenance in manifests.
+
+## Canonical Price Eligibility
+
+The canonical project price remains the exact midpoint of Coinbase best bid and best ask at quarter-hour boundaries:
+
+`P_t = (best_bid_t + best_ask_t) / 2`
+
+Historical OHLCV candle closes are not substituted for this exact canonical midpoint. Therefore:
+
+```text
+historical candle data:
+    canonical_target_eligible = false
+
+REST one-shot book snapshot:
+    canonical_target_eligible = false
+    purpose = connectivity_and_schema_validation
+
+future WebSocket BBO observations:
+    intended canonical target source
+```
+
+This distinction is preserved in manifest metadata and in the normalized data model so the scientific benchmark remains unchanged.
+
+## Local Data Lake
+
+Real acquisition output is kept under a local `data_lake/` directory instead of the packaged synthetic fixture area.
+
+```text
+data_lake/
+  raw/coinbase_advanced/{candles,product_book}/BTC-USD/<sha256>.json.gz
+  raw/coinbase_advanced/{candles,product_book}/BTC-USD/<sha256>.meta.json
+  normalized/coinbase_advanced/BTC-USD/<data_kind>/<granularity-if-candles>/date=YYYY-MM-DD/part-<sha256>.parquet
+  manifests/<dataset_id>.json
+```
+
+`raw` is the immutable source-of-truth record, `normalized` stores derived analytical datasets, and `manifests` keeps acquisition provenance and reproducibility metadata.
+
+### Optional manual Coinbase network smoke test
+
+These commands require outbound access to Coinbase and are **not run in CI**:
+
+```bash
+btc-qh-fetch-coinbase-candles \
+  --product BTC-USD \
+  --start 2026-09-29T18:00:00Z \
+  --end 2026-09-29T18:10:00Z \
+  --granularity ONE_MINUTE \
+  --output-root data_lake
+
+btc-qh-snapshot-coinbase-book \
+  --product BTC-USD \
+  --output-root data_lake
+```
+
+Expect exact response bytes and HTTP metadata in `raw/`, dated validated Parquet under `normalized/`, and a dataset manifest under `manifests/`. Partial acquisitions retain completed raw responses but do not publish a success manifest or normalized output. Neither historical candles nor one-shot REST book snapshots qualify as canonical exact-boundary BBO targets.
 
 ## Benchmark and OOF Evaluation
 
