@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
 
+from btc_quarter_hour_engine.storage.forward_manifest import (
+    build_forward_dataset_id,
+    build_forward_manifest,
+    write_forward_manifest,
+)
 from btc_quarter_hour_engine.storage.manifest import build_dataset_id, build_manifest, write_manifest
 
 
@@ -119,3 +125,86 @@ def test_manifest_repeat_ignores_run_times_but_rejects_stable_conflicts(tmp_path
     with pytest.raises(ValueError, match="conflict"):
         write_manifest(conflicting, tmp_path)
     assert path.read_bytes() == persisted_bytes
+
+
+def test_forward_manifest_is_session_shaped_and_content_addressed(tmp_path):
+    raw_segments = [
+        {"sha256": "a" * 64, "session_id": "session-1", "segment_index": 0},
+        {"sha256": "b" * 64, "session_id": "session-1", "segment_index": 1},
+    ]
+    manifest = build_forward_manifest(
+        source="coinbase_advanced",
+        product_id="BTC-USD",
+        session_id="session-1",
+        websocket_url="wss://advanced-trade-ws.coinbase.com",
+        channels=["heartbeats", "level2"],
+        session_started_at_utc=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        session_completed_at_utc=datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
+        termination_reason="duration_reached",
+        connection_count=2,
+        reconnect_count=1,
+        connections=[{"connection_id": "connection-1"}],
+        raw_segments=raw_segments,
+        normalized_artifacts={
+            "quarter_hour_bbo": [{"sha256": "c" * 64}],
+            "level2_updates": [{"sha256": "d" * 64}],
+            "bbo_state": [{"sha256": "e" * 64}],
+        },
+        quarter_hour_summary={
+            "boundaries_seen": 3,
+            "eligible_boundaries": 2,
+            "ineligible_boundaries": 1,
+        },
+        integrity={"heartbeat_discontinuity_count": 1, "sequence_gap_count": 2},
+    )
+
+    assert manifest["forward_manifest_schema_version"] == "1"
+    assert manifest["session_id"] == "session-1"
+    assert manifest["dataset_id"] == build_forward_manifest(
+        source="coinbase_advanced",
+        product_id="BTC-USD",
+        session_id="session-2",
+        session_started_at_utc=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        raw_segments=raw_segments,
+    )["dataset_id"]
+    assert set(manifest["normalized_artifacts"]) == {
+        "quarter_hour_bbo",
+        "level2_updates",
+        "bbo_state",
+    }
+    assert manifest["quarter_hour_summary"]["ineligible_boundaries"] == 1
+    assert manifest["integrity"]["heartbeat_discontinuity_count"] == 1
+    assert manifest["integrity"]["malformed_frame_count"] == 0
+    assert manifest["canonical_source"] == {
+        "price_definition": "best_bid_ask_midpoint",
+        "boundary_schedule": ":00/:15/:30/:45 UTC",
+    }
+
+    path = write_forward_manifest(manifest, tmp_path)
+    assert path.name == "session-1.json"
+    assert write_forward_manifest(manifest, tmp_path) == path
+    assert json.loads(path.read_text())["dataset_id"] == manifest["dataset_id"]
+    assert len(list(path.parent.glob(".*"))) == 0
+
+
+def test_forward_dataset_id_tracks_order_and_schema_versions():
+    args = {
+        "source": "coinbase_advanced",
+        "product_id": "BTC-USD",
+        "raw_segments": [{"sha256": "a"}, {"sha256": "b"}],
+    }
+    original = build_forward_manifest(**args)["dataset_id"]
+    assert build_forward_manifest(**args)["dataset_id"] == original
+    assert build_forward_manifest(
+        **(args | {"raw_segments": [{"sha256": "b"}, {"sha256": "a"}]})
+    )["dataset_id"] != original
+    assert build_forward_dataset_id(
+        **args,
+        schema_versions={
+            "raw_segment": "2",
+            "level2_updates": "1",
+            "bbo_state": "1",
+            "quarter_hour_bbo": "1",
+            "forward_manifest": "1",
+        },
+    ) != original

@@ -24,23 +24,26 @@ class NormalizedParquetStore:
         data_kind: str,
         granularity: str | None = None,
         schema_version: str = "1",
+        timestamp_field: str | None = None,
     ) -> list[dict]:
-        timestamp_field = "bucket_start" if data_kind == "candles" else "source_time_utc"
-        if dataframe.empty or timestamp_field not in dataframe:
-            raise ValueError(f"Nonempty normalized data requires {timestamp_field}")
+        resolved_timestamp_field = timestamp_field or (
+            "bucket_start" if data_kind == "candles" else "source_time_utc"
+        )
+        if dataframe.empty or resolved_timestamp_field not in dataframe:
+            raise ValueError(f"Nonempty normalized data requires {resolved_timestamp_field}")
         frame = dataframe.copy()
-        if any(pd.Timestamp(value).tzinfo is None for value in frame[timestamp_field]):
-            raise ValueError(f"{timestamp_field} must be timezone-aware")
-        frame[timestamp_field] = pd.to_datetime(frame[timestamp_field], utc=True)
-        frame = frame.sort_values(timestamp_field).reset_index(drop=True)
-        if data_kind == "candles" and frame[timestamp_field].duplicated().any():
+        if any(pd.Timestamp(value).tzinfo is None for value in frame[resolved_timestamp_field]):
+            raise ValueError(f"{resolved_timestamp_field} must be timezone-aware")
+        frame[resolved_timestamp_field] = pd.to_datetime(frame[resolved_timestamp_field], utc=True)
+        frame = frame.sort_values(resolved_timestamp_field).reset_index(drop=True)
+        if data_kind == "candles" and frame[resolved_timestamp_field].duplicated().any():
             raise ValueError("Duplicate normalized candle bucket")
         partition_root = self.normalized_root / source / product_id / data_kind
         if granularity is not None:
             partition_root = partition_root / granularity.upper()
 
         artifacts: list[dict] = []
-        for day, partition in frame.groupby(frame[timestamp_field].dt.strftime("%Y-%m-%d"), sort=True):
+        for day, partition in frame.groupby(frame[resolved_timestamp_field].dt.strftime("%Y-%m-%d"), sort=True):
             destination = partition_root / f"date={day}"
             destination.mkdir(parents=True, exist_ok=True)
             with NamedTemporaryFile(dir=destination, prefix=".part-", suffix=".parquet", delete=False) as handle:
@@ -65,8 +68,8 @@ class NormalizedParquetStore:
                     "path": str(target),
                     "sha256": digest,
                     "row_count": len(partition),
-                    "first_timestamp": partition[timestamp_field].min().isoformat(),
-                    "last_timestamp": partition[timestamp_field].max().isoformat(),
+                    "first_timestamp": partition[resolved_timestamp_field].min().isoformat(),
+                    "last_timestamp": partition[resolved_timestamp_field].max().isoformat(),
                     "schema_version": schema_version,
                     "product_id": product_id,
                     "source": source,
