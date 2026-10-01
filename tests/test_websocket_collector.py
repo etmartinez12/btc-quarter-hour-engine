@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
@@ -144,7 +145,9 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert len(result.bbo_state_artifacts) == 1
     assert len(result.normalized_artifacts) == 3
     frame = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"])
-    assert list(frame["eligible"]) == [True]
+    assert list(frame["canonical_target_eligible"]) == [True]
+    assert list(frame["eligibility_reason"]) == ["eligible"]
+    assert frame["boundary_time_utc"].iloc[0] == pd.Timestamp("2024-01-01T00:15:00Z")
     assert frame["best_bid"].iloc[0] == 100.0
     assert frame["best_ask"].iloc[0] == 101.0
     assert frame["product_id"].iloc[0] == "BTC-USD"
@@ -168,10 +171,12 @@ def test_collector_with_no_eligible_observations_reports_ineligibility_reason(tm
     messages = [_heartbeat(1, "2024-01-01T00:00:00Z")]
     collector, *_ = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
-    assert result.observation_count == 0
+    assert result.observation_count == 1
+    assert result.manifest["quarter_hour_summary"]["ineligible_boundaries"] == 1
     assert result.manifest["canonical_target_eligible"] is False
-    assert "no eligible" in result.manifest["canonical_target_ineligibility_reason"]
-    assert result.normalized_artifacts == []
+    assert result.manifest["canonical_target_eligible"] is False
+    assert len(result.bbo_normalized_artifacts) == 1
+    assert pd.read_parquet(result.bbo_normalized_artifacts[0]["path"])["eligibility_reason"].iloc[0] == "no_synced_snapshot"
 
 
 def test_collector_reconnects_on_connection_error_and_continues(tmp_path):
@@ -254,7 +259,7 @@ def test_collector_raw_segments_replay_to_same_observations_as_live(tmp_path):
     # ...and must exactly match what the live collector actually persisted,
     # proving live processing and offline replay of the sealed raw segment
     # are byte-for-byte equivalent in their derived output.
-    live_frame = pd.read_parquet(result.normalized_artifacts[0]["path"]).sort_values("source_time_utc")
+    live_frame = pd.read_parquet(result.normalized_artifacts[0]["path"]).sort_values("boundary_time_utc")
     replayed_rows = [
         (o.timestamp_utc.isoformat(), o.best_bid, o.best_ask, o.eligible)
         for o in sorted(replayed, key=lambda o: o.timestamp_utc)
@@ -262,7 +267,164 @@ def test_collector_raw_segments_replay_to_same_observations_as_live(tmp_path):
     live_rows = [
         (pd.Timestamp(ts).isoformat(), bid, ask, bool(eligible))
         for ts, bid, ask, eligible in zip(
-            live_frame["source_time_utc"], live_frame["best_bid"], live_frame["best_ask"], live_frame["eligible"]
+            live_frame["boundary_time_utc"], live_frame["best_bid"], live_frame["best_ask"], live_frame["canonical_target_eligible"]
         )
     ]
     assert replayed_rows == live_rows
+
+
+def test_final_canonical_replay_includes_late_arriving_pre_boundary_l2(tmp_path):
+    messages = [
+        _snapshot(1, "2024-01-01T13:14:50Z"),
+        _heartbeat(1, "2024-01-01T13:14:55Z"),
+        _update(2, "2024-01-01T13:15:00.100Z", "offer", 101.5, 1),
+        _update(3, "2024-01-01T13:14:59.950Z", "bid", 100.5, 1),
+    ]
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+    result = collector.run(max_messages=len(messages))
+    row = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"]).iloc[0]
+    assert row["best_bid"] == 100.5
+    assert row["best_ask"] == 101.0
+    assert row["midpoint"] == 100.75
+    assert bool(row["canonical_target_eligible"])
+    assert result.manifest["quarter_hour_summary"]["eligible_boundaries"] == 1
+    assert result.manifest["session_id"] == service.session_id
+
+
+def test_final_replay_uses_each_update_time_in_one_envelope(tmp_path):
+    before, after = "2024-01-01T13:14:59.900Z", "2024-01-01T13:15:00.100Z"
+    messages = [
+        _snapshot(199, "2024-01-01T13:14:50Z"),
+        _heartbeat(1, "2024-01-01T13:14:55Z"),
+        _l2_message("update", 200, after, [
+            {"side": "bid", "price_level": "100.5", "new_quantity": "1", "event_time": before},
+            {"side": "offer", "price_level": "101.5", "new_quantity": "1", "event_time": after},
+        ]),
+    ]
+    collector, _, _, _ = _build_collector(tmp_path, messages)
+    result = collector.run(max_messages=len(messages))
+    row = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"]).iloc[0]
+    assert (row["best_bid"], row["best_ask"]) == (100.5, 101)
+    updates = pd.read_parquet(result.level2_update_artifacts[0]["path"])
+    assert set(updates["event_time_utc"]) >= {pd.Timestamp(before), pd.Timestamp(after)}
+
+
+def test_binary_transport_bytes_survive_final_raw_segment(tmp_path):
+    payload = _snapshot(1, "2024-01-01T13:14:50Z").encode("utf-8")
+    collector, _, _, writer = _build_collector(tmp_path, [payload])
+    result = collector.run(max_messages=1)
+    assert writer.read_segment_frames(result.raw_segments[0]["path"]) == [payload]
+    assert result.raw_segments[0]["frames"][0]["raw_frame_sha256"]
+
+
+def test_unexpected_failure_leaves_durable_partial_without_success_manifest(tmp_path):
+    messages = [_snapshot(1, "2024-01-01T13:14:50Z")] * 3
+    collector, _, transport, writer = _build_collector(tmp_path, messages)
+    original_recv = transport.recv
+    count = 0
+
+    def fail_after_three(timeout=None):
+        nonlocal count
+        count += 1
+        if count > 3:
+            raise OSError("disk or transport failure")
+        return original_recv(timeout)
+
+    transport.recv = fail_after_three
+    with pytest.raises(OSError, match="failure"):
+        collector.run()
+    assert writer.active_partial_path.exists()
+    assert writer.active_partial_path.stat().st_size > 3 * 8
+    assert writer.sealed_segments == []
+    assert not list((tmp_path / "manifests").rglob("*.json")) if (tmp_path / "manifests").exists() else True
+
+
+def test_keyboard_interrupt_finalizes_and_closes(tmp_path):
+    collector, _, transport, _ = _build_collector(tmp_path, [_snapshot(1, "2024-01-01T13:14:50Z")])
+    original_recv = transport.recv
+    count = 0
+
+    def interrupt(timeout=None):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise KeyboardInterrupt()
+        return original_recv(timeout)
+
+    transport.recv = interrupt
+    result = collector.run()
+    assert result.termination_reason == "keyboard_interrupt"
+    assert result.manifest_path.exists()
+    assert transport.close_count == 1
+
+
+def test_reconnect_frames_are_recorded_with_new_epoch_and_row_provenance(tmp_path):
+    messages = [
+        _snapshot(10, "2024-01-01T13:14:50Z"),
+        _heartbeat(1, "2024-01-01T13:14:55Z"),
+        _snapshot(1, "2024-01-01T13:15:05Z"),
+        _heartbeat(1, "2024-01-01T13:29:59Z"),
+        _update(2, "2024-01-01T13:30:01Z", "bid", 100.5, 1),
+    ]
+    collector, service, transport, _ = _build_collector(
+        tmp_path, messages,
+        config_kwargs={"initial_reconnect_backoff_seconds": 0},
+        transport_kwargs={"connection_errors_after": 3},
+    )
+    result = collector.run(stop_fn=lambda: transport.connect_count == 2 and not transport.messages)
+    assert result.connection_count == 2
+    assert result.raw_frame_count == 5
+    assert len(result.raw_segments) == 2
+    assert result.raw_segments[0]["connection_id"] != result.raw_segments[1]["connection_id"]
+    assert result.raw_segments[1]["frames"][0]["frame_index"] == 2
+    updates = pd.concat([pd.read_parquet(item["path"]) for item in result.level2_update_artifacts])
+    assert updates["frame_index"].notna().all()
+    assert set(updates["connection_id"]) == {c.connection_id for c in [*service.connection_history, service.connection]}
+    boundaries = pd.concat([pd.read_parquet(item["path"]) for item in result.bbo_normalized_artifacts])
+    assert boundaries.loc[boundaries["boundary_time_utc"] == pd.Timestamp("2024-01-01T13:15:00Z"), "eligibility_reason"].iloc[0] == "connection_unhealthy"
+    assert bool(boundaries.loc[boundaries["boundary_time_utc"] == pd.Timestamp("2024-01-01T13:30:00Z"), "canonical_target_eligible"].iloc[0])
+
+
+def test_malformed_frame_invalidates_canonical_epoch_and_counts_integrity(tmp_path):
+    invalid = json.dumps({
+        "channel": "l2_data", "timestamp": "2024-01-01T13:14:56Z", "sequence_num": 2,
+        "events": [{"type": "update", "product_id": "BTC-USD", "updates": [
+            {"side": "bid", "price_level": "inf", "new_quantity": "1", "event_time": "2024-01-01T13:14:56Z"}
+        ]}],
+    })
+    messages = [_snapshot(1, "2024-01-01T13:14:50Z"), _heartbeat(1, "2024-01-01T13:14:55Z"), invalid,
+                _update(3, "2024-01-01T13:15:01Z", "bid", 100.5, 1)]
+    collector, _, _, _ = _build_collector(tmp_path, messages)
+    result = collector.run(max_messages=len(messages))
+    row = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"]).iloc[0]
+    assert row["eligibility_reason"] == "malformed_source_state"
+    assert result.manifest["integrity"]["malformed_frame_count"] == 1
+    assert result.manifest["integrity"]["malformed_level2_count"] == 1
+
+
+def test_quiet_collection_retains_every_boundary_through_session_end(tmp_path):
+    config = CoinbaseWebSocketConfig(heartbeat_timeout_seconds=30)
+    clock = {"now": datetime(2024, 1, 1, 13, 14, 49, tzinfo=timezone.utc)}
+    transport = FakeTransport([_snapshot(1, "2024-01-01T13:14:50Z")])
+    client = CoinbaseWebSocketClient(config=config, transport=transport, now_fn=lambda: clock["now"])
+    service = CoinbaseWebSocketService(config=config, client=client, now_fn=lambda: clock["now"],
+                                       monotonic_fn=lambda: 0.0)
+    collector = WebSocketCollector(
+        service=service, raw_segment_writer=RawSegmentWriter(tmp_path),
+        forward_store=ForwardParquetStore(tmp_path), output_root=str(tmp_path),
+    )
+
+    def stop_after_silence():
+        if transport.messages:
+            return False
+        clock["now"] = datetime(2024, 1, 1, 13, 45, 1, tzinfo=timezone.utc)
+        return True
+
+    result = collector.run(stop_fn=stop_after_silence)
+    frame = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"])
+    assert list(frame["boundary_time_utc"]) == [
+        pd.Timestamp("2024-01-01T13:15:00Z"),
+        pd.Timestamp("2024-01-01T13:30:00Z"),
+        pd.Timestamp("2024-01-01T13:45:00Z"),
+    ]
+    assert set(frame["eligibility_reason"]) == {"heartbeat_stale"}

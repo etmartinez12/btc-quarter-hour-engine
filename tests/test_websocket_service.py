@@ -166,6 +166,16 @@ def test_handle_message_heartbeat_updates_health_tracking():
     assert service.heartbeat_is_healthy()
 
 
+def test_heartbeat_counter_discontinuity_is_recorded_without_invalidating_book():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+    service.handle_message(_heartbeat(1, "2024-01-01T00:00:01Z"))
+    service.handle_message(_heartbeat(3, "2024-01-01T00:00:02Z"))
+    assert service.connection.heartbeat_discontinuity_count == 1
+    assert service.order_book.is_synced()
+
+
 def test_heartbeat_is_healthy_reports_false_after_timeout():
     service, _ = _service([], heartbeat_timeout_seconds=5)
     tick = {"value": 0.0}

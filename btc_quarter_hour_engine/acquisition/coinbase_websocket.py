@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from .config import CoinbaseWebSocketConfig
 
 class WebSocketTransport(Protocol):
     def send(self, payload: str) -> None: ...
-    def recv(self, timeout: float | None = None) -> str: ...
+    def recv(self, timeout: float | None = None) -> str | bytes: ...
     def close(self) -> None: ...
 
 
@@ -165,7 +166,7 @@ def _parse_level2_update_entry(entry: Any) -> Level2UpdateEntry:
         quantity_value = float(quantity)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Malformed Level 2 update entry: {entry!r}") from exc
-    if not (price_value > 0 and quantity_value >= 0 and price_value == price_value and quantity_value == quantity_value):
+    if not (math.isfinite(price_value) and math.isfinite(quantity_value) and price_value > 0 and quantity_value >= 0):
         raise ValueError(f"Invalid Level 2 update entry: {entry!r}")
     side = _normalize_side(entry.get("side"))
     event_time = _optional_utc_datetime(entry.get("event_time"), field_name="update event_time")
@@ -333,11 +334,15 @@ def parse_coinbase_ws_message(raw: str | bytes | Mapping[str, Any]) -> dict[str,
 
 @dataclass(frozen=True, slots=True)
 class CoinbaseWebSocketFrame:
-    raw: str
+    raw_bytes: bytes
     message: dict[str, Any] | None
     received_at_utc: datetime
     connection_id: str | None = None
     parse_error: str | None = None
+
+    @property
+    def raw(self) -> bytes:
+        return self.raw_bytes
 
 
 class CoinbaseWebSocketClient:
@@ -401,13 +406,14 @@ class CoinbaseWebSocketClient:
         if self.transport is None:
             raise RuntimeError("No websocket transport configured")
         raw = self.transport.recv(timeout=timeout if timeout is not None else self.config.receive_timeout_seconds)
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
         self._last_message_at = self.monotonic_fn()
         received_at_utc = self.now_fn()
         try:
-            payload = parse_coinbase_ws_message(raw)
-        except ValueError as exc:
-            return CoinbaseWebSocketFrame(raw=str(raw), message=None, received_at_utc=received_at_utc, parse_error=str(exc))
-        return CoinbaseWebSocketFrame(raw=str(raw), message=payload, received_at_utc=received_at_utc)
+            payload = parse_coinbase_ws_message(raw_bytes)
+        except (ValueError, UnicodeError) as exc:
+            return CoinbaseWebSocketFrame(raw_bytes=raw_bytes, message=None, received_at_utc=received_at_utc, parse_error=str(exc))
+        return CoinbaseWebSocketFrame(raw_bytes=raw_bytes, message=payload, received_at_utc=received_at_utc)
 
 
 __all__ = [

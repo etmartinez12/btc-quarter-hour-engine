@@ -5,6 +5,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from btc_quarter_hour_engine.storage.parquet import NormalizedParquetStore
+from btc_quarter_hour_engine.storage.forward_parquet import ForwardParquetStore
 
 
 def frame(close=101.0):
@@ -57,3 +58,42 @@ def test_naive_parquet_timestamp_rejected(tmp_path):
         NormalizedParquetStore(tmp_path).write_dataframe(
             dataframe=data, source="coinbase_advanced", product_id="BTC-USD", data_kind="candles",
         )
+
+
+@pytest.mark.parametrize("timestamp_field", ["event_time_utc", "state_time_utc", "boundary_time_utc"])
+def test_explicit_timestamp_field_is_preserved_and_partitions_by_that_field(tmp_path, timestamp_field):
+    data = pd.DataFrame({
+        timestamp_field: [
+            datetime(2026, 1, 1, 23, 59, tzinfo=timezone.utc),
+            datetime(2026, 1, 2, 0, 0, tzinfo=timezone.utc),
+        ],
+        "value": [1, 2],
+    })
+    artifacts = NormalizedParquetStore(tmp_path).write_dataframe(
+        dataframe=data,
+        source="coinbase_advanced",
+        product_id="BTC-USD",
+        data_kind="quarter_hour_bbo",
+        timestamp_field=timestamp_field,
+    )
+    assert len(artifacts) == 2
+    recovered = pd.concat([pd.read_parquet(artifact["path"]) for artifact in artifacts])
+    assert timestamp_field in recovered.columns
+    assert "source_time_utc" not in recovered.columns
+
+
+def test_forward_store_forwards_explicit_timestamp_field(tmp_path):
+    rows = [{
+        "event_time_utc": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "sequence_num": 1,
+    }]
+    artifact = ForwardParquetStore(tmp_path).write_rows(
+        rows=rows,
+        source="coinbase_advanced",
+        product_id="BTC-USD",
+        data_kind="level2_updates",
+        timestamp_field="event_time_utc",
+    )[0]
+    recovered = pd.read_parquet(artifact["path"])
+    assert "event_time_utc" in recovered.columns
+    assert "source_time_utc" not in recovered.columns

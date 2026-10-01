@@ -94,7 +94,8 @@ def collect_coinbase_bbo_main() -> None:
     client = CoinbaseWebSocketClient(config=config, transport=WebsocketsTransport())
     service = CoinbaseWebSocketService(config=config, client=client)
     raw_segment_writer = RawSegmentWriter(
-        args.output_root, product_id=args.product, max_frames=config.raw_segment_max_frames
+        args.output_root, product_id=args.product, session_id=service.session_id,
+        max_frames=config.raw_segment_max_frames
     )
     forward_store = ForwardParquetStore(args.output_root)
     collector = WebSocketCollector(
@@ -104,9 +105,28 @@ def collect_coinbase_bbo_main() -> None:
         output_root=args.output_root,
     )
     result = collector.run(max_messages=args.max_messages, max_duration_seconds=args.max_duration_seconds)
+    print(f"session_id={result.manifest['session_id']}")
     print(f"dataset_id={result.manifest['dataset_id']}")
     print(f"manifest_path={result.manifest_path}")
+    print(f"product_id={result.manifest['product_id']}")
+    print(f"session_start={result.manifest['session_started_at_utc']}")
+    print(f"session_end={result.manifest['session_completed_at_utc']}")
+    print(f"termination_reason={result.manifest['termination_reason']}")
+    print(f"raw_frame_count={sum(segment['frame_count'] for segment in result.raw_segments)}")
+    print(f"level2_message_count={sum(c['level2_messages_received'] for c in result.manifest['connections'])}")
+    print(f"heartbeat_message_count={sum(c['heartbeat_messages_received'] for c in result.manifest['connections'])}")
+    for counter in ("sequence_gap_count", "stale_sequence_count", "heartbeat_timeout_count"):
+        print(f"{counter}={result.manifest['integrity'][counter]}")
+    for name, key in (
+        ("quarter_hour_boundaries_seen", "boundaries_seen"),
+        ("quarter_hour_boundaries_eligible", "eligible_boundaries"),
+        ("quarter_hour_boundaries_ineligible", "ineligible_boundaries"),
+    ):
+        print(f"{name}={result.manifest['quarter_hour_summary'][key]}")
     print(f"raw_segment_count={len(result.raw_segments)}")
+    print(f"normalized_l2_rows={result.level2_update_row_count}")
+    print(f"bbo_state_rows={result.bbo_state_row_count}")
+    print(f"boundary_rows={result.observation_count}")
     print(f"observation_count={result.observation_count}")
     print(f"eligible_observation_count={result.eligible_observation_count}")
     print(f"level2_update_row_count={result.level2_update_row_count}")

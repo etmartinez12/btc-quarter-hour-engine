@@ -124,6 +124,13 @@ def test_parse_level2_event_rejects_invalid_price_and_quantity():
         parse_level2_event(_level2_event(updates=[_level2_update(price_level="nan")]))
 
 
+@pytest.mark.parametrize("field", ["price_level", "new_quantity"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_parse_level2_event_rejects_nonfinite_numbers(field, value):
+    with pytest.raises(ValueError, match="Invalid Level 2"):
+        parse_level2_event(_level2_event(updates=[_level2_update(**{field: value})]))
+
+
 def test_parse_level2_event_rejects_unsupported_side():
     with pytest.raises(ValueError, match="Unsupported side"):
         parse_level2_event(_level2_event(updates=[_level2_update(side="sideways")]))

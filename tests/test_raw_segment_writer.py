@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -82,6 +83,61 @@ def test_sealed_segment_metadata_tracks_provenance(tmp_path):
     second = writer.seal()
     assert second["segment_index"] == 1
     assert second["first_sequence_num"] is None
+
+
+def test_frames_are_durably_appended_and_sealed_with_session_provenance(tmp_path):
+    writer = RawSegmentWriter(
+        tmp_path,
+        product_id="BTC-USD",
+        session_id="session-1",
+        max_frames=10,
+    )
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    frame = b'{ "sequence_num": 7, "raw":true } \n'
+    writer.add_frame(
+        raw=frame,
+        message_type="l2_data",
+        connection_id="connection-1",
+        ingest_time_utc=base,
+    )
+
+    partial = writer.active_partial_path
+    assert partial.suffix == ".partial"
+    assert partial.exists()
+    assert partial.read_bytes() == len(frame).to_bytes(8, "big") + frame
+    assert writer.sealed_segments == []
+
+    sealed = writer.seal()
+    assert sealed is not None
+    assert not partial.exists()
+    assert sealed["session_id"] == "session-1"
+    assert sealed["connection_id"] == "connection-1"
+    assert sealed["raw_segment_schema_version"] == "1"
+    assert sealed["frames"] == [{
+        "frame_index": 0,
+        "connection_id": "connection-1",
+        "ingest_time_utc": "2024-01-01T00:00:00Z",
+        "sequence_num": 7,
+        "raw_frame_sha256": hashlib.sha256(frame).hexdigest(),
+        "message_type": "l2_data",
+    }]
+    assert writer.read_segment_frames(sealed["path"]) == [frame]
+    metadata_path = tmp_path / "raw" / "coinbase_advanced" / "websocket_segments" / "BTC-USD"
+    metadata = json.loads(next(metadata_path.glob("*.meta.json")).read_text())
+    assert metadata["request_metadata"]["session_id"] == "session-1"
+    assert metadata["request_metadata"]["frames"][0]["raw_frame_sha256"] == hashlib.sha256(frame).hexdigest()
+
+
+def test_unsealed_partial_remains_incomplete_after_writer_restart(tmp_path):
+    first = RawSegmentWriter(tmp_path, product_id="BTC-USD", session_id="crashed-session")
+    first.add_frame(raw=b'{"type":"heartbeat"}', message_type="heartbeat")
+    partial_path = first.active_partial_path
+    assert partial_path.exists()
+
+    restarted = RawSegmentWriter(tmp_path, product_id="BTC-USD", session_id="new-session")
+    assert restarted.sealed_segments == []
+    assert partial_path.exists()
+    assert not list(partial_path.parent.glob("*.json.gz"))
 
 
 def test_add_frame_rejects_naive_timestamp(tmp_path):

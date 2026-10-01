@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import time
 import uuid
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook
 from btc_quarter_hour_engine.market_data.replay import BoundaryEventProcessor, process_parsed_event
+from btc_quarter_hour_engine.storage.forward_schema import (
+    COINBASE_BBO_STATE_SCHEMA_VERSION, COINBASE_L2_UPDATE_SCHEMA_VERSION, FORWARD_SOURCE,
+)
 
 from .coinbase_websocket import CoinbaseWebSocketClient, parse_coinbase_ws_message
 from .config import CoinbaseWebSocketConfig
@@ -32,6 +36,11 @@ class ConnectionDiagnostics:
     heartbeat_messages_received: int = 0
     sequence_gap_count: int = 0
     stale_sequence_count: int = 0
+    heartbeat_timeout_count: int = 0
+    heartbeat_discontinuity_count: int = 0
+    malformed_frame_count: int = 0
+    malformed_level2_count: int = 0
+    crossed_book_count: int = 0
 
 
 def _level2_update_rows(
@@ -40,6 +49,9 @@ def _level2_update_rows(
     product_id: str,
     connection_id: str | None,
     fallback_time_utc: datetime,
+    session_id: str,
+    frame_index: int | None,
+    ingest_time_utc: datetime,
 ) -> list[dict[str, Any]]:
     """Build one normalized ``level2_updates`` row per individual book mutation.
 
@@ -54,14 +66,20 @@ def _level2_update_rows(
         event_time_utc = update.get("event_time_utc") or fallback_time_utc
         rows.append(
             {
-                "source_time_utc": event_time_utc,
+                "source": FORWARD_SOURCE,
                 "product_id": product_id,
+                "session_id": session_id,
                 "connection_id": connection_id,
+                "frame_index": frame_index,
                 "sequence_num": sequence_num,
-                "message_type": event.get("type"),
+                "message_time_utc": event.get("envelope_time_utc") or fallback_time_utc,
+                "event_time_utc": event_time_utc,
+                "ingest_time_utc": ingest_time_utc,
+                "event_type": event.get("type"),
                 "side": update.get("side"),
                 "price": update.get("price"),
-                "quantity": update.get("quantity"),
+                "new_quantity": update.get("quantity"),
+                "l2_schema_version": COINBASE_L2_UPDATE_SCHEMA_VERSION,
             }
         )
     return rows
@@ -72,17 +90,28 @@ def _bbo_state_row(
     book: Level2OrderBook,
     connection_id: str | None,
     source_time_utc: datetime,
+    session_id: str,
+    frame_index: int | None,
+    ingest_time_utc: datetime,
 ) -> dict[str, Any]:
     return {
-        "source_time_utc": source_time_utc,
+        "source": FORWARD_SOURCE,
         "product_id": book.product_id,
+        "session_id": session_id,
         "connection_id": connection_id,
+        "frame_index": frame_index,
+        "sequence_num": book.last_sequence_num,
+        "state_time_utc": source_time_utc,
+        "ingest_time_utc": ingest_time_utc,
         "state": book.state.value,
         "best_bid": book.best_bid,
         "best_ask": book.best_ask,
         "best_bid_size": book.best_bid_size,
         "best_ask_size": book.best_ask_size,
+        "spread": book.spread,
         "midpoint": book.midpoint,
+        "book_synced": book.is_synced(),
+        "book_schema_version": COINBASE_BBO_STATE_SCHEMA_VERSION,
     }
 
 
@@ -128,6 +157,7 @@ class CoinbaseWebSocketService:
     level2_update_rows: list[dict[str, Any]] = field(default_factory=list)
     bbo_state_rows: list[dict[str, Any]] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    on_reconnect_frame: Any = None
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -156,6 +186,9 @@ class CoinbaseWebSocketService:
         self.order_book.reset_for_new_connection()
         self.order_book.invalidate("new connection epoch")
         self.boundary_processor.note_gap()
+        self.heartbeat_counter = None
+        self.last_heartbeat_at = None
+        self.last_heartbeat_monotonic = self.monotonic_fn()
         connection = ConnectionDiagnostics(connection_id=str(uuid.uuid4()), connected_at_utc=self._utcnow())
         self.connection = connection
         return connection
@@ -172,8 +205,11 @@ class CoinbaseWebSocketService:
     def _record_diagnostic(self, *, kind: str, **payload: Any) -> None:
         self.diagnostics.append({"kind": kind, **payload})
 
-    def handle_message(self, message: Any) -> dict[str, Any]:
+    def handle_message(
+        self, message: Any, *, frame_index: int | None = None, ingest_time_utc: datetime | None = None,
+    ) -> dict[str, Any]:
         payload = parse_coinbase_ws_message(message)
+        ingest_time_utc = ingest_time_utc or self._utcnow()
         message_type = payload.get("type")
         if self.connection is not None:
             self.connection.messages_received += 1
@@ -184,7 +220,8 @@ class CoinbaseWebSocketService:
             connection_id = self.connection.connection_id if self.connection else None
             sequence_num = payload.get("sequence_num")
             was_synced_before = self.order_book.is_synced()
-            is_stale = self.order_book.classify_sequence(sequence_num).value == "stale"
+            disposition = self.order_book.classify_sequence(sequence_num).value
+            is_stale = disposition == "stale"
             new_observations = process_parsed_event(event=payload, book=self.order_book, processor=self.boundary_processor)
             self.observations.extend(new_observations)
             if is_stale:
@@ -193,7 +230,7 @@ class CoinbaseWebSocketService:
                 return {"status": "stale_sequence_ignored", "book": self.order_book.snapshot()}
             if self.connection is not None:
                 self.connection.last_sequence_num = sequence_num
-            if self.boundary_processor.gap_since_sync:
+            if disposition == "gap":
                 if self.connection is not None:
                     self.connection.sequence_gap_count += 1
                     self.connection.invalidated_at_utc = self._utcnow()
@@ -209,16 +246,28 @@ class CoinbaseWebSocketService:
                 if was_synced_before:
                     raise ValueError(f"Order book desynchronized at sequence {sequence_num!r}")
                 raise ValueError(f"Order book failed to synchronize at sequence {sequence_num!r}")
+            if not self.order_book.is_synced():
+                if self.connection is not None:
+                    reason = self.order_book.last_error or "malformed level2 state"
+                    if "crossed" in reason.lower():
+                        self.connection.crossed_book_count += 1
+                    else:
+                        self.connection.malformed_level2_count += 1
+                    self.connection.invalidated_at_utc = self._utcnow()
+                raise ValueError(self.order_book.last_error or "Order book failed to synchronize")
             envelope_time_utc = payload.get("envelope_time_utc") or self._utcnow()
             self.level2_update_rows.extend(
                 _level2_update_rows(
                     event=payload, product_id=self.config.product_id, connection_id=connection_id,
-                    fallback_time_utc=envelope_time_utc,
+                    fallback_time_utc=envelope_time_utc, session_id=self.session_id,
+                    frame_index=frame_index, ingest_time_utc=ingest_time_utc,
                 )
             )
             if self.order_book.is_synced():
                 self.bbo_state_rows.append(
-                    _bbo_state_row(book=self.order_book, connection_id=connection_id, source_time_utc=envelope_time_utc)
+                    _bbo_state_row(book=self.order_book, connection_id=connection_id,
+                                   source_time_utc=payload.get("event_time_utc") or envelope_time_utc,
+                                   session_id=self.session_id, frame_index=frame_index, ingest_time_utc=ingest_time_utc)
                 )
             if message_type == "snapshot":
                 if self.connection is not None:
@@ -236,6 +285,9 @@ class CoinbaseWebSocketService:
             self.last_heartbeat_at = heartbeat_time
             self.last_heartbeat_monotonic = self.monotonic_fn()
             if payload.get("sequence") is not None:
+                if self.heartbeat_counter is not None and int(payload["sequence"]) != self.heartbeat_counter + 1:
+                    if self.connection is not None:
+                        self.connection.heartbeat_discontinuity_count += 1
                 self.heartbeat_counter = int(payload["sequence"])
             return {"status": "heartbeat", "heartbeat_counter": self.heartbeat_counter}
 
@@ -268,6 +320,17 @@ class CoinbaseWebSocketService:
             self.connection.invalidated_at_utc = self._utcnow()
             self.connection.disconnect_reason = reason
 
+    def record_malformed_frame(self, raw_bytes: bytes) -> None:
+        if self.connection is not None:
+            self.connection.malformed_frame_count += 1
+            try:
+                payload = json.loads(raw_bytes)
+            except (ValueError, UnicodeError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("channel") == "l2_data":
+                self.connection.malformed_level2_count += 1
+        self.mark_invalid("malformed_source_state")
+
     def _wait_for_snapshot(self, *, deadline_seconds: float) -> None:
         """Keep receiving messages on the current connection until the order
         book becomes synced (a snapshot has been applied) or ``deadline_seconds``
@@ -284,10 +347,14 @@ class CoinbaseWebSocketService:
                 frame = self.client.receive_message()
             except TimeoutError:
                 continue
+            frame_index = self.on_reconnect_frame(frame) if self.on_reconnect_frame is not None else None
             try:
-                self.handle_message(frame.raw)
+                self.handle_message(
+                    frame.raw_bytes, frame_index=frame_index, ingest_time_utc=frame.received_at_utc,
+                )
             except ValueError:
-                pass
+                if frame.parse_error:
+                    self.record_malformed_frame(frame.raw_bytes)
             if self.order_book.is_synced():
                 return
 
