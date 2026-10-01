@@ -21,7 +21,7 @@ from btc_quarter_hour_engine.storage.forward_schema import (
 )
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
 
-from .websocket_service import CoinbaseWebSocketService
+from .websocket_service import CoinbaseWebSocketService, ReconnectExhaustedError
 
 
 @dataclass(slots=True)
@@ -148,6 +148,8 @@ class WebSocketCollector:
                 message_count += 1
         except KeyboardInterrupt:
             termination_reason = "keyboard_interrupt"
+        except ReconnectExhaustedError:
+            termination_reason = "reconnect_exhausted"
         except BaseException:
             if self.service.connection is not None:
                 self.service.connection.disconnected_at_utc = self.service._utcnow()
@@ -167,10 +169,7 @@ class WebSocketCollector:
 
     def _reconnect(self) -> None:
         self.raw_segment_writer.seal()
-        try:
-            self.service.reconnect()
-        except RuntimeError as exc:
-            raise RuntimeError("reconnect_exhausted") from exc
+        self.service.reconnect()
         self.connection_count += 1
         self.reconnect_count += 1
 

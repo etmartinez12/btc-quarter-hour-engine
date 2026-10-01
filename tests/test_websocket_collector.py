@@ -214,6 +214,89 @@ def test_collector_reconnects_on_connection_error_and_continues(tmp_path):
     assert transport.close_count >= 1
 
 
+def test_reconnect_exhaustion_finalizes_controlled_session(tmp_path):
+    clock = {"now": datetime(2024, 1, 1, 0, 14, 50, tzinfo=timezone.utc)}
+    ack = json.dumps({
+        "channel": "subscriptions",
+        "client_id": "",
+        "timestamp": "2024-01-01T00:14:56Z",
+        "sequence_num": 1,
+        "events": [],
+    })
+
+    class AttemptTransport(FakeTransport):
+        def __init__(self):
+            super().__init__([])
+            self.per_connection = {
+                1: [_snapshot(1, "2024-01-01T00:14:50Z"), _heartbeat(1, "2024-01-01T00:14:55Z")],
+                2: [ack, _heartbeat(1, "2024-01-01T00:14:57Z")],
+                3: [ack, _heartbeat(1, "2024-01-01T00:14:58Z")],
+            }
+            self.drop_sent = False
+
+        def recv(self, timeout=None):
+            current = self.connect_count
+            if self.per_connection[current]:
+                return self.per_connection[current].pop(0)
+            if current == 1 and not self.drop_sent:
+                self.drop_sent = True
+                raise ConnectionError("simulated initial connection drop")
+            if current == 3:
+                clock["now"] = datetime(2024, 1, 1, 0, 15, 5, tzinfo=timezone.utc)
+            raise TimeoutError("snapshot did not arrive")
+
+    ticks = {"value": 0.0}
+
+    def monotonic():
+        ticks["value"] += 0.1
+        return ticks["value"]
+
+    config = CoinbaseWebSocketConfig(
+        receive_timeout_seconds=0.01,
+        snapshot_wait_timeout_seconds=2.0,
+        max_reconnect_attempts=2,
+        initial_reconnect_backoff_seconds=0,
+        heartbeat_timeout_seconds=30,
+    )
+    transport = AttemptTransport()
+    client = CoinbaseWebSocketClient(config=config, transport=transport, now_fn=lambda: clock["now"])
+    service = CoinbaseWebSocketService(
+        config=config,
+        client=client,
+        now_fn=lambda: clock["now"],
+        monotonic_fn=monotonic,
+        sleep_fn=lambda *_: None,
+    )
+    collector = WebSocketCollector(
+        service=service,
+        raw_segment_writer=RawSegmentWriter(tmp_path, product_id="BTC-USD", max_frames=100),
+        forward_store=ForwardParquetStore(tmp_path),
+        output_root=str(tmp_path),
+    )
+
+    result = collector.run()
+
+    assert result.termination_reason == "reconnect_exhausted"
+    assert result.connection_count == 3
+    assert result.reconnect_count == 2
+    assert transport.connect_count == 3
+    assert transport.close_count >= 3
+    assert result.raw_segments
+    assert result.raw_frame_count == sum(segment["frame_count"] for segment in result.raw_segments)
+    assert result.manifest_path.exists()
+    persisted = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert persisted["termination_reason"] == "reconnect_exhausted"
+    assert persisted["connection_count"] == 3
+    assert persisted["reconnect_count"] == 2
+    boundary_artifact = result.bbo_normalized_artifacts[0]
+    boundary_frame = pd.read_parquet(boundary_artifact["path"])
+    boundary = boundary_frame.loc[
+        boundary_frame["boundary_time_utc"] == pd.Timestamp("2024-01-01T00:15:00Z")
+    ].iloc[0]
+    assert not bool(boundary["canonical_target_eligible"])
+    assert boundary["eligibility_reason"] in {"connection_unhealthy", "heartbeat_stale", "no_synced_snapshot"}
+
+
 def test_collector_stops_on_max_duration(tmp_path):
     ticks = iter([0.0, 0.0, 100.0, 100.0])
 

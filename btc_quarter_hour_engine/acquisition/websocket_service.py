@@ -17,6 +17,10 @@ from .coinbase_websocket import CoinbaseWebSocketClient, parse_coinbase_ws_messa
 from .config import CoinbaseWebSocketConfig
 
 
+class ReconnectExhaustedError(RuntimeError):
+    """Raised when the configured number of fresh-connection attempts fails."""
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -370,16 +374,20 @@ class CoinbaseWebSocketService:
         while True:
             self.sleep_fn(delay)
             connection = self.connect_and_subscribe()
+            failure_reason = "snapshot_wait_timeout"
             try:
                 self._wait_for_snapshot(deadline_seconds=self.config.snapshot_wait_timeout_seconds)
             except ConnectionError:
-                pass
+                failure_reason = "connection_failed_before_snapshot"
             if self.order_book.is_synced():
                 return connection
+            connection.disconnected_at_utc = self._utcnow()
+            connection.disconnect_reason = failure_reason
+            self.client.close()
             if self.config.max_reconnect_attempts is not None and attempt >= self.config.max_reconnect_attempts:
-                raise RuntimeError("WebSocket reconnect attempts exhausted")
+                raise ReconnectExhaustedError("WebSocket reconnect attempts exhausted")
             attempt += 1
             delay = min(self.config.max_reconnect_backoff_seconds, delay * 2)
 
 
-__all__ = ["CoinbaseWebSocketService", "ConnectionDiagnostics"]
+__all__ = ["CoinbaseWebSocketService", "ConnectionDiagnostics", "ReconnectExhaustedError"]
