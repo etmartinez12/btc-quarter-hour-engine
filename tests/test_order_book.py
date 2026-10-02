@@ -5,8 +5,6 @@ import pytest
 from btc_quarter_hour_engine.market_data.order_book import (
     Level2OrderBook,
     OrderBookState,
-    SequenceDisposition,
-    SequenceGapError,
 )
 
 
@@ -80,54 +78,9 @@ def test_snapshot_requires_two_sided_book():
     assert book.state == OrderBookState.INVALID
 
 
-def test_sequence_validation_accepts_monotonic_increments():
-    book = Level2OrderBook()
-    assert book.validate_sequence(5) is SequenceDisposition.IN_ORDER
-    assert book.validate_sequence(6) is SequenceDisposition.IN_ORDER
-    assert book.validate_sequence(7) is SequenceDisposition.IN_ORDER
-    assert book.last_sequence_num == 7
-
-
-def test_sequence_validation_detects_gap():
-    book = Level2OrderBook()
-    book.validate_sequence(5)
-    with pytest.raises(SequenceGapError, match="gap"):
-        book.validate_sequence(8)
-    # Gap detection does not silently advance the sequence epoch.
-    assert book.last_sequence_num == 5
-
-
-def test_sequence_validation_is_non_fatal_for_stale_or_duplicate_sequences():
-    """Stale/duplicate (redelivered) sequence numbers must be classified as
-    `STALE`, not raise, and must not advance `last_sequence_num` -- unlike a
-    real gap, no data was lost so the book/connection remain fully valid."""
-    book = Level2OrderBook()
-    book.validate_sequence(5)
-    assert book.validate_sequence(5) is SequenceDisposition.STALE
-    assert book.last_sequence_num == 5
-    assert book.validate_sequence(4) is SequenceDisposition.STALE
-    assert book.last_sequence_num == 5
-
-
-def test_classify_sequence_does_not_mutate_state():
-    book = Level2OrderBook()
-    book.validate_sequence(5)
-    assert book.classify_sequence(5) is SequenceDisposition.STALE
-    assert book.classify_sequence(6) is SequenceDisposition.IN_ORDER
-    assert book.classify_sequence(8) is SequenceDisposition.GAP
-    # None of the above classify_sequence calls advanced state.
-    assert book.last_sequence_num == 5
-
-
-def test_sequence_validation_ignores_none():
-    book = Level2OrderBook()
-    book.validate_sequence(None)
-    assert book.last_sequence_num is None
-
-
-def test_reset_clears_book_but_not_sequence_epoch():
+def test_reset_clears_book_but_retains_l2_sequence_provenance():
     book = _synced_book()
-    book.validate_sequence(42)
+    book.last_sequence_num = 42
     book.reset()
     assert book.state == OrderBookState.UNINITIALIZED
     assert book.best_bid is None
@@ -137,17 +90,14 @@ def test_reset_clears_book_but_not_sequence_epoch():
     assert book.last_sequence_num == 42
 
 
-def test_reset_for_new_connection_clears_book_and_sequence_epoch():
+def test_reset_for_new_connection_clears_book_and_l2_sequence_provenance():
     book = _synced_book()
-    book.validate_sequence(42)
+    book.last_sequence_num = 42
     book.reset_for_new_connection()
     assert book.state == OrderBookState.UNINITIALIZED
     assert book.best_bid is None
     assert book.best_ask is None
-    assert book.last_sequence_num is None, "a new connection must start a fresh sequence epoch"
-    # A sequence number from the prior connection epoch must not look like a gap now.
-    book.validate_sequence(1)
-    assert book.last_sequence_num == 1
+    assert book.last_sequence_num is None
 
 
 def test_invalidate_marks_state_and_records_reason():

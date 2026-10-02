@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ class WebSocketTransport(Protocol):
 #
 # Every server -> client message shares one outer envelope: a `channel`
 # identifying the subscription ("l2_data", "heartbeats", "subscriptions",
-# ...), a channel-scoped monotonically increasing `sequence_num`, a
+# ...), a connection-scoped monotonically increasing `sequence_num`, a
 # server-assigned `timestamp`, and a list of channel-specific `events`. See:
 # https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/level2
 #
@@ -46,8 +47,8 @@ class WebSocketTransport(Protocol):
 # Both "snapshot" and "update" events share the exact same `updates` shape
 # (there is no separate `bids`/`asks`/`changes` list as in the legacy
 # Coinbase Exchange feed); `side` is "bid" or "offer" on the wire (not
-# "ask"). Heartbeats carry their own per-channel sequence/timestamp and a
-# `current_time`/`heartbeat_counter` pair per event.
+# "ask"). Heartbeats also carry a separate `heartbeat_counter` per event;
+# this counter is distinct from the shared envelope sequence.
 # ---------------------------------------------------------------------------
 
 CHANNEL_LEVEL2 = "l2_data"
@@ -86,11 +87,28 @@ def _require_utc_datetime(value: Any, *, field_name: str) -> datetime:
     if value is None:
         raise ValueError(f"Missing {field_name}")
     text = str(value).strip()
+    go_timestamp = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{1,9}) ([+-]\d{4}) UTC m=[+-]\d+(?:\.\d+)?",
+        text,
+    )
+    if go_timestamp:
+        wall_time, fraction, offset = go_timestamp.groups()
+        microseconds = fraction[:6].ljust(6, "0")
+        offset = f"{offset[:3]}:{offset[3:]}"
+        try:
+            parsed = datetime.fromisoformat(f"{wall_time.replace(' ', 'T')}.{microseconds}{offset}")
+        except ValueError as exc:
+            raise ValueError(f"Malformed {field_name}: {value!r}") from exc
+        return parsed.astimezone(timezone.utc)
     normalized = text.replace("Z", "+00:00")
     if " " in normalized and "T" not in normalized:
         # Coinbase heartbeats' `current_time` uses a space-separated
         # "YYYY-MM-DD HH:MM:SS.ffffff" form rather than ISO-8601 with "T".
         normalized = normalized.replace(" ", "T", 1)
+    iso_fraction = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{7,})(.*)", normalized)
+    if iso_fraction:
+        wall_time, fraction, suffix = iso_fraction.groups()
+        normalized = f"{wall_time}.{fraction[:6]}{suffix}"
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError as exc:

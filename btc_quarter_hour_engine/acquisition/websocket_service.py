@@ -21,6 +21,10 @@ class ReconnectExhaustedError(RuntimeError):
     """Raised when the configured number of fresh-connection attempts fails."""
 
 
+class EnvelopeSequenceGapError(ValueError):
+    """Raised when a connection-level Coinbase envelope sequence gap is found."""
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -34,7 +38,9 @@ class ConnectionDiagnostics:
     invalidated_at_utc: datetime | None = None
     disconnected_at_utc: datetime | None = None
     disconnect_reason: str | None = None
+    # Retained in manifests as the last successfully applied L2 sequence.
     last_sequence_num: int | None = None
+    last_envelope_sequence_num: int | None = None
     messages_received: int = 0
     level2_messages_received: int = 0
     heartbeat_messages_received: int = 0
@@ -217,39 +223,36 @@ class CoinbaseWebSocketService:
         message_type = payload.get("type")
         if self.connection is not None:
             self.connection.messages_received += 1
+            envelope_sequence = payload["envelope"].sequence_num
+            previous_sequence = self.connection.last_envelope_sequence_num
+            if previous_sequence is not None and envelope_sequence <= previous_sequence:
+                self.connection.stale_sequence_count += 1
+                return {"status": "stale_sequence_ignored", "book": self.order_book.snapshot()}
+            if previous_sequence is not None and envelope_sequence > previous_sequence + 1:
+                self.connection.sequence_gap_count += 1
+                self.connection.invalidated_at_utc = self._utcnow()
+                expected_sequence = previous_sequence + 1
+                self.connection.last_envelope_sequence_num = envelope_sequence
+                self.mark_invalid("sequence_gap")
+                self._record_diagnostic(
+                    kind="sequence_error",
+                    expected_sequence=expected_sequence,
+                    received_sequence=envelope_sequence,
+                    gap_detected_at=self._utcnow().isoformat(),
+                    connection_id=self.connection.connection_id,
+                )
+                raise EnvelopeSequenceGapError(
+                    f"Connection sequence gap detected: expected {expected_sequence}, received {envelope_sequence}"
+                )
+            self.connection.last_envelope_sequence_num = envelope_sequence
 
         if message_type in {"snapshot", "l2_data"}:
             if self.connection is not None:
                 self.connection.level2_messages_received += 1
             connection_id = self.connection.connection_id if self.connection else None
             sequence_num = payload.get("sequence_num")
-            was_synced_before = self.order_book.is_synced()
-            disposition = self.order_book.classify_sequence(sequence_num).value
-            is_stale = disposition == "stale"
             new_observations = process_parsed_event(event=payload, book=self.order_book, processor=self.boundary_processor)
             self.observations.extend(new_observations)
-            if is_stale:
-                if self.connection is not None:
-                    self.connection.stale_sequence_count += 1
-                return {"status": "stale_sequence_ignored", "book": self.order_book.snapshot()}
-            if self.connection is not None:
-                self.connection.last_sequence_num = sequence_num
-            if disposition == "gap":
-                if self.connection is not None:
-                    self.connection.sequence_gap_count += 1
-                    self.connection.invalidated_at_utc = self._utcnow()
-                self._record_diagnostic(
-                    kind="sequence_error",
-                    expected_sequence=(
-                        self.order_book.last_sequence_num + 1 if self.order_book.last_sequence_num is not None else None
-                    ),
-                    received_sequence=sequence_num,
-                    gap_detected_at=self._utcnow().isoformat(),
-                    connection_id=connection_id,
-                )
-                if was_synced_before:
-                    raise ValueError(f"Order book desynchronized at sequence {sequence_num!r}")
-                raise ValueError(f"Order book failed to synchronize at sequence {sequence_num!r}")
             if not self.order_book.is_synced():
                 if self.connection is not None:
                     reason = self.order_book.last_error or "malformed level2 state"
@@ -259,6 +262,8 @@ class CoinbaseWebSocketService:
                         self.connection.malformed_level2_count += 1
                     self.connection.invalidated_at_utc = self._utcnow()
                 raise ValueError(self.order_book.last_error or "Order book failed to synchronize")
+            if self.connection is not None:
+                self.connection.last_sequence_num = sequence_num
             envelope_time_utc = payload.get("envelope_time_utc") or self._utcnow()
             self.level2_update_rows.extend(
                 _level2_update_rows(
@@ -356,6 +361,8 @@ class CoinbaseWebSocketService:
                 self.handle_message(
                     frame.raw_bytes, frame_index=frame_index, ingest_time_utc=frame.received_at_utc,
                 )
+            except EnvelopeSequenceGapError:
+                raise
             except ValueError:
                 if frame.parse_error:
                     self.record_malformed_frame(frame.raw_bytes)
@@ -377,6 +384,8 @@ class CoinbaseWebSocketService:
             failure_reason = "snapshot_wait_timeout"
             try:
                 self._wait_for_snapshot(deadline_seconds=self.config.snapshot_wait_timeout_seconds)
+            except EnvelopeSequenceGapError:
+                failure_reason = "sequence_gap_before_snapshot"
             except ConnectionError:
                 failure_reason = "connection_failed_before_snapshot"
             if self.order_book.is_synced():
@@ -390,4 +399,6 @@ class CoinbaseWebSocketService:
             delay = min(self.config.max_reconnect_backoff_seconds, delay * 2)
 
 
-__all__ = ["CoinbaseWebSocketService", "ConnectionDiagnostics", "ReconnectExhaustedError"]
+__all__ = [
+    "CoinbaseWebSocketService", "ConnectionDiagnostics", "EnvelopeSequenceGapError", "ReconnectExhaustedError",
+]

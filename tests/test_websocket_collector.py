@@ -104,8 +104,8 @@ def _build_collector(tmp_path, messages, *, heartbeat_timeout_seconds=30.0, conf
 def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path):
     messages = [
         _snapshot(1, "2024-01-01T00:14:50Z"),
-        _heartbeat(1, "2024-01-01T00:14:55Z"),
-        _update(2, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
     ]
     collector, service, transport, raw_writer = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
@@ -114,6 +114,7 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert result.eligible_observation_count == 1
     assert result.connection_count == 1
     assert result.reconnect_count == 0
+    assert result.heartbeat_message_count == 1
 
     # Manifest completeness.
     manifest = result.manifest
@@ -177,6 +178,45 @@ def test_collector_with_no_eligible_observations_reports_ineligibility_reason(tm
     assert result.manifest["canonical_target_eligible"] is False
     assert len(result.bbo_normalized_artifacts) == 1
     assert pd.read_parquet(result.bbo_normalized_artifacts[0]["path"])["eligibility_reason"].iloc[0] == "no_synced_snapshot"
+
+
+def test_collector_counts_real_heartbeat_and_keeps_counters_distinct(tmp_path):
+    heartbeat = json.dumps({
+        "channel": "heartbeats",
+        "timestamp": "2026-10-02T17:20:32.414830619Z",
+        "sequence_num": 1,
+        "events": [{
+            "current_time": "2026-10-02 17:20:32.414052991 +0000 UTC m=+181244.321549317",
+            "heartbeat_counter": 181244,
+        }],
+    })
+    collector, _, _, _ = _build_collector(
+        tmp_path,
+        [_snapshot(0, "2026-10-02T17:20:30Z"), heartbeat],
+    )
+    result = collector.run(max_messages=2)
+    assert result.heartbeat_message_count == 1
+    assert result.manifest["connections"][0]["heartbeat_messages_received"] == 1
+    assert result.manifest["connections"][0]["last_envelope_sequence_num"] == 1
+    assert result.manifest["connections"][0]["last_sequence_num"] == 0
+
+
+def test_collector_reconnects_after_a_true_envelope_sequence_gap(tmp_path):
+    messages = [
+        _snapshot(10, "2024-01-01T00:14:50Z"),
+        _update(12, "2024-01-01T00:14:55Z", "bid", 100.5, 2.0),
+        _snapshot(0, "2024-01-01T00:15:05Z"),
+    ]
+    collector, _, _, _ = _build_collector(
+        tmp_path,
+        messages,
+        config_kwargs={"initial_reconnect_backoff_seconds": 0},
+    )
+    result = collector.run(max_messages=2)
+    assert result.reconnect_count == 1
+    assert result.connection_count == 2
+    assert result.raw_frame_count == 3
+    assert result.manifest["integrity"]["sequence_gap_count"] == 1
 
 
 def test_collector_reconnects_on_connection_error_and_continues(tmp_path):
@@ -320,10 +360,10 @@ def test_collector_stops_on_max_duration(tmp_path):
 def test_collector_raw_segments_replay_to_same_observations_as_live(tmp_path):
     messages = [
         _snapshot(1, "2024-01-01T00:14:50Z"),
-        _heartbeat(1, "2024-01-01T00:14:55Z"),
-        _update(2, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
-        _heartbeat(2, "2024-01-01T00:15:03Z"),
-        _update(3, "2024-01-01T00:30:02Z", "ask", 101.5, 3.0),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
+        _heartbeat(4, "2024-01-01T00:15:03Z"),
+        _update(5, "2024-01-01T00:30:02Z", "ask", 101.5, 3.0),
     ]
     collector, service, transport, raw_writer = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
@@ -359,9 +399,9 @@ def test_collector_raw_segments_replay_to_same_observations_as_live(tmp_path):
 def test_final_canonical_replay_includes_late_arriving_pre_boundary_l2(tmp_path):
     messages = [
         _snapshot(1, "2024-01-01T13:14:50Z"),
-        _heartbeat(1, "2024-01-01T13:14:55Z"),
-        _update(2, "2024-01-01T13:15:00.100Z", "offer", 101.5, 1),
-        _update(3, "2024-01-01T13:14:59.950Z", "bid", 100.5, 1),
+        _heartbeat(2, "2024-01-01T13:14:55Z"),
+        _update(3, "2024-01-01T13:15:00.100Z", "offer", 101.5, 1),
+        _update(4, "2024-01-01T13:14:59.950Z", "bid", 100.5, 1),
     ]
     collector, service, _, _ = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
@@ -378,8 +418,8 @@ def test_final_replay_uses_each_update_time_in_one_envelope(tmp_path):
     before, after = "2024-01-01T13:14:59.900Z", "2024-01-01T13:15:00.100Z"
     messages = [
         _snapshot(199, "2024-01-01T13:14:50Z"),
-        _heartbeat(1, "2024-01-01T13:14:55Z"),
-        _l2_message("update", 200, after, [
+        _heartbeat(200, "2024-01-01T13:14:55Z"),
+        _l2_message("update", 201, after, [
             {"side": "bid", "price_level": "100.5", "new_quantity": "1", "event_time": before},
             {"side": "offer", "price_level": "101.5", "new_quantity": "1", "event_time": after},
         ]),
@@ -444,10 +484,10 @@ def test_keyboard_interrupt_finalizes_and_closes(tmp_path):
 def test_reconnect_frames_are_recorded_with_new_epoch_and_row_provenance(tmp_path):
     messages = [
         _snapshot(10, "2024-01-01T13:14:50Z"),
-        _heartbeat(1, "2024-01-01T13:14:55Z"),
+        _heartbeat(11, "2024-01-01T13:14:55Z"),
         _snapshot(1, "2024-01-01T13:15:05Z"),
-        _heartbeat(1, "2024-01-01T13:29:59Z"),
-        _update(2, "2024-01-01T13:30:01Z", "bid", 100.5, 1),
+        _heartbeat(2, "2024-01-01T13:29:59Z"),
+        _update(3, "2024-01-01T13:30:01Z", "bid", 100.5, 1),
     ]
     collector, service, transport, _ = _build_collector(
         tmp_path, messages,
@@ -475,8 +515,8 @@ def test_malformed_frame_invalidates_canonical_epoch_and_counts_integrity(tmp_pa
             {"side": "bid", "price_level": "inf", "new_quantity": "1", "event_time": "2024-01-01T13:14:56Z"}
         ]}],
     })
-    messages = [_snapshot(1, "2024-01-01T13:14:50Z"), _heartbeat(1, "2024-01-01T13:14:55Z"), invalid,
-                _update(3, "2024-01-01T13:15:01Z", "bid", 100.5, 1)]
+    messages = [_snapshot(1, "2024-01-01T13:14:50Z"), _heartbeat(2, "2024-01-01T13:14:55Z"), invalid,
+                _update(2, "2024-01-01T13:15:01Z", "bid", 100.5, 1)]
     collector, _, _, _ = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
     row = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"]).iloc[0]

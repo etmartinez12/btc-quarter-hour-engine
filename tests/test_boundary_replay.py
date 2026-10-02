@@ -100,34 +100,18 @@ def test_boundary_crossed_with_stale_heartbeat_is_ineligible():
     assert observations[0].eligible is False
 
 
-def test_sequence_gap_makes_subsequent_boundary_ineligible_until_resync():
+def test_l2_mutation_path_does_not_infer_gaps_from_l2_only_sequences():
     book = Level2OrderBook(product_id="BTC-USD")
     processor = BoundaryEventProcessor(product_id="BTC-USD", heartbeat_timeout_seconds=30)
     process_parsed_event(event=_snapshot_event(1, datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)), book=book, processor=processor)
-    process_parsed_event(event=_heartbeat_event(datetime(2024, 1, 1, 0, 0, 1, tzinfo=timezone.utc)), book=book, processor=processor)
-    # Simulate a dropped message: sequence jumps from 1 to 5.
-    gap_observations = process_parsed_event(
+    process_parsed_event(
         event=_update_event(5, datetime(2024, 1, 1, 0, 5, 0, tzinfo=timezone.utc), "bid", 100.5, 1.0),
         book=book,
         processor=processor,
     )
-    assert gap_observations == []
-    assert not book.is_synced()
-    assert processor.gap_since_sync is True
-
-    # Real Coinbase sequence recovery only happens via a new connection epoch
-    # (reconnect + fresh subscribe), which restarts the per-connection
-    # sequence counter -- an in-band snapshot cannot silently "skip ahead".
-    book.reset_for_new_connection()
-    process_parsed_event(event=_snapshot_event(1, datetime(2024, 1, 1, 0, 10, 0, tzinfo=timezone.utc)), book=book, processor=processor)
-    process_parsed_event(event=_heartbeat_event(datetime(2024, 1, 1, 0, 14, 59, tzinfo=timezone.utc)), book=book, processor=processor)
-    observations = process_parsed_event(
-        event=_update_event(2, datetime(2024, 1, 1, 0, 15, 0, tzinfo=timezone.utc), "bid", 100.5, 1.0),
-        book=book,
-        processor=processor,
-    )
-    assert len(observations) == 1
-    assert observations[0].eligible is True
+    assert book.is_synced()
+    assert book.last_sequence_num == 5
+    assert processor.gap_since_sync is False
 
 
 def test_replay_events_is_deterministic_regardless_of_input_order():
@@ -246,6 +230,15 @@ def _frame(channel, timestamp, sequence, *, updates=None, event_type="update", c
     return json.dumps({"channel": channel, "timestamp": timestamp, "sequence_num": sequence, "events": events}).encode()
 
 
+def _subscription(sequence, timestamp="2024-01-01T13:14:56Z"):
+    return json.dumps({
+        "channel": "subscriptions",
+        "timestamp": timestamp,
+        "sequence_num": sequence,
+        "events": [{"subscriptions": {"level2": ["BTC-USD"]}}],
+    }).encode()
+
+
 def _snapshot(timestamp="2024-01-01T13:14:50Z"):
     return _frame("l2_data", timestamp, 1, event_type="snapshot", updates=[
         ("bid", "1970-01-01T00:00:00Z", 100, 1),
@@ -257,8 +250,8 @@ def _update(sequence, *updates):
     return _frame("l2_data", "2024-01-01T13:15:01Z", sequence, updates=updates)
 
 
-def _heartbeat(time="2024-01-01T13:14:55Z"):
-    return _frame("heartbeats", time, 1)
+def _heartbeat(time="2024-01-01T13:14:55Z", sequence=2, counter=1):
+    return _frame("heartbeats", time, sequence, counter=counter)
 
 
 def _replay(raw_frames, **kwargs):
@@ -271,14 +264,14 @@ def _replay(raw_frames, **kwargs):
 def test_final_replay_late_arriving_l2_mutation_excludes_future_ask():
     ledger = _replay([
         _snapshot(), _heartbeat(),
-        _update(2, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
-        _update(3, ("bid", "2024-01-01T13:14:59.950Z", 100.5, 1)),
+        _update(3, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
+        _update(4, ("bid", "2024-01-01T13:14:59.950Z", 100.5, 1)),
     ])
     assert len(ledger) == 1
     row = ledger[0]
     assert row.boundary_time_utc == _at("15:00")
     assert (row.best_bid, row.best_ask, row.midpoint) == (100.5, 101, 100.75)
-    assert (row.source_sequence_num, row.connection_id, row.session_id) == (3, "conn-1", "session-1")
+    assert (row.source_sequence_num, row.connection_id, row.session_id) == (4, "conn-1", "session-1")
     assert row.canonical_target_eligible and row.eligibility_reason == "eligible"
     assert row.derived_at_utc == _at("15:00.100000")
 
@@ -286,7 +279,7 @@ def test_final_replay_late_arriving_l2_mutation_excludes_future_ask():
 def test_one_envelope_replays_individual_update_times():
     ledger = _replay([
         _snapshot(), _heartbeat(),
-        _update(2,
+        _update(3,
             ("bid", "2024-01-01T13:14:59.900Z", 100.5, 1),
             ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
     ])
@@ -296,8 +289,8 @@ def test_one_envelope_replays_individual_update_times():
 def test_exact_boundary_mutation_inclusive_and_one_microsecond_future_exclusive():
     ledger = _replay([
         _snapshot(), _heartbeat(),
-        _update(2, ("bid", "2024-01-01T13:15:00Z", 100.5, 1)),
-        _update(3, ("offer", "2024-01-01T13:15:00.000001Z", 101.5, 1)),
+        _update(3, ("bid", "2024-01-01T13:15:00Z", 100.5, 1)),
+        _update(4, ("offer", "2024-01-01T13:15:00.000001Z", 101.5, 1)),
     ])
     assert (ledger[0].best_bid, ledger[0].best_ask) == (100.5, 101)
 
@@ -315,7 +308,7 @@ def test_ineligible_ledger_reasons_and_no_price_freshness():
     assert gap[0].best_bid is None
     crossed = _replay([
         _snapshot(), _heartbeat(),
-        _update(2, ("bid", "2024-01-01T13:14:59Z", 102, 1)),
+        _update(3, ("bid", "2024-01-01T13:14:59Z", 102, 1)),
     ], session_completed_at_utc=start)
     assert crossed[0].eligibility_reason == "crossed_book"
     assert not crossed[0].book_synced
@@ -354,7 +347,7 @@ def test_old_price_remains_valid_with_fresh_heartbeat_and_stale_sequence_is_igno
         _snapshot("2024-01-01T13:00:01Z"),
         _update(2, ("bid", "2024-01-01T13:00:02Z", 100.5, 1)),
         _update(2, ("bid", "2024-01-01T13:14:59Z", 999, 1)),
-        _heartbeat("2024-01-01T13:14:59Z"),
+        _heartbeat("2024-01-01T13:14:59Z", sequence=3),
     ], session_completed_at_utc=_at("15:00"))
     assert ledger[0].eligible
     assert ledger[0].best_bid == 100.5
@@ -364,17 +357,49 @@ def test_old_price_remains_valid_with_fresh_heartbeat_and_stale_sequence_is_igno
 def test_sequence_integrity_uses_arrival_not_sorted_update_time():
     ledger = _replay([
         _snapshot(), _heartbeat(),
-        _update(2, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
-        _update(4, ("bid", "2024-01-01T13:14:59.950Z", 100.5, 1)),
+        _update(3, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
+        _update(5, ("bid", "2024-01-01T13:14:59.950Z", 100.5, 1)),
     ])
     assert ledger[0].eligibility_reason == "sequence_gap"
     assert ledger[0].best_bid is None
 
 
+def test_final_replay_tracks_subscriptions_and_heartbeats_in_envelope_sequence():
+    frames = [
+        _frame("l2_data", "2024-01-01T13:14:50Z", 0, event_type="snapshot", updates=[
+            ("bid", "1970-01-01T00:00:00Z", 100, 1),
+            ("offer", "1970-01-01T00:00:00Z", 101, 2),
+        ]),
+        _update(1, ("bid", "2024-01-01T13:14:54Z", 100.5, 1)),
+        _subscription(2),
+        _frame("heartbeats", "2024-01-01T13:14:59Z", 3, counter=1),
+        _update(4, ("offer", "2024-01-01T13:14:59Z", 101.5, 1)),
+    ]
+    ledger = _replay(frames, session_completed_at_utc=_at("15:00"))
+    assert len(ledger) == 1
+    assert ledger[0].eligible
+    assert ledger[0].best_bid == 100.5
+
+
+def test_final_replay_detects_gap_across_non_l2_envelopes():
+    frames = [
+        _frame("l2_data", "2024-01-01T13:14:50Z", 0, event_type="snapshot", updates=[
+            ("bid", "1970-01-01T00:00:00Z", 100, 1),
+            ("offer", "1970-01-01T00:00:00Z", 101, 2),
+        ]),
+        _frame("heartbeats", "2024-01-01T13:14:55Z", 1, counter=1),
+        _update(3, ("bid", "2024-01-01T13:14:59Z", 100.5, 1)),
+    ]
+    ledger = _replay(frames, session_completed_at_utc=_at("15:00"))
+    assert ledger[0].eligibility_reason == "sequence_gap"
+    assert not ledger[0].eligible
+    assert ledger[0].best_bid is None
+
+
 def test_delivery_order_wins_over_nonmonotonic_frame_indices():
     frames = [(_snapshot(), "conn-1", 30), (_heartbeat(), "conn-1", 20),
-              (_update(2, ("bid", "2024-01-01T13:15:00Z", 100.5, 1)), "conn-1", 10),
-              (_update(3, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)), "conn-1", 0)]
+              (_update(3, ("bid", "2024-01-01T13:15:00Z", 100.5, 1)), "conn-1", 10),
+              (_update(4, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)), "conn-1", 0)]
     row = replay_recorded_frames(
         frames, product_id="BTC-USD", session_id="session-1", heartbeat_timeout_seconds=30,
     )[0]
