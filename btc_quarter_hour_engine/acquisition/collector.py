@@ -21,7 +21,7 @@ from btc_quarter_hour_engine.storage.forward_schema import (
 )
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
 
-from .websocket_service import CoinbaseWebSocketService, ReconnectExhaustedError
+from .websocket_service import CoinbaseWebSocketService, EnvelopeSequenceGapError, ReconnectExhaustedError
 
 
 @dataclass(slots=True)
@@ -142,6 +142,8 @@ class WebSocketCollector:
                     self.service.handle_message(
                         frame.raw_bytes, frame_index=frame_index, ingest_time_utc=frame.received_at_utc,
                     )
+                except EnvelopeSequenceGapError:
+                    self._reconnect()
                 except ValueError:
                     if frame.parse_error:
                         self.service.record_malformed_frame(frame.raw_bytes)

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .boundary_observations import QuarterHourObservation, derive_quarter_hour_observation, require_utc
-from .order_book import Level2OrderBook, SequenceDisposition, SequenceGapError
+from .order_book import Level2OrderBook
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -90,13 +90,7 @@ def process_parsed_event(
     if event_type not in {"snapshot", "l2_data"}:
         return observations
     sequence_num = event.get("sequence_num")
-    try:
-        disposition = book.validate_sequence(sequence_num)
-    except SequenceGapError:
-        book.invalidate("sequence gap")
-        processor.note_gap()
-        return observations
-    if disposition is SequenceDisposition.STALE:
+    if sequence_num is not None and book.last_sequence_num is not None and sequence_num <= book.last_sequence_num:
         # A redelivered/duplicate message for this connection epoch: its
         # effect is already reflected in the book, so it is safely dropped
         # without invalidating the book or marking a gap.
@@ -118,6 +112,8 @@ def process_parsed_event(
     except ValueError:
         processor.note_gap()
         return observations
+    if sequence_num is not None:
+        book.last_sequence_num = sequence_num
     processor.note_synced()
     return observations
 
@@ -137,7 +133,7 @@ def replay_recorded_frames(
     session_completed_at_utc: datetime | None = None,
     derived_at_utc: datetime | None = None,
 ) -> list[QuarterHourObservation]:
-    """Finalize raw frames: validate L2 sequences in delivery order, then replay source-time mutations.
+    """Finalize raw frames: validate envelope sequences in delivery order, then replay source-time mutations.
 
     Connection diagnostics may be mappings or objects with ``connection_id``,
     ``connected_at_utc`` and ``disconnected_at_utc`` attributes. A missing
@@ -152,9 +148,8 @@ def replay_recorded_frames(
     if start is not None and end is not None and end < start:
         raise ValueError("Session completion precedes session start")
 
-    # Sort only for integrity within an epoch. Do not sort envelopes by source time:
-    # a late-arriving valid update must remain valid even if its time precedes
-    # another update with a smaller sequence number.
+    # Validate envelopes in recorded delivery order before sorting their
+    # mutations by source time for boundary reconstruction.
     deliveries: dict[str, list[tuple[int, int, bytes]]] = {}
     for arrival, (raw, connection_id, frame_index) in enumerate(frames):
         if not isinstance(raw, bytes):
@@ -183,11 +178,33 @@ def replay_recorded_frames(
                     actions.append((last_time, arrival, 0, "malformed", None, sequence))
                 continue
             kind = event.get("type")
-            if kind not in {"snapshot", "l2_data", "heartbeat"}:
-                continue
-            envelope_time = event.get("envelope_time_utc") or event.get("time_utc")
+            envelope = event["envelope"]
+            envelope_time = event.get("envelope_time_utc") or event.get("time_utc") or envelope.timestamp_utc
             if envelope_time is not None:
                 envelope_time = require_utc(envelope_time)
+            current = envelope.sequence_num
+            if sequence is not None and current <= sequence:
+                continue
+            if sequence is not None and current > sequence + 1:
+                gap_time = envelope_time
+                if kind == "snapshot":
+                    gap_time = envelope_time or require_utc(event["event_time_utc"])
+                elif kind == "heartbeat":
+                    gap_time = require_utc(event["time_utc"])
+                elif kind == "l2_data":
+                    times = [require_utc(u.get("event_time_utc") or envelope_time) for u in event["updates"]]
+                    if times:
+                        gap_time = min(times)
+                invalid = True
+                actions.append((gap_time, arrival, 0, "gap", None, current))
+                observed_times.append(gap_time)
+                first_time = min(first_time, gap_time) if first_time else gap_time
+                last_time = max(last_time, gap_time) if last_time else gap_time
+                sequence = current
+                continue
+            sequence = current
+            if kind not in {"snapshot", "l2_data", "heartbeat"}:
+                continue
             if kind == "snapshot":
                 event_time = envelope_time or require_utc(event["event_time_utc"])
             elif kind == "heartbeat":
@@ -204,20 +221,11 @@ def replay_recorded_frames(
             first_time = min(first_time, event_time) if first_time else event_time
             last_time = max(last_time, event_time) if last_time else event_time
             if kind == "heartbeat":
-                actions.append((event_time, arrival, 0, "heartbeat", None, None))
+                if not invalid:
+                    actions.append((event_time, arrival, 0, "heartbeat", None, None))
                 continue
             if event["product_id"] != product_id:
                 continue
-            current = event.get("sequence_num")
-            if sequence is not None and current is not None:
-                if current <= sequence:
-                    continue
-                if current > sequence + 1:
-                    invalid = True
-                    actions.append((event_time, arrival, 0, "gap", None, current))
-                    sequence = current
-                    continue
-            sequence = current if current is not None else sequence
             if invalid:
                 continue
             if kind == "snapshot":

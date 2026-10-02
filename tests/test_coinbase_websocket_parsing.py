@@ -277,6 +277,25 @@ def test_parse_coinbase_ws_message_flattens_heartbeat():
     assert parsed["time_utc"] == datetime(2024, 1, 1, 0, 0, 5, tzinfo=timezone.utc)
 
 
+def test_parse_real_coinbase_heartbeat_time_and_preserve_envelope_sequence():
+    payload = {
+        "channel": "heartbeats",
+        "timestamp": "2026-10-02T17:20:32.414830619Z",
+        "sequence_num": 16,
+        "events": [
+            {
+                "current_time": "2026-10-02 17:20:32.414052991 +0000 UTC m=+181244.321549317",
+                "heartbeat_counter": 181244,
+            }
+        ],
+    }
+    parsed = parse_coinbase_ws_message(payload)
+    assert parsed["type"] == "heartbeat"
+    assert parsed["sequence"] == 181244
+    assert parsed["time_utc"] == datetime(2026, 10, 2, 17, 20, 32, 414052, tzinfo=timezone.utc)
+    assert parsed["envelope"].sequence_num == 16
+
+
 def test_parse_coinbase_ws_message_falls_back_to_envelope_timestamp_when_heartbeat_missing_current_time():
     payload = _heartbeat_message(events=[{"heartbeat_counter": "3"}])
     parsed = parse_coinbase_ws_message(json.dumps(payload))
@@ -288,6 +307,18 @@ def test_parse_coinbase_ws_message_passes_through_other_channels():
     parsed = parse_coinbase_ws_message(json.dumps(payload))
     assert parsed["type"] == "subscriptions"
     assert parsed["payload"] == payload
+
+
+def test_parse_real_coinbase_subscription_envelope():
+    payload = {
+        "channel": "subscriptions",
+        "timestamp": "2026-10-02T17:20:32.027067134Z",
+        "sequence_num": 5,
+        "events": [{"subscriptions": {"level2": ["BTC-USD"]}}],
+    }
+    parsed = parse_coinbase_ws_message(payload)
+    assert parsed["type"] == "subscriptions"
+    assert parsed["envelope"].sequence_num == 5
 
 
 def test_parse_coinbase_ws_message_rejects_malformed_json():

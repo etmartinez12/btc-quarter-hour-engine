@@ -69,14 +69,25 @@ def _update(seq, time, side, price, quantity):
     )
 
 
-def _heartbeat(seq, time):
+def _heartbeat(seq, time, *, counter=None):
     return json.dumps(
         {
             "channel": "heartbeats",
             "client_id": "",
             "timestamp": time,
             "sequence_num": seq,
-            "events": [{"current_time": time, "heartbeat_counter": str(seq)}],
+            "events": [{"current_time": time, "heartbeat_counter": str(seq if counter is None else counter)}],
+        }
+    )
+
+
+def _subscriptions(seq, time="2026-10-02T17:20:32.027067134Z"):
+    return json.dumps(
+        {
+            "channel": "subscriptions",
+            "timestamp": time,
+            "sequence_num": seq,
+            "events": [{"subscriptions": {"level2": ["BTC-USD"]}}],
         }
     )
 
@@ -157,6 +168,93 @@ def test_handle_message_stale_or_duplicate_sequence_is_non_fatal():
     assert service.diagnostics == []
 
 
+def test_interleaved_envelopes_advance_connection_sequence_without_mutating_book():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(0, "2026-10-02T17:20:30Z"))
+    service.handle_message(_update(1, "2026-10-02T17:20:31Z", "bid", 100.5, 2.0))
+    before_subscription = service.order_book.snapshot()
+    service.handle_message(_subscriptions(2, "2026-10-02T17:20:32Z"))
+    assert service.order_book.snapshot() == before_subscription
+    service.handle_message(_update(3, "2026-10-02T17:20:33Z", "offer", 101.5, 3.0))
+    service.handle_message(_heartbeat(4, "2026-10-02T17:20:34Z"))
+    service.handle_message(_update(5, "2026-10-02T17:20:35Z", "bid", 100.75, 4.0))
+    service.handle_message(_subscriptions(6, "2026-10-02T17:20:36Z"))
+
+    assert service.connection.sequence_gap_count == 0
+    assert service.connection.stale_sequence_count == 0
+    assert service.connection.last_envelope_sequence_num == 6
+    assert service.connection.last_sequence_num == 5
+    assert service.connection.level2_messages_received == 4
+    assert service.connection.heartbeat_messages_received == 1
+    assert service.order_book.is_synced()
+    assert service.order_book.best_bid == 100.75
+    assert service.order_book.best_ask == 101.0
+    assert 101.5 in service.order_book.asks
+    assert len(service.level2_update_rows) == 5
+    assert len(service.bbo_state_rows) == 4
+
+
+def test_true_gap_across_channels_invalidates_book():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(10, "2026-10-02T17:20:30Z"))
+    service.handle_message(_heartbeat(11, "2026-10-02T17:20:31Z"))
+    with pytest.raises(ValueError, match="expected 12, received 13"):
+        service.handle_message(_update(13, "2026-10-02T17:20:32Z", "bid", 100.5, 2.0))
+    assert service.connection.sequence_gap_count == 1
+    assert not service.order_book.is_synced()
+
+
+def test_stale_control_envelope_is_ignored_without_invalidating_book():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(10, "2026-10-02T17:20:30Z"))
+    service.handle_message(_heartbeat(11, "2026-10-02T17:20:31Z"))
+    before = service.order_book.snapshot()
+    result = service.handle_message(_subscriptions(10, "2026-10-02T17:20:32Z"))
+    assert result["status"] == "stale_sequence_ignored"
+    assert service.connection.stale_sequence_count == 1
+    assert service.connection.sequence_gap_count == 0
+    assert service.order_book.snapshot() == before
+    service.handle_message(_update(12, "2026-10-02T17:20:33Z", "bid", 100.5, 2.0))
+    assert service.order_book.is_synced()
+    assert service.connection.last_envelope_sequence_num == 12
+
+
+def test_unknown_valid_channel_advances_connection_sequence_only():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(10, "2026-10-02T17:20:30Z"))
+    before = service.order_book.snapshot()
+    result = service.handle_message(json.dumps({
+        "channel": "future_control_channel",
+        "timestamp": "2026-10-02T17:20:31Z",
+        "sequence_num": 11,
+        "events": [{"status": "ok"}],
+    }))
+    assert result["status"] == "ignored"
+    assert service.order_book.snapshot() == before
+    service.handle_message(_update(12, "2026-10-02T17:20:32Z", "bid", 100.5, 2.0))
+    assert service.connection.sequence_gap_count == 0
+    assert service.connection.last_envelope_sequence_num == 12
+
+
+def test_connection_sequence_baseline_resets_on_reconnect():
+    service, _ = _service([])
+    first = service.new_connection()
+    for seq in (100, 101, 102):
+        service.handle_message(_subscriptions(seq, f"2026-10-02T17:20:{seq - 70:02d}Z"))
+    assert first.last_envelope_sequence_num == 102
+
+    second = service.new_connection()
+    for seq in (0, 1, 2):
+        service.handle_message(_subscriptions(seq, f"2026-10-02T17:21:{seq:02d}Z"))
+    assert second.last_envelope_sequence_num == 2
+    assert second.sequence_gap_count == 0
+    assert service.connection_history == [first]
+
+
 def test_handle_message_heartbeat_updates_health_tracking():
     service, _ = _service([], heartbeat_timeout_seconds=1000)
     assert service.heartbeat_is_healthy()
@@ -170,8 +268,8 @@ def test_heartbeat_counter_discontinuity_is_recorded_without_invalidating_book()
     service, _ = _service([])
     service.connect_and_subscribe()
     service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
-    service.handle_message(_heartbeat(1, "2024-01-01T00:00:01Z"))
-    service.handle_message(_heartbeat(3, "2024-01-01T00:00:02Z"))
+    service.handle_message(_heartbeat(2, "2024-01-01T00:00:01Z", counter=1))
+    service.handle_message(_heartbeat(3, "2024-01-01T00:00:02Z", counter=3))
     assert service.connection.heartbeat_discontinuity_count == 1
     assert service.order_book.is_synced()
 
@@ -268,7 +366,7 @@ def test_reconnect_restarts_sequence_epoch_and_resyncs():
         _snapshot(1, "2024-01-01T00:00:00Z"),
         # A brand-new connection's first snapshot uses a fresh, low sequence
         # number; this must not look like a gap relative to the old epoch.
-        _snapshot(1, "2024-01-01T00:00:05Z"),
+        _snapshot(3, "2024-01-01T00:00:05Z"),
     ]
     service, transport = _service(messages, max_reconnect_attempts=3, initial_reconnect_backoff_seconds=0)
     service.connect_and_subscribe()
@@ -296,7 +394,7 @@ def test_reconnect_wait_for_snapshot_drains_non_snapshot_messages_first():
     queued_messages = [
         _heartbeat(1, "2024-01-01T00:00:01Z"),
         _heartbeat(2, "2024-01-01T00:00:02Z"),
-        _snapshot(1, "2024-01-01T00:00:05Z"),
+        _snapshot(3, "2024-01-01T00:00:05Z"),
     ]
     service, transport = _service(
         queued_messages, max_reconnect_attempts=3, initial_reconnect_backoff_seconds=0, snapshot_wait_timeout_seconds=1000.0
