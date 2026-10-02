@@ -5,6 +5,8 @@ import threading
 import pytest
 from websockets.sync.server import serve
 
+from btc_quarter_hour_engine.acquisition import websocket_transport
+from btc_quarter_hour_engine.acquisition.config import CoinbaseWebSocketConfig
 from btc_quarter_hour_engine.acquisition.websocket_transport import WebsocketsTransport
 
 
@@ -23,6 +25,24 @@ def loopback_server():
     host, port = server.socket.getsockname()[:2]
     try:
         yield f"ws://{host}:{port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.fixture()
+def large_message_server():
+    payload = "x" * (2 * 1024 * 1024)
+
+    def send_large_message(connection):
+        connection.send(payload)
+
+    server = serve(send_large_message, "127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.socket.getsockname()[:2]
+    try:
+        yield f"ws://{host}:{port}", payload
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -71,3 +91,54 @@ def test_transport_close_before_connect_is_a_noop():
     transport = WebsocketsTransport()
     transport.close()  # must not raise
     assert not transport.connected
+
+
+def test_transport_passes_open_timeout_and_configured_max_size(monkeypatch):
+    captured = {}
+
+    def fake_connect(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(websocket_transport, "_sync_connect", fake_connect)
+    transport = WebsocketsTransport(max_message_size_bytes=12345)
+
+    transport.connect(url="ws://example.test", connect_timeout=7.5)
+
+    assert captured == {
+        "url": "ws://example.test",
+        "open_timeout": 7.5,
+        "max_size": 12345,
+    }
+
+
+def test_transport_receives_message_larger_than_one_mibibyte(large_message_server):
+    url, payload = large_message_server
+    transport = WebsocketsTransport(max_message_size_bytes=16 * 1024 * 1024)
+    transport.connect(url=url, connect_timeout=5.0)
+    try:
+        assert transport.recv(timeout=5.0) == payload
+    finally:
+        transport.close()
+
+
+def test_transport_rejects_message_exceeding_configured_bound(large_message_server):
+    url, _ = large_message_server
+    transport = WebsocketsTransport(max_message_size_bytes=1024)
+    transport.connect(url=url, connect_timeout=5.0)
+    try:
+        with pytest.raises(ConnectionError):
+            transport.recv(timeout=5.0)
+    finally:
+        transport.close()
+
+
+def test_coinbase_websocket_config_defaults_to_sixteen_mibibytes():
+    assert CoinbaseWebSocketConfig().max_message_size_bytes == 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize("size", [0, -1, 1.5, True])
+def test_coinbase_websocket_config_rejects_non_positive_integer_message_size(size):
+    with pytest.raises(ValueError, match="positive integer"):
+        CoinbaseWebSocketConfig(max_message_size_bytes=size)
