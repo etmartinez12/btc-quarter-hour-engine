@@ -91,7 +91,10 @@ def collect_coinbase_bbo_main() -> None:
     args = parser.parse_args()
 
     config = CoinbaseWebSocketConfig(product_id=args.product)
-    client = CoinbaseWebSocketClient(config=config, transport=WebsocketsTransport())
+    client = CoinbaseWebSocketClient(
+        config=config,
+        transport=WebsocketsTransport(max_message_size_bytes=config.max_message_size_bytes),
+    )
     service = CoinbaseWebSocketService(config=config, client=client)
     raw_segment_writer = RawSegmentWriter(
         args.output_root, product_id=args.product, session_id=service.session_id,

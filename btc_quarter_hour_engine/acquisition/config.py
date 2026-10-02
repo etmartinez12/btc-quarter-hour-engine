@@ -19,6 +19,7 @@ class CoinbaseRESTConfig:
 class CoinbaseWebSocketConfig:
     url: str = "wss://advanced-trade-ws.coinbase.com"
     product_id: str = "BTC-USD"
+    max_message_size_bytes: int = 16 * 1024 * 1024
 
     heartbeat_timeout_seconds: float = 5.0
 
@@ -35,3 +36,11 @@ class CoinbaseWebSocketConfig:
     max_reconnect_attempts: int | None = None
 
     raw_segment_max_frames: int = 10000
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_message_size_bytes, bool)
+            or not isinstance(self.max_message_size_bytes, int)
+            or self.max_message_size_bytes <= 0
+        ):
+            raise ValueError("max_message_size_bytes must be a positive integer")

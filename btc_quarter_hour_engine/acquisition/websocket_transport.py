@@ -16,7 +16,12 @@ class WebsocketsTransport:
     translation only, no protocol semantics.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_message_size_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        self.max_message_size_bytes = max_message_size_bytes
         self._connection: ClientConnection | None = None
 
     @property
@@ -24,7 +29,11 @@ class WebsocketsTransport:
         return self._connection is not None
 
     def connect(self, *, url: str, connect_timeout: float) -> None:
-        self._connection = _sync_connect(url, open_timeout=connect_timeout)
+        self._connection = _sync_connect(
+            url,
+            open_timeout=connect_timeout,
+            max_size=self.max_message_size_bytes,
+        )
 
     def send(self, payload: str) -> None:
         if self._connection is None:
