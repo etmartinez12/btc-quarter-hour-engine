@@ -168,6 +168,42 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert [f.decode("utf-8") for f in frames] == messages
 
 
+def test_collector_keeps_transient_cross_multi_update_envelope_synced(tmp_path):
+    update_time = "2024-01-01T00:14:59.900Z"
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _l2_message(
+            "update",
+            3,
+            update_time,
+            [
+                {"side": "bid", "price_level": "102.0", "new_quantity": "1.0", "event_time": update_time},
+                {"side": "offer", "price_level": "101.0", "new_quantity": "0", "event_time": update_time},
+                {"side": "offer", "price_level": "103.0", "new_quantity": "1.0", "event_time": update_time},
+            ],
+        ),
+        _heartbeat(4, "2024-01-01T00:15:01Z"),
+    ]
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+    result = collector.run(max_messages=len(messages))
+
+    assert result.connection_count == 1
+    assert result.reconnect_count == 0
+    assert result.manifest["integrity"]["sequence_gap_count"] == 0
+    assert service.connection.crossed_book_count == 0
+    assert service.connection.malformed_level2_count == 0
+    assert service.order_book.is_synced()
+    assert (service.order_book.best_bid, service.order_book.best_ask) == (102.0, 103.0)
+    assert result.level2_update_row_count == 5
+    assert result.bbo_state_row_count == 2
+
+    state_frame = pd.read_parquet(result.bbo_state_artifacts[0]["path"])
+    assert len(state_frame) == 2
+    assert state_frame.iloc[-1]["best_bid"] == 102.0
+    assert state_frame.iloc[-1]["best_ask"] == 103.0
+
+
 def test_collector_with_no_eligible_observations_reports_ineligibility_reason(tmp_path):
     messages = [_heartbeat(1, "2024-01-01T00:00:00Z")]
     collector, *_ = _build_collector(tmp_path, messages)

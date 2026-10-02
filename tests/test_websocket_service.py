@@ -311,6 +311,37 @@ def test_level2_update_rows_and_bbo_state_rows_accumulate_and_drain():
     assert service.level2_update_rows == []
     assert service.bbo_state_rows == []
 
+def test_multi_update_l2_envelope_is_applied_atomically_and_records_one_bbo():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(0, "2024-01-01T00:00:00Z"))
+    initial_update_count = len(service.level2_update_rows)
+    initial_bbo_count = len(service.bbo_state_rows)
+    message = _l2_message(
+        "update",
+        1,
+        "2024-01-01T00:00:01Z",
+        [
+            {"side": "bid", "price_level": "102.0", "new_quantity": "1.0"},
+            {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+            {"side": "offer", "price_level": "103.0", "new_quantity": "1.0"},
+        ],
+    )
+
+    result = service.handle_message(message)
+
+    assert result["status"] == "l2_update_applied"
+    assert service.order_book.is_synced()
+    assert service.order_book.best_bid == 102.0
+    assert service.order_book.best_ask == 103.0
+    assert service.connection.crossed_book_count == 0
+    assert service.connection.malformed_level2_count == 0
+    assert service.connection.last_sequence_num == 1
+    assert len(service.level2_update_rows) - initial_update_count == 3
+    assert len(service.bbo_state_rows) - initial_bbo_count == 1
+    assert service.bbo_state_rows[-1]["best_bid"] == 102.0
+    assert service.bbo_state_rows[-1]["best_ask"] == 103.0
+
 
 def test_level2_update_rows_and_bbo_state_rows_not_recorded_for_stale_or_gap():
     service, _ = _service([])
