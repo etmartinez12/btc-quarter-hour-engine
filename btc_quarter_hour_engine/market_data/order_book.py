@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from enum import Enum
 from typing import Any
 
@@ -78,7 +78,7 @@ class Level2OrderBook:
     def _require_valid_price(self, price: Any, *, field_name: str = "price") -> float:
         try:
             numeric = float(price)
-        except (TypeError, ValueError) as exc:
+        except (OverflowError, TypeError, ValueError) as exc:
             raise ValueError(f"Malformed {field_name}: {price!r}") from exc
         if not math.isfinite(numeric) or numeric <= 0:
             raise ValueError(f"Invalid {field_name}: {price!r}")
@@ -87,7 +87,7 @@ class Level2OrderBook:
     def _require_valid_quantity(self, quantity: Any, *, field_name: str = "quantity") -> float:
         try:
             numeric = float(quantity)
-        except (TypeError, ValueError) as exc:
+        except (OverflowError, TypeError, ValueError) as exc:
             raise ValueError(f"Malformed {field_name}: {quantity!r}") from exc
         if not math.isfinite(numeric) or numeric < 0:
             raise ValueError(f"Invalid {field_name}: {quantity!r}")
@@ -99,13 +99,13 @@ class Level2OrderBook:
             raise ValueError(f"Unsupported side: {side!r}")
         return normalized
 
-    def _validate_book_integrity(self) -> None:
-        if not self.bids or not self.asks:
+    def _validate_candidate_book(self, bids: Mapping[float, float], asks: Mapping[float, float]) -> None:
+        if not bids or not asks:
             raise ValueError("Order book requires both bid and ask sides")
-        best_bid = self.best_bid
-        best_ask = self.best_ask
-        bid_size = self.best_bid_size
-        ask_size = self.best_ask_size
+        best_bid = max(bids)
+        best_ask = min(asks)
+        bid_size = bids[best_bid]
+        ask_size = asks[best_ask]
         values = [best_bid, best_ask, bid_size, ask_size]
         if any(value is None for value in values):
             raise ValueError("Best bid/ask values are incomplete")
@@ -118,6 +118,9 @@ class Level2OrderBook:
         if bid_size < 0 or ask_size < 0:
             raise ValueError("Best bid/ask sizes cannot be negative")
 
+    def _validate_book_integrity(self) -> None:
+        self._validate_candidate_book(self.bids, self.asks)
+
     def _apply_level(self, *, side: str, price: float, quantity: float) -> None:
         if quantity == 0:
             self.bids.pop(price, None) if side == "bid" else self.asks.pop(price, None)
@@ -126,6 +129,21 @@ class Level2OrderBook:
             self.bids[price] = quantity
         else:
             self.asks[price] = quantity
+
+    @staticmethod
+    def _apply_level_to(
+        bids: dict[float, float],
+        asks: dict[float, float],
+        *,
+        side: str,
+        price: float,
+        quantity: float,
+    ) -> None:
+        levels = bids if side == "bid" else asks
+        if quantity == 0:
+            levels.pop(price, None)
+        else:
+            levels[price] = quantity
 
     def apply_snapshot(self, *, product_id: str | None, levels: Mapping[str, list[Mapping[str, Any]]]) -> None:
         if product_id is not None:
@@ -158,6 +176,38 @@ class Level2OrderBook:
         except ValueError as exc:
             self.invalidate(str(exc))
             raise
+
+    def apply_updates(self, updates: Iterable[Mapping[str, Any]]) -> None:
+        if self.state != OrderBookState.SYNCED:
+            raise ValueError("Order book is not synchronized")
+
+        normalized_updates: list[tuple[str, float, float]] = []
+        try:
+            for update in updates:
+                if not isinstance(update, Mapping):
+                    raise ValueError("Malformed order book update")
+                side = self._normalize_side(update.get("side"))
+                price = self._require_valid_price(update.get("price"), field_name=f"{side} price")
+                quantity = self._require_valid_quantity(update.get("quantity"), field_name=f"{side} quantity")
+                normalized_updates.append((side, price, quantity))
+        except (TypeError, ValueError) as exc:
+            self.invalidate(str(exc))
+            raise ValueError(str(exc)) from exc
+
+        staged_bids = dict(self.bids)
+        staged_asks = dict(self.asks)
+        for side, price, quantity in normalized_updates:
+            self._apply_level_to(staged_bids, staged_asks, side=side, price=price, quantity=quantity)
+        try:
+            self._validate_candidate_book(staged_bids, staged_asks)
+        except ValueError as exc:
+            self.invalidate(str(exc))
+            raise
+
+        self.bids = staged_bids
+        self.asks = staged_asks
+        self.state = OrderBookState.SYNCED
+        self.last_error = None
 
     def snapshot(self) -> dict[str, Any]:
         return {

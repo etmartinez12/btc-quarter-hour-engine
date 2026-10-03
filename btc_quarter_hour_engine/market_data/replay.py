@@ -107,8 +107,7 @@ def process_parsed_event(
                 },
             )
         else:
-            for change in event.get("updates", []):
-                book.apply_update(side=change["side"], price=change["price"], quantity=change["quantity"])
+            book.apply_updates(event.get("updates", []))
     except ValueError:
         processor.note_gap()
         return observations
@@ -231,9 +230,14 @@ def replay_recorded_frames(
             if kind == "snapshot":
                 actions.append((event_time, arrival, 0, "snapshot", event["updates"], current))
             else:
+                update_batches: dict[datetime, tuple[int, list[Mapping[str, Any]]]] = {}
                 for offset, update in enumerate(event["updates"]):
                     when = require_utc(update.get("event_time_utc") or envelope_time)
-                    actions.append((when, arrival, offset, "update", update, current))
+                    if when not in update_batches:
+                        update_batches[when] = (offset, [])
+                    update_batches[when][1].append(update)
+                for when, (first_offset, batch) in update_batches.items():
+                    actions.append((when, arrival, first_offset, "update_batch", batch, current))
         meta = metadata.get(connection_id)
         # Connection diagnostics are wall-clock ingest times, not Coinbase
         # source times. Comparing them to event-time boundaries mixes clocks.
@@ -318,8 +322,8 @@ def replay_recorded_frames(
                                     "ask": [u for u in payload if u["side"] == "ask"]},
                         )
                         reasons[active] = None
-                    elif book.is_synced():
-                        book.apply_update(side=payload["side"], price=payload["price"], quantity=payload["quantity"])
+                    elif kind == "update_batch" and book.is_synced():
+                        book.apply_updates(payload)
                 except (ValueError, KeyError, TypeError) as exc:
                     book.invalidate(str(exc))
                     if "crossed" in str(exc).lower():

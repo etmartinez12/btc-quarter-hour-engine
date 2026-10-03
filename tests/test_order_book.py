@@ -70,6 +70,91 @@ def test_apply_update_rejects_unsupported_side():
     with pytest.raises(ValueError, match="Unsupported side"):
         book.apply_update(side="middle", price=100.0, quantity=1.0)
 
+def test_apply_updates_allows_transient_crossed_gce_shaped_batch():
+    book = Level2OrderBook(product_id="BTC-USD")
+    book.apply_snapshot(
+        product_id="BTC-USD",
+        levels={
+            "bid": [{"price": 83984.02, "quantity": 1.0}],
+            "ask": [{"price": 83984.76, "quantity": 1.0}],
+        },
+    )
+
+    book.apply_updates([
+        {"side": "bid", "price": 83992.99, "quantity": 0.04710111},
+        {"side": "ask", "price": 83984.76, "quantity": 0},
+        {"side": "ask", "price": 83993.50, "quantity": 1.0},
+    ])
+
+    assert book.state == OrderBookState.SYNCED
+    assert book.best_bid == 83992.99
+    assert book.best_ask == 83993.50
+    assert book.last_error is None
+
+
+def test_apply_updates_allows_temporarily_one_sided_book():
+    book = _synced_book()
+    book.apply_updates([
+        {"side": "ask", "price": 101.0, "quantity": 0},
+        {"side": "ask", "price": 102.0, "quantity": 1.0},
+    ])
+    assert book.is_synced()
+    assert book.best_ask == 102.0
+
+
+def test_apply_updates_rejects_final_cross_without_committing_any_levels():
+    book = _synced_book()
+    before_bids = dict(book.bids)
+    before_asks = dict(book.asks)
+
+    with pytest.raises(ValueError, match="Crossed book"):
+        book.apply_updates([{"side": "bid", "price": 102.0, "quantity": 1.0}])
+
+    assert book.state == OrderBookState.INVALID
+    assert book.bids == before_bids
+    assert book.asks == before_asks
+    assert book.last_error is not None and "Crossed book" in book.last_error
+
+
+@pytest.mark.parametrize(
+    "bad_update",
+    [
+        {"side": "bid", "price": 0, "quantity": 1.0},
+        {"side": "bid", "price": float("inf"), "quantity": 1.0},
+        {"side": "bid", "price": float("nan"), "quantity": 1.0},
+        {"side": "bid", "price": 99.0, "quantity": -1.0},
+        {"side": "bid", "price": 99.0, "quantity": float("inf")},
+        {"side": "middle", "price": 99.0, "quantity": 1.0},
+    ],
+)
+def test_apply_updates_malformed_batch_is_atomic(bad_update):
+    book = _synced_book()
+    before_bids = dict(book.bids)
+    before_asks = dict(book.asks)
+
+    with pytest.raises(ValueError):
+        book.apply_updates([
+            {"side": "bid", "price": 99.0, "quantity": 1.0},
+            bad_update,
+            {"side": "ask", "price": 102.0, "quantity": 1.0},
+        ])
+
+    assert book.state == OrderBookState.INVALID
+    assert book.bids == before_bids
+    assert book.asks == before_asks
+    assert book.last_error
+
+
+def test_apply_updates_preserves_wire_order_for_repeated_price_levels():
+    book = _synced_book()
+    book.apply_updates([
+        {"side": "bid", "price": 99.0, "quantity": 2.0},
+        {"side": "bid", "price": 99.0, "quantity": 3.0},
+        {"side": "bid", "price": 99.0, "quantity": 0},
+    ])
+    assert 99.0 not in book.bids
+    assert book.best_bid == 100.0
+
 
 def test_snapshot_requires_two_sided_book():
     book = Level2OrderBook(product_id="BTC-USD")

@@ -113,6 +113,24 @@ def test_l2_mutation_path_does_not_infer_gaps_from_l2_only_sequences():
     assert book.last_sequence_num == 5
     assert processor.gap_since_sync is False
 
+def test_failed_l2_batch_does_not_advance_book_sequence_provenance():
+    book = Level2OrderBook(product_id="BTC-USD")
+    processor = BoundaryEventProcessor(product_id="BTC-USD", heartbeat_timeout_seconds=30)
+    process_parsed_event(
+        event=_snapshot_event(1, datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)),
+        book=book,
+        processor=processor,
+    )
+
+    process_parsed_event(
+        event=_update_event(2, datetime(2024, 1, 1, 0, 0, 1, tzinfo=timezone.utc), "bid", 102.0, 1.0),
+        book=book,
+        processor=processor,
+    )
+
+    assert book.state.value == "INVALID"
+    assert book.last_sequence_num == 1
+
 
 def test_replay_events_is_deterministic_regardless_of_input_order():
     events = [
@@ -284,6 +302,33 @@ def test_one_envelope_replays_individual_update_times():
             ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
     ])
     assert (ledger[0].best_bid, ledger[0].best_ask) == (100.5, 101)
+
+def test_same_timestamp_envelope_mutations_replay_as_one_atomic_batch():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("bid", "2024-01-01T13:14:59.900Z", 102, 1),
+            ("offer", "2024-01-01T13:14:59.900Z", 101, 0),
+            ("offer", "2024-01-01T13:14:59.900Z", 103, 1)),
+    ], session_completed_at_utc=_at("15:00"))
+    row = ledger[0]
+    assert row.eligible
+    assert (row.best_bid, row.best_ask, row.midpoint) == (102.0, 103.0, 102.5)
+    assert row.eligibility_reason == "eligible"
+
+
+def test_future_mutation_in_envelope_cannot_rescue_invalid_pre_boundary_state():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("bid", "2024-01-01T13:14:59.900Z", 102, 1),
+            ("offer", "2024-01-01T13:15:00.100Z", 103, 1)),
+    ])
+    row = ledger[0]
+    assert not row.eligible
+    assert row.eligibility_reason == "crossed_book"
+    assert row.best_bid is None
+    assert row.best_ask is None
 
 
 def test_exact_boundary_mutation_inclusive_and_one_microsecond_future_exclusive():
