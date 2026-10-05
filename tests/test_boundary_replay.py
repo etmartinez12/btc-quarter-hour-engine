@@ -340,6 +340,90 @@ def test_exact_boundary_mutation_inclusive_and_one_microsecond_future_exclusive(
     assert (ledger[0].best_bid, ledger[0].best_ask) == (100.5, 101)
 
 
+def test_valid_envelope_transient_cross_resolves_before_boundary_with_provenance():
+    ledger = _replay([
+        _frame("l2_data", "2024-01-01T13:14:50Z", 1, event_type="snapshot", updates=[
+            ("bid", "1970-01-01T00:00:00Z", 85241.36, 1),
+            ("offer", "1970-01-01T00:00:00Z", 85241.78, 1),
+        ]),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _update(3,
+            ("bid", "2024-01-01T13:14:58.900Z", 85242.00, 1),
+            ("offer", "2024-01-01T13:14:59.100Z", 85241.78, 0),
+            ("bid", "2024-01-01T13:14:59.200Z", 85242.00, 0),
+            ("offer", "2024-01-01T13:14:59.300Z", 85241.78, 1)),
+    ], session_completed_at_utc=_at("15:00"))
+    row = ledger[0]
+    assert row.eligible and row.book_synced
+    assert row.eligibility_reason == "eligible"
+    assert (row.best_bid, row.best_ask, row.midpoint) == (85241.36, 85241.78, 85241.57)
+    assert row.source_state_time_utc == _at("14:59.300000")
+    assert row.source_sequence_num == 3
+
+
+def test_later_boundary_recovers_after_transient_cross_at_prior_boundary():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("bid", "2024-01-01T13:14:59.900Z", 102, 1),
+            ("offer", "2024-01-01T13:15:00.100Z", 101, 0),
+            ("offer", "2024-01-01T13:15:00.100Z", 103, 1)),
+        _heartbeat("2024-01-01T13:29:59Z", sequence=4),
+    ], session_completed_at_utc=_at("30:00"))
+    assert len(ledger) == 2
+    crossed, recovered = ledger
+    assert not crossed.eligible
+    assert crossed.eligibility_reason == "crossed_book"
+    assert crossed.best_bid is None and crossed.best_ask is None
+    assert recovered.eligible and recovered.book_synced
+    assert (recovered.best_bid, recovered.best_ask, recovered.midpoint) == (102, 103, 102.5)
+    assert recovered.source_state_time_utc == _at("15:00.100000")
+    assert recovered.source_sequence_num == 3
+
+
+def test_recovered_book_still_requires_fresh_heartbeat():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("bid", "2024-01-01T13:14:59.900Z", 102, 1),
+            ("offer", "2024-01-01T13:15:00.100Z", 101, 0),
+            ("offer", "2024-01-01T13:15:00.100Z", 103, 1)),
+    ], session_completed_at_utc=_at("30:00"))
+    assert len(ledger) == 2
+    assert ledger[0].eligibility_reason == "crossed_book"
+    assert ledger[1].book_synced
+    assert (ledger[1].best_bid, ledger[1].best_ask) == (102, 103)
+    assert not ledger[1].eligible
+    assert ledger[1].eligibility_reason == "heartbeat_stale"
+
+
+def test_truly_crossed_complete_source_envelope_permanently_invalidates_epoch():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3, ("bid", "2024-01-01T13:14:59Z", 102, 1)),
+        _update(4, ("offer", "2024-01-01T13:15:01Z", 103, 1)),
+        _heartbeat("2024-01-01T13:29:59Z", sequence=5),
+    ], session_completed_at_utc=_at("30:00"))
+    assert len(ledger) == 2
+    assert ledger[0].eligibility_reason == "crossed_book"
+    assert ledger[1].eligibility_reason == "crossed_book"
+    assert not ledger[1].book_synced and not ledger[1].eligible
+
+
+def test_future_complete_envelope_invalidity_does_not_poison_prior_boundary():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("bid", "2024-01-01T13:14:59.900Z", 100.5, 1),
+            ("bid", "2024-01-01T13:15:00.100Z", 102, 1)),
+    ], session_completed_at_utc=_at("15:00"))
+    row = ledger[0]
+    assert row.eligible and row.book_synced
+    assert (row.best_bid, row.best_ask) == (100.5, 101)
+    assert row.source_state_time_utc == _at("14:59.900000")
+    assert row.source_sequence_num == 3
+
+
 def test_ineligible_ledger_reasons_and_no_price_freshness():
     start, end = _at("15:00"), _at("30:00")
     assert [r.eligibility_reason for r in _replay([], session_started_at_utc=start, session_completed_at_utc=end)] == [

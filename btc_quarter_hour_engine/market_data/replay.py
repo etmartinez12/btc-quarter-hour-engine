@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .boundary_observations import QuarterHourObservation, derive_quarter_hour_observation, require_utc
-from .order_book import Level2OrderBook
+from .order_book import Level2OrderBook, OrderBookState
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -121,6 +121,56 @@ def _connection_field(connection: Any, name: str) -> Any:
     return connection.get(name) if isinstance(connection, Mapping) else getattr(connection, name, None)
 
 
+def _apply_replay_updates_without_integrity_commit(
+    bids: dict[float, float],
+    asks: dict[float, float],
+    updates: Iterable[Mapping[str, Any]],
+) -> None:
+    """Apply parsed mutations without validating an event-time subgroup."""
+    for update in updates:
+        side = update.get("side")
+        if side == "bid":
+            levels = bids
+        elif side == "ask":
+            levels = asks
+        else:
+            raise ValueError(f"Unsupported replay side: {side!r}")
+        price = update["price"]
+        quantity = update["quantity"]
+        if quantity == 0:
+            levels.pop(price, None)
+        else:
+            levels[price] = quantity
+
+
+def _set_boundary_book_integrity(book: Level2OrderBook, *, has_snapshot: bool) -> None:
+    """Commit only the candidate's integrity at the boundary, not mid-envelope."""
+    if not has_snapshot:
+        return
+    if not book.bids or not book.asks:
+        book.invalidate("Order book requires both bid and ask sides")
+        return
+    if max(book.bids) > min(book.asks):
+        book.invalidate("Crossed book: best_bid exceeds best_ask")
+        return
+    book.state = OrderBookState.SYNCED
+    book.last_error = None
+
+
+def _envelope_integrity_reason(
+    bids: Mapping[float, float],
+    asks: Mapping[float, float],
+    error: Exception,
+) -> str:
+    if "crossed" in str(error).lower():
+        return "crossed_book"
+    if not bids:
+        return "missing_bid"
+    if not asks:
+        return "missing_ask"
+    return "malformed_source_state"
+
+
 def replay_recorded_frames(
     frames: Iterable[tuple[bytes, str, int]],
     *,
@@ -165,6 +215,7 @@ def replay_recorded_frames(
     for connection_id in ids:
         sequence: int | None = None
         invalid = False
+        wire_book = Level2OrderBook(product_id=product_id)
         actions: list[tuple[datetime, int, int, str, Any, int | None]] = []
         first_time: datetime | None = None
         last_time: datetime | None = None
@@ -228,7 +279,20 @@ def replay_recorded_frames(
             if invalid:
                 continue
             if kind == "snapshot":
-                actions.append((event_time, arrival, 0, "snapshot", event["updates"], current))
+                try:
+                    wire_book.apply_snapshot(
+                        product_id=product_id,
+                        levels={
+                            "bid": [u for u in event["updates"] if u["side"] == "bid"],
+                            "ask": [u for u in event["updates"] if u["side"] == "ask"],
+                        },
+                    )
+                except (ValueError, KeyError, TypeError) as exc:
+                    invalid = True
+                    failure_reason = _envelope_integrity_reason(wire_book.bids, wire_book.asks, exc)
+                    actions.append((event_time, arrival, 0, "envelope_invalid", (failure_reason, str(exc)), current))
+                else:
+                    actions.append((event_time, arrival, 0, "snapshot", event["updates"], current))
             else:
                 update_batches: dict[datetime, tuple[int, list[Mapping[str, Any]]]] = {}
                 for offset, update in enumerate(event["updates"]):
@@ -236,8 +300,35 @@ def replay_recorded_frames(
                     if when not in update_batches:
                         update_batches[when] = (offset, [])
                     update_batches[when][1].append(update)
-                for when, (first_offset, batch) in update_batches.items():
-                    actions.append((when, arrival, first_offset, "update_batch", batch, current))
+                batch_actions = [
+                    (when, arrival, first_offset, "update_batch", batch, current)
+                    for when, (first_offset, batch) in update_batches.items()
+                ]
+                if wire_book.is_synced():
+                    try:
+                        wire_book.apply_updates(event["updates"])
+                    except (ValueError, KeyError, TypeError) as exc:
+                        # The complete envelope only becomes known invalid at its
+                        # latest source time; never move that knowledge backward.
+                        actions.extend(batch_actions)
+                        invalid = True
+                        latest_time = max(update_batches, default=event_time)
+                        candidate_bids, candidate_asks = dict(wire_book.bids), dict(wire_book.asks)
+                        try:
+                            _apply_replay_updates_without_integrity_commit(
+                                candidate_bids, candidate_asks, event["updates"],
+                            )
+                        except (ValueError, KeyError, TypeError):
+                            pass
+                        failure_reason = _envelope_integrity_reason(candidate_bids, candidate_asks, exc)
+                        actions.append((
+                            latest_time, arrival, len(event["updates"]), "envelope_invalid",
+                            (failure_reason, str(exc)), current,
+                        ))
+                    else:
+                        actions.extend(batch_actions)
+                else:
+                    actions.extend(batch_actions)
         meta = metadata.get(connection_id)
         # Connection diagnostics are wall-clock ingest times, not Coinbase
         # source times. Comparing them to event-time boundaries mixes clocks.
@@ -273,6 +364,7 @@ def replay_recorded_frames(
     state_times: dict[str, datetime | None] = {cid: None for cid in ids}
     state_sequences: dict[str, int | None] = {cid: None for cid in ids}
     reasons: dict[str, str | None] = {cid: None for cid in ids}
+    has_snapshot: dict[str, bool] = {cid: False for cid in ids}
     result: list[QuarterHourObservation] = []
     while boundary <= end:
         active: str | None = None
@@ -312,7 +404,12 @@ def replay_recorded_frames(
                     reasons[active] = "malformed_source_state"
                     state_times[active], state_sequences[active] = when, sequence
                     continue
-                if reasons[active] == "sequence_gap":
+                if kind == "envelope_invalid":
+                    reasons[active], message = payload
+                    book.invalidate(message)
+                    state_times[active], state_sequences[active] = when, sequence
+                    continue
+                if reasons[active] is not None:
                     continue
                 try:
                     if kind == "snapshot":
@@ -321,20 +418,17 @@ def replay_recorded_frames(
                             levels={"bid": [u for u in payload if u["side"] == "bid"],
                                     "ask": [u for u in payload if u["side"] == "ask"]},
                         )
-                        reasons[active] = None
-                    elif kind == "update_batch" and book.is_synced():
-                        book.apply_updates(payload)
+                        has_snapshot[active] = True
+                        state_times[active], state_sequences[active] = when, sequence
+                    elif kind == "update_batch" and has_snapshot[active]:
+                        _apply_replay_updates_without_integrity_commit(book.bids, book.asks, payload)
+                        state_times[active], state_sequences[active] = when, sequence
                 except (ValueError, KeyError, TypeError) as exc:
                     book.invalidate(str(exc))
-                    if "crossed" in str(exc).lower():
-                        reasons[active] = "crossed_book"
-                    elif not book.bids and book.asks:
-                        reasons[active] = "missing_bid"
-                    elif book.bids and not book.asks:
-                        reasons[active] = "missing_ask"
-                    else:
-                        reasons[active] = "malformed_source_state"
-                state_times[active], state_sequences[active] = when, sequence
+                    reasons[active] = "malformed_source_state"
+                    state_times[active], state_sequences[active] = when, sequence
+            if reasons[active] is None:
+                _set_boundary_book_integrity(book, has_snapshot=has_snapshot[active])
             result.append(
                 derive_quarter_hour_observation(
                     book=book, timestamp_utc=boundary, product_id=product_id,
