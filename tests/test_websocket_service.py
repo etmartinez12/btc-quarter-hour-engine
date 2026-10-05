@@ -7,8 +7,8 @@ import pytest
 
 from btc_quarter_hour_engine.acquisition.coinbase_websocket import CoinbaseWebSocketClient
 from btc_quarter_hour_engine.acquisition.config import CoinbaseWebSocketConfig
-from btc_quarter_hour_engine.acquisition.websocket_service import CoinbaseWebSocketService
-from btc_quarter_hour_engine.market_data.order_book import OrderBookState
+from btc_quarter_hour_engine.acquisition.websocket_service import CoinbaseWebSocketService, _bbo_state_row
+from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook, OrderBookState
 
 
 class FakeTransport:
@@ -134,10 +134,66 @@ def test_handle_message_snapshot_then_update_produces_synced_book():
     service, _ = _service([])
     result = service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
     assert result["status"] == "snapshot_synced"
+    assert {"bids", "asks"} <= result["book"].keys()
     assert service.order_book.is_synced()
     result = service.handle_message(_update(2, "2024-01-01T00:00:01Z", "bid", 100.5, 2.0))
     assert result["status"] == "l2_update_applied"
+    assert {"bids", "asks"} <= result["book"].keys()
     assert service.order_book.best_bid == 100.5
+
+
+def test_handle_message_fast_mode_skips_snapshots_for_snapshot_update_and_stale(monkeypatch):
+    service, _ = _service([])
+    service.connect_and_subscribe()
+
+    def fail_snapshot():
+        raise AssertionError("full book snapshot must not be materialized")
+
+    monkeypatch.setattr(service.order_book, "snapshot", fail_snapshot)
+    result = service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"), include_book_snapshot=False)
+    assert result == {"status": "snapshot_synced"}
+    result = service.handle_message(
+        _update(2, "2024-01-01T00:00:01Z", "bid", 100.5, 2.0),
+        include_book_snapshot=False,
+    )
+    assert result == {"status": "l2_update_applied"}
+    result = service.handle_message(
+        _update(2, "2024-01-01T00:00:02Z", "bid", 999.0, 2.0),
+        include_book_snapshot=False,
+    )
+    assert result == {"status": "stale_sequence_ignored"}
+
+
+def test_bbo_state_row_uses_equivalent_top_of_book_values():
+    book = Level2OrderBook(product_id="BTC-USD")
+    book.apply_snapshot(
+        product_id="BTC-USD",
+        levels={
+            "bid": [{"price": 100.0, "quantity": 1.0}, {"price": 102.0, "quantity": 3.0}],
+            "ask": [{"price": 105.0, "quantity": 4.0}, {"price": 103.0, "quantity": 5.0}],
+        },
+    )
+    book.last_sequence_num = 42
+    timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    row = _bbo_state_row(
+        book=book,
+        connection_id="connection-1",
+        source_time_utc=timestamp,
+        session_id="session-1",
+        frame_index=7,
+        ingest_time_utc=timestamp,
+    )
+
+    assert row["best_bid"] == 102.0
+    assert row["best_bid_size"] == 3.0
+    assert row["best_ask"] == 103.0
+    assert row["best_ask_size"] == 5.0
+    assert row["spread"] == 1.0
+    assert row["midpoint"] == 102.5
+    assert row["book_synced"] is True
+    assert row["state"] == "SYNCED"
+    assert row["sequence_num"] == 42
 
 
 def test_handle_message_raises_and_invalidates_on_sequence_gap():
@@ -439,6 +495,25 @@ def test_reconnect_wait_for_snapshot_drains_non_snapshot_messages_first():
     assert service.order_book.is_synced()
     # Every buffered message must have been drained (2 heartbeats + the resync snapshot).
     assert transport.messages == []
+
+
+def test_reconnect_snapshot_wait_does_not_materialize_full_book(monkeypatch):
+    resync_snapshot = _snapshot(3, "2024-01-01T00:00:05Z")
+    service, _ = _service(
+        [resync_snapshot], max_reconnect_attempts=2, initial_reconnect_backoff_seconds=0,
+        snapshot_wait_timeout_seconds=1000.0,
+    )
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+
+    def fail_snapshot():
+        raise AssertionError("reconnect snapshot wait must not materialize full book")
+
+    monkeypatch.setattr(service.order_book, "snapshot", fail_snapshot)
+    connection = service.reconnect()
+
+    assert connection is not None
+    assert service.order_book.is_synced()
 
 
 def test_reconnect_raises_after_exhausting_attempts():

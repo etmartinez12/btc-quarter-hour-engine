@@ -223,8 +223,27 @@ class Level2OrderBook:
             "asks": dict(sorted(self.asks.items())),
         }
 
+    def top_of_book(self) -> dict[str, Any]:
+        best_bid = max(self.bids) if self.bids else None
+        best_bid_size = self.bids[best_bid] if best_bid is not None else None
+        best_ask = min(self.asks) if self.asks else None
+        best_ask_size = self.asks[best_ask] if best_ask is not None else None
+        spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
+        midpoint = (best_bid + best_ask) / 2.0 if best_bid is not None and best_ask is not None else None
+        return {
+            "product_id": self.product_id,
+            "state": self.state.value,
+            "best_bid": best_bid,
+            "best_bid_size": best_bid_size,
+            "best_ask": best_ask,
+            "best_ask_size": best_ask_size,
+            "spread": spread,
+            "midpoint": midpoint,
+            "book_synced": self.is_synced(),
+        }
+
     def is_synced(self) -> bool:
-        return self.state == OrderBookState.SYNCED and self.best_bid is not None and self.best_ask is not None
+        return self.state == OrderBookState.SYNCED and bool(self.bids) and bool(self.asks)
 
 
 __all__ = ["Level2OrderBook", "OrderBookState"]

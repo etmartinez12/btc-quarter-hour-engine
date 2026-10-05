@@ -32,6 +32,92 @@ def test_snapshot_sync_and_bbo_derivation():
     assert book.is_synced()
 
 
+def test_top_of_book_matches_properties_for_multiple_levels():
+    book = Level2OrderBook(product_id="BTC-USD")
+    book.apply_snapshot(
+        product_id="BTC-USD",
+        levels={
+            "bid": [
+                {"price": 100.0, "quantity": 1.0},
+                {"price": 102.0, "quantity": 3.0},
+                {"price": 101.0, "quantity": 2.0},
+            ],
+            "ask": [
+                {"price": 105.0, "quantity": 4.0},
+                {"price": 103.0, "quantity": 5.0},
+                {"price": 104.0, "quantity": 6.0},
+            ],
+        },
+    )
+
+    top = book.top_of_book()
+
+    assert top["product_id"] == book.product_id
+    assert top["state"] == book.state.value
+    assert top["best_bid"] == book.best_bid
+    assert top["best_bid_size"] == book.best_bid_size
+    assert top["best_ask"] == book.best_ask
+    assert top["best_ask_size"] == book.best_ask_size
+    assert top["spread"] == book.spread
+    assert top["midpoint"] == book.midpoint
+    assert top["book_synced"] == book.is_synced()
+
+
+def test_top_of_book_handles_empty_and_invalid_books():
+    book = Level2OrderBook(product_id="BTC-USD")
+    top = book.top_of_book()
+    assert top["state"] == OrderBookState.UNINITIALIZED.value
+    assert top["best_bid"] is None
+    assert top["best_bid_size"] is None
+    assert top["best_ask"] is None
+    assert top["best_ask_size"] is None
+    assert top["spread"] is None
+    assert top["midpoint"] is None
+    assert top["book_synced"] is False
+
+    book.invalidate("test")
+    top = book.top_of_book()
+    assert top["state"] == OrderBookState.INVALID.value
+    assert top["best_bid"] is None
+    assert top["best_bid_size"] is None
+    assert top["best_ask"] is None
+    assert top["best_ask_size"] is None
+    assert top["spread"] is None
+    assert top["midpoint"] is None
+    assert top["book_synced"] is False
+
+
+def test_is_synced_tracks_validated_state_and_reset():
+    book = Level2OrderBook(product_id="BTC-USD")
+    assert not book.is_synced()
+    book.apply_snapshot(
+        product_id="BTC-USD",
+        levels={"bid": [{"price": 100.0, "quantity": 1.0}], "ask": [{"price": 101.0, "quantity": 1.0}]},
+    )
+    assert book.is_synced()
+    book.invalidate("test")
+    assert not book.is_synced()
+    book.reset()
+    assert not book.is_synced()
+
+
+def test_top_of_book_stays_small_for_large_depth_while_snapshot_keeps_depth():
+    book = Level2OrderBook(product_id="BTC-USD")
+    book.bids = {float(price): 1.0 for price in range(1, 5001)}
+    book.asks = {float(price): 1.0 for price in range(5001, 10001)}
+    book.state = OrderBookState.SYNCED
+
+    top = book.top_of_book()
+    full = book.snapshot()
+
+    assert set(top) == {
+        "product_id", "state", "best_bid", "best_bid_size", "best_ask", "best_ask_size",
+        "spread", "midpoint", "book_synced",
+    }
+    assert len(full["bids"]) == 5000
+    assert len(full["asks"]) == 5000
+
+
 def test_apply_update_requires_prior_sync():
     book = Level2OrderBook(product_id="BTC-USD")
     with pytest.raises(ValueError, match="not synchronized"):
