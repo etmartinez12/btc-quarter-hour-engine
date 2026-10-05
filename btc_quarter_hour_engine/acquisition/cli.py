@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import math
+import signal
+import threading
 from datetime import datetime
 
 from btc_quarter_hour_engine.storage.parquet import NormalizedParquetStore
@@ -22,6 +25,27 @@ def _parse_utc(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("Timezone-aware timestamp required")
     return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be >= 1")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def _sigterm_stop_handler(stop_event: threading.Event):
+    def request_stop(_signum: int, _frame: Any) -> None:
+        stop_event.set()
+
+    return request_stop
 
 
 def fetch_candles_main() -> None:
@@ -88,6 +112,18 @@ def collect_coinbase_bbo_main() -> None:
     parser.add_argument("--output-root", default="data_lake")
     parser.add_argument("--max-messages", type=int, default=None, help="Stop after this many websocket messages (omit to run indefinitely).")
     parser.add_argument("--max-duration-seconds", type=float, default=None, help="Stop after this many wall-clock seconds (omit to run indefinitely).")
+    parser.add_argument(
+        "--flush-row-threshold",
+        type=_positive_int,
+        default=100_000,
+        help="Checkpoint normalized rows after this many buffered L2 and BBO rows (default: 100000).",
+    )
+    parser.add_argument(
+        "--flush-interval-seconds",
+        type=_positive_float,
+        default=300.0,
+        help="Checkpoint normalized rows after this many seconds, even below the row threshold (default: 300).",
+    )
     args = parser.parse_args()
 
     config = CoinbaseWebSocketConfig(product_id=args.product)
@@ -106,8 +142,20 @@ def collect_coinbase_bbo_main() -> None:
         raw_segment_writer=raw_segment_writer,
         forward_store=forward_store,
         output_root=args.output_root,
+        flush_row_threshold=args.flush_row_threshold,
+        flush_interval_seconds=args.flush_interval_seconds,
     )
-    result = collector.run(max_messages=args.max_messages, max_duration_seconds=args.max_duration_seconds)
+    stop_event = threading.Event()
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, _sigterm_stop_handler(stop_event))
+    try:
+        result = collector.run(
+            max_messages=args.max_messages,
+            max_duration_seconds=args.max_duration_seconds,
+            stop_fn=stop_event.is_set,
+        )
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
     print(f"session_id={result.manifest['session_id']}")
     print(f"dataset_id={result.manifest['dataset_id']}")
     print(f"manifest_path={result.manifest_path}")

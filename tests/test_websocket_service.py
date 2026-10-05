@@ -7,22 +7,30 @@ import pytest
 
 from btc_quarter_hour_engine.acquisition.coinbase_websocket import CoinbaseWebSocketClient
 from btc_quarter_hour_engine.acquisition.config import CoinbaseWebSocketConfig
-from btc_quarter_hour_engine.acquisition.websocket_service import CoinbaseWebSocketService, _bbo_state_row
+from btc_quarter_hour_engine.acquisition.websocket_service import (
+    CoinbaseWebSocketService,
+    ReconnectExhaustedError,
+    _bbo_state_row,
+)
 from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook, OrderBookState
 
 
 class FakeTransport:
-    def __init__(self, messages=None, *, fail_connect_times=0):
+    def __init__(self, messages=None, *, fail_connect_times=0, fail_connect_calls=()):
         self.messages = list(messages or [])
         self.sent = []
         self.connected = False
         self.close_count = 0
         self.connect_count = 0
         self._fail_connect_times = fail_connect_times
+        self._fail_connect_calls = set(fail_connect_calls)
 
     def connect(self, *, url, connect_timeout):
         self.connect_count += 1
-        if self.connect_count <= self._fail_connect_times:
+        if (
+            self.connect_count <= self._fail_connect_times
+            or self.connect_count in self._fail_connect_calls
+        ):
             raise ConnectionError("simulated connect failure")
         self.connected = True
 
@@ -111,9 +119,13 @@ def _fake_monotonic(start: float = 0.0, step: float = 1.0):
     return _tick
 
 
-def _service(messages, **config_kwargs):
+def _service(messages, *, fail_connect_times=0, fail_connect_calls=(), **config_kwargs):
     config = CoinbaseWebSocketConfig(receive_timeout_seconds=0.01, **config_kwargs)
-    transport = FakeTransport(messages)
+    transport = FakeTransport(
+        messages,
+        fail_connect_times=fail_connect_times,
+        fail_connect_calls=fail_connect_calls,
+    )
     client = CoinbaseWebSocketClient(config=config, transport=transport)
     service = CoinbaseWebSocketService(
         config=config, client=client, sleep_fn=lambda *_: None, monotonic_fn=_fake_monotonic()
@@ -467,6 +479,62 @@ def test_reconnect_restarts_sequence_epoch_and_resyncs():
     assert transport.connect_count >= 2
 
 
+def test_reconnect_retries_connection_establishment_failures_then_syncs():
+    service, transport = _service(
+        [_snapshot(1, "2024-01-01T00:00:05Z")],
+        fail_connect_times=2,
+        max_reconnect_attempts=3,
+        initial_reconnect_backoff_seconds=0,
+    )
+
+    connection = service.reconnect()
+
+    assert transport.connect_count == 3
+    assert connection is service.connection
+    assert connection.disconnect_reason is None
+    assert service.order_book.is_synced()
+    assert service.order_book.last_sequence_num == 1
+    assert [
+        item.disconnect_reason
+        for item in service.connection_history[-2:]
+    ] == ["connection_establishment_failed", "connection_establishment_failed"]
+
+
+def test_reconnect_exhausts_exactly_after_connection_establishment_attempt_limit():
+    service, transport = _service(
+        [],
+        fail_connect_times=5,
+        max_reconnect_attempts=3,
+        initial_reconnect_backoff_seconds=0,
+    )
+
+    with pytest.raises(ReconnectExhaustedError):
+        service.reconnect()
+    assert transport.connect_count == 3
+    assert service.connection.disconnect_reason == "connection_establishment_failed"
+
+
+def test_reconnect_stop_callback_interrupts_connect_failure_retries():
+    from btc_quarter_hour_engine.acquisition.websocket_service import ReconnectStopRequested
+
+    service, transport = _service(
+        [],
+        fail_connect_times=10,
+        max_reconnect_attempts=None,
+        initial_reconnect_backoff_seconds=0,
+    )
+    checks = {"count": 0}
+
+    def stop_after_repeated_failures():
+        checks["count"] += 1
+        return transport.connect_count >= 3 and checks["count"] >= 5
+
+    with pytest.raises(ReconnectStopRequested):
+        service.reconnect(stop_fn=stop_after_repeated_failures)
+
+    assert transport.connect_count == 3
+
+
 def test_reconnect_wait_for_snapshot_drains_non_snapshot_messages_first():
     """A real reconnect does not necessarily receive a snapshot as its very
     first message: heartbeats or other messages may arrive first. The wait
@@ -537,6 +605,23 @@ def test_reconnect_gives_up_waiting_once_deadline_elapses_without_a_snapshot():
     )
     with pytest.raises(RuntimeError, match="exhausted"):
         service.reconnect()
+
+
+def test_reconnect_stop_callback_interrupts_snapshot_wait():
+    from btc_quarter_hour_engine.acquisition.websocket_service import ReconnectStopRequested
+
+    service, _ = _service(
+        [], max_reconnect_attempts=None, initial_reconnect_backoff_seconds=0,
+        snapshot_wait_timeout_seconds=1000.0,
+    )
+    checks = {"count": 0}
+
+    def stop_after_connect():
+        checks["count"] += 1
+        return checks["count"] >= 3
+
+    with pytest.raises(ReconnectStopRequested):
+        service.reconnect(stop_fn=stop_after_connect)
 
 
 def test_mark_invalid_records_reason_and_invalidates_book():

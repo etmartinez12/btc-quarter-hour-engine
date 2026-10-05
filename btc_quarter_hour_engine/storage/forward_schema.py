@@ -26,7 +26,7 @@ COINBASE_WS_RAW_SEGMENT_SCHEMA_VERSION = "1"
 COINBASE_L2_UPDATE_SCHEMA_VERSION = "1"
 COINBASE_BBO_STATE_SCHEMA_VERSION = "1"
 COINBASE_BOUNDARY_BBO_SCHEMA_VERSION = "1"
-COINBASE_WS_SESSION_MANIFEST_SCHEMA_VERSION = "1"
+COINBASE_WS_SESSION_MANIFEST_SCHEMA_VERSION = "2"
 
 # Independently versioned so each normalized artifact's shape can evolve on
 # its own schedule without forcing a version bump of unrelated artifacts.

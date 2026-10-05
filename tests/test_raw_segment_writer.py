@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -113,7 +114,13 @@ def test_frames_are_durably_appended_and_sealed_with_session_provenance(tmp_path
     assert sealed["session_id"] == "session-1"
     assert sealed["connection_id"] == "connection-1"
     assert sealed["raw_segment_schema_version"] == "1"
-    assert sealed["frames"] == [{
+    assert "frames" not in sealed
+    assert sealed["metadata_path"].endswith(".meta.json")
+    assert sealed["frame_count"] == 1
+    assert writer.read_segment_frames(sealed["path"]) == [frame]
+    metadata = json.loads(Path(sealed["metadata_path"]).read_text())
+    assert metadata["request_metadata"]["session_id"] == "session-1"
+    assert metadata["request_metadata"]["frames"] == [{
         "frame_index": 0,
         "connection_id": "connection-1",
         "ingest_time_utc": "2024-01-01T00:00:00Z",
@@ -121,11 +128,32 @@ def test_frames_are_durably_appended_and_sealed_with_session_provenance(tmp_path
         "raw_frame_sha256": hashlib.sha256(frame).hexdigest(),
         "message_type": "l2_data",
     }]
-    assert writer.read_segment_frames(sealed["path"]) == [frame]
-    metadata_path = tmp_path / "raw" / "coinbase_advanced" / "websocket_segments" / "BTC-USD"
-    metadata = json.loads(next(metadata_path.glob("*.meta.json")).read_text())
-    assert metadata["request_metadata"]["session_id"] == "session-1"
-    assert metadata["request_metadata"]["frames"][0]["raw_frame_sha256"] == hashlib.sha256(frame).hexdigest()
+    assert list(writer.iter_sealed_frames())[0].raw_bytes == frame
+
+
+def test_lazy_sealed_frame_iteration_preserves_global_order_and_provenance(tmp_path):
+    writer = RawSegmentWriter(tmp_path, product_id="BTC-USD", session_id="session-1", max_frames=2)
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    source = [
+        (b"first", "connection-1"),
+        (b"second", "connection-1"),
+        (b"third", "connection-2"),
+    ]
+    for index, (payload, connection_id) in enumerate(source):
+        writer.add_frame(
+            raw=payload,
+            message_type="heartbeat",
+            connection_id=connection_id,
+            ingest_time_utc=base + timedelta(seconds=index),
+        )
+    writer.seal()
+
+    frames = list(writer.iter_sealed_frames())
+    assert [(frame.raw_bytes, frame.connection_id, frame.frame_index) for frame in frames] == [
+        (b"first", "connection-1", 0),
+        (b"second", "connection-1", 1),
+        (b"third", "connection-2", 2),
+    ]
 
 
 def test_unsealed_partial_remains_incomplete_after_writer_restart(tmp_path):

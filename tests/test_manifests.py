@@ -158,7 +158,7 @@ def test_forward_manifest_is_session_shaped_and_content_addressed(tmp_path):
         integrity={"heartbeat_discontinuity_count": 1, "sequence_gap_count": 2},
     )
 
-    assert manifest["forward_manifest_schema_version"] == "1"
+    assert manifest["forward_manifest_schema_version"] == "2"
     assert manifest["session_id"] == "session-1"
     assert manifest["dataset_id"] == build_forward_manifest(
         source="coinbase_advanced",
@@ -175,6 +175,7 @@ def test_forward_manifest_is_session_shaped_and_content_addressed(tmp_path):
     assert manifest["quarter_hour_summary"]["ineligible_boundaries"] == 1
     assert manifest["integrity"]["heartbeat_discontinuity_count"] == 1
     assert manifest["integrity"]["malformed_frame_count"] == 0
+    assert all("frames" not in segment for segment in manifest["raw_segments"])
     assert manifest["canonical_source"] == {
         "price_definition": "best_bid_ask_midpoint",
         "boundary_schedule": ":00/:15/:30/:45 UTC",
