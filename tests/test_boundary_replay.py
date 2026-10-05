@@ -713,11 +713,33 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
         _heartbeat("2024-01-01T13:15:05Z", sequence=2),
         _update(3, ("bid", "2024-01-01T13:15:01Z", 100.5, 1)),
     ]
+    late_heartbeat = [
+        _snapshot(),
+        _update(2, ("bid", "2024-01-01T13:15:01Z", 100.5, 1)),
+        _heartbeat("2024-01-01T13:14:59Z", sequence=3),
+    ]
+    future_heartbeat = [
+        _snapshot(),
+        _update(2, ("bid", "2024-01-01T13:15:01Z", 100.5, 1)),
+        _heartbeat("2024-01-01T13:15:01Z", sequence=3),
+    ]
     integrity_cases = [
         [_snapshot(), _heartbeat(), _update(4, ("bid", "2024-01-01T13:14:59Z", 100.5, 1))],
         [_snapshot(), _heartbeat(), b"malformed source frame"],
-        [_heartbeat("2024-01-01T13:15:01Z", sequence=1), b"malformed source frame"],
+        [b"malformed first source frame", _snapshot(), _heartbeat()],
         [_snapshot(), _heartbeat("2024-01-01T13:14:00Z"), _heartbeat("2024-01-01T13:15:01Z", sequence=3)],
+        [
+            _snapshot(),
+            _heartbeat(),
+            _update(3, ("bid", "2024-01-01T13:14:59.900Z", 102, 1)),
+            _update(4, ("bid", "2024-01-01T13:15:01Z", 100.5, 1)),
+        ],
+    ]
+    all_channel_sequence = [
+        _snapshot(),
+        _subscription(2),
+        _update(3, ("bid", "2024-01-01T13:15:01Z", 100.5, 1)),
+        _heartbeat("2024-01-01T13:14:59Z", sequence=4),
     ]
     reconnect = [
         (_snapshot(), "conn-1"),
@@ -731,6 +753,9 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
         [(raw, "conn-1") for raw in exact_boundary],
         [(raw, "conn-1") for raw in causal_prefix],
         [(raw, "conn-1") for raw in stale_delivery],
+        [(raw, "conn-1") for raw in late_heartbeat],
+        [(raw, "conn-1") for raw in future_heartbeat],
+        [(raw, "conn-1") for raw in all_channel_sequence],
         *[[(raw, "conn-1") for raw in case] for case in integrity_cases],
         reconnect,
     ]
@@ -770,6 +795,61 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
             derived_at_utc=_utc("2024-01-01T14:00:00Z"),
         )
         assert streamed == offline
+        if scenario == [(raw, "conn-1") for raw in late_heartbeat]:
+            assert streamed[0].canonical_target_eligible
+        if scenario == [(raw, "conn-1") for raw in future_heartbeat]:
+            assert not streamed[0].canonical_target_eligible
+        if scenario == [(raw, "conn-1") for raw in all_channel_sequence]:
+            assert streamed[0].canonical_target_eligible
+        if scenario == [(raw, "conn-1") for raw in integrity_cases[-1]]:
+            assert streamed[0].eligibility_reason == "crossed_book"
+
+
+def test_streaming_accumulator_quiet_session_end_matches_offline_replay():
+    recorded = [
+        (_snapshot(), "conn-1", 0, _utc("2024-01-01T13:14:50Z")),
+        (_heartbeat(), "conn-1", 1, _utc("2024-01-01T13:14:55Z")),
+        (
+            _update(3, ("bid", "2024-01-01T13:15:10Z", 100.5, 1)),
+            "conn-1",
+            2,
+            _utc("2024-01-01T13:15:11Z"),
+        ),
+    ]
+    session_start = _utc("2024-01-01T13:14:40Z")
+    session_end = _utc("2024-01-01T13:30:10Z")
+    derived_at = session_end
+    accumulator = CanonicalReplayAccumulator(
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+    )
+    for raw, connection_id, frame_index, ingest_time in recorded:
+        accumulator.consume(raw, connection_id, frame_index, ingest_time)
+
+    streamed = accumulator.finalize(
+        session_started_at_utc=session_start,
+        session_completed_at_utc=session_end,
+        derived_at_utc=derived_at,
+    )
+    offline = replay_recorded_frames(
+        [(raw, connection_id, frame_index) for raw, connection_id, frame_index, _ in recorded],
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+        session_started_at_utc=session_start,
+        session_completed_at_utc=session_end,
+        derived_at_utc=derived_at,
+    )
+
+    assert streamed == offline
+    assert [item.timestamp_utc for item in streamed] == [
+        _utc("2024-01-01T13:15:00Z"),
+        _utc("2024-01-01T13:30:00Z"),
+    ]
+    assert streamed[0].source_sequence_num == 1
+    assert streamed[0].eligibility_reason == "eligible"
+    assert streamed[1].eligibility_reason == "heartbeat_stale"
 
 
 def test_streaming_accumulator_retains_only_compact_state_for_long_streams():
@@ -808,3 +888,45 @@ def test_streaming_accumulator_retains_only_compact_state_for_long_streams():
     assert not hasattr(accumulator, "frames")
     assert not hasattr(accumulator, "frames_factory")
     assert not hasattr(accumulator, "connections_factory")
+
+
+def test_streaming_accumulator_releases_full_books_for_superseded_connections():
+    accumulator = CanonicalReplayAccumulator(
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+    )
+    ingest_time = _utc("2024-01-01T13:14:50Z")
+    for epoch in range(50):
+        connection_id = f"conn-{epoch}"
+        for frame_index, raw in enumerate(
+            [
+                _snapshot(),
+                _heartbeat(),
+                _update(3, ("bid", "2024-01-01T13:15:01Z", 100.5, 1)),
+            ],
+            start=epoch * 3,
+        ):
+            accumulator.consume(
+                raw,
+                connection_id,
+                frame_index,
+                ingest_time + timedelta(seconds=frame_index),
+            )
+
+    books = [
+        state.book
+        for state in accumulator._connections.values()
+        if isinstance(state.book, Level2OrderBook)
+    ]
+    assert len(accumulator._connections) == 50
+    assert len(books) == 1
+    assert accumulator._connections["conn-49"].book is books[0]
+    assert all(not hasattr(state, "wire_book") for state in accumulator._connections.values())
+    for connection_id in (f"conn-{epoch}" for epoch in range(49)):
+        state = accumulator._connections[connection_id]
+        assert state.book is None
+        assert state.terminal_state is not None
+        assert state.terminal_state.book_synced
+        assert state.terminal_state.best_bid == 100.5
+        assert state.terminal_state.best_ask == 101.0

@@ -798,8 +798,8 @@ class _StreamingConnectionState:
     connection_id: str | None
     last_envelope_sequence_num: int | None = None
     source_invalid: bool = False
-    wire_book: Level2OrderBook = field(default_factory=Level2OrderBook)
-    book: Level2OrderBook = field(default_factory=Level2OrderBook)
+    book: Level2OrderBook | None = None
+    terminal_state: _CompactBoundaryState | None = None
     has_snapshot: bool = False
     source_state_time_utc: datetime | None = None
     source_sequence_num: int | None = None
@@ -814,6 +814,19 @@ class _StreamingConnectionState:
     delivery_count: int = 0
 
     def compact_book(self) -> _CompactBoundaryState:
+        if self.book is None:
+            if self.terminal_state is not None:
+                return self.terminal_state
+            return _CompactBoundaryState(
+                connection_id=self.connection_id,
+                source_state_time_utc=None,
+                source_sequence_num=None,
+                best_bid=None,
+                best_bid_size=None,
+                best_ask=None,
+                best_ask_size=None,
+                book_synced=False,
+            )
         top = self.book.top_of_book()
         return _CompactBoundaryState(
             connection_id=self.connection_id,
@@ -886,6 +899,8 @@ class _StreamingConnectionState:
                 best_ask_size=None,
                 book_synced=False,
             )
+        if self.terminal_state is not None:
+            return self.terminal_state
         return self.compact_book()
 
 
@@ -952,6 +967,29 @@ class CanonicalReplayAccumulator:
     observed_max: datetime | None = None
     has_frames: bool = False
     _connections: dict[str | None, _StreamingConnectionState] = field(default_factory=dict, init=False)
+    _active_connection_id: str | None = field(default=None, init=False)
+    _has_active_connection: bool = field(default=False, init=False)
+
+    def _new_connection_state(self, connection_id: str | None) -> _StreamingConnectionState:
+        return _StreamingConnectionState(
+            connection_id=connection_id,
+            book=Level2OrderBook(product_id=self.product_id),
+        )
+
+    def _activate_connection(self, connection_id: str | None) -> _StreamingConnectionState:
+        if self._has_active_connection and connection_id != self._active_connection_id:
+            previous = self._connections[self._active_connection_id]
+            previous.terminal_state = previous.compact_book()
+            previous.book = None
+        state = self._connections.get(connection_id)
+        if state is None:
+            state = self._new_connection_state(connection_id)
+            self._connections[connection_id] = state
+        elif state.book is None:
+            state.book = Level2OrderBook(product_id=self.product_id)
+        self._active_connection_id = connection_id
+        self._has_active_connection = True
+        return state
 
     def consume(
         self,
@@ -967,14 +1005,7 @@ class CanonicalReplayAccumulator:
         ingest = require_utc(ingest_time_utc)
         from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
 
-        state = self._connections.setdefault(
-            connection_id,
-            _StreamingConnectionState(
-                connection_id=connection_id,
-                wire_book=Level2OrderBook(product_id=self.product_id),
-                book=Level2OrderBook(product_id=self.product_id),
-            ),
-        )
+        state = self._activate_connection(connection_id)
         self.frame_count += 1
         self.has_frames = True
         state.delivery_count += 1
@@ -1072,24 +1103,9 @@ class CanonicalReplayAccumulator:
             )
         state.freeze_before(event_time)
 
-        try:
-            if kind == "snapshot":
-                state.wire_book.apply_snapshot(
-                    product_id=self.product_id,
-                    levels={
-                        "bid": [update for update in event["updates"] if update["side"] == "bid"],
-                        "ask": [update for update in event["updates"] if update["side"] == "ask"],
-                    },
-                )
-            elif state.wire_book.is_synced():
-                state.wire_book.apply_updates(event["updates"])
-        except (ValueError, KeyError, TypeError) as exc:
-            reason = _envelope_integrity_reason(state.wire_book.bids, state.wire_book.asks, exc)
-            state.record_control(event_time, reason, str(exc))
-            return
-
         if kind == "snapshot":
             try:
+                assert state.book is not None
                 state.book.apply_snapshot(
                     product_id=self.product_id,
                     levels={
@@ -1106,6 +1122,7 @@ class CanonicalReplayAccumulator:
             state.source_sequence_num = sequence_num
         elif state.has_snapshot:
             try:
+                assert state.book is not None
                 state.book.apply_updates(event["updates"])
             except (ValueError, KeyError, TypeError) as exc:
                 reason = _envelope_integrity_reason(state.book.bids, state.book.asks, exc)
@@ -1159,14 +1176,7 @@ class CanonicalReplayAccumulator:
         ids = list(metadata)
         ids.extend(cid for cid in self._connections if cid not in metadata)
         for cid in ids:
-            self._connections.setdefault(
-                cid,
-                _StreamingConnectionState(
-                    connection_id=cid,
-                    wire_book=Level2OrderBook(product_id=self.product_id),
-                    book=Level2OrderBook(product_id=self.product_id),
-                ),
-            )
+            self._connections.setdefault(cid, _StreamingConnectionState(connection_id=cid))
         id_order = {cid: index for index, cid in enumerate(ids)}
         ordered_ids = sorted(
             ids,

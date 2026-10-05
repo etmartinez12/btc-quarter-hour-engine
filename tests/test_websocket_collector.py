@@ -19,16 +19,19 @@ from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
 
 
 class FakeTransport:
-    def __init__(self, messages, *, connection_errors_after=None):
+    def __init__(self, messages, *, connection_errors_after=None, fail_connect_calls=()):
         self.messages = list(messages)
         self.sent = []
         self.connect_count = 0
         self.close_count = 0
         self._connection_errors_after = connection_errors_after
         self._recv_count = 0
+        self._fail_connect_calls = set(fail_connect_calls)
 
     def connect(self, *, url, connect_timeout):
         self.connect_count += 1
+        if self.connect_count in self._fail_connect_calls:
+            raise ConnectionError("simulated connect failure")
 
     def send(self, payload):
         self.sent.append(payload)
@@ -306,6 +309,37 @@ def test_sigterm_during_unbounded_reconnect_finishes_cleanly(tmp_path):
     assert writer.pending_frame_count == 0
     assert transport.connect_count == 2
     assert transport.close_count >= 2
+    assert service.connection.disconnect_reason == "requested_stop"
+
+
+def test_stop_during_reconnect_connect_failures_finalizes_durably(tmp_path):
+    collector, service, transport, writer = _build_collector(
+        tmp_path,
+        [_snapshot(1, "2024-01-01T00:14:50Z")],
+        config_kwargs={
+            "initial_reconnect_backoff_seconds": 0,
+            "max_reconnect_attempts": None,
+        },
+        transport_kwargs={
+            "connection_errors_after": 2,
+            "fail_connect_calls": {2, 3, 4, 5},
+        },
+    )
+
+    result = collector.run(
+        stop_fn=lambda: transport.connect_count >= 4,
+    )
+
+    assert result.termination_reason == "requested_stop"
+    assert result.manifest_path.exists()
+    assert result.raw_frame_count == 1
+    assert writer.pending_frame_count == 0
+    assert writer.sealed_segments
+    assert result.level2_update_row_count == 2
+    assert result.bbo_state_row_count == 1
+    assert service.level2_update_rows == []
+    assert service.bbo_state_rows == []
+    assert transport.connect_count == 4
     assert service.connection.disconnect_reason == "requested_stop"
 
 

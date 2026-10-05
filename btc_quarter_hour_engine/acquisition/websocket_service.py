@@ -413,7 +413,38 @@ class CoinbaseWebSocketService:
                     remaining -= interval
             if stop_fn is not None and stop_fn():
                 raise ReconnectStopRequested("Stop requested during reconnect backoff")
-            connection = self.connect_and_subscribe()
+            try:
+                connection = self.connect_and_subscribe()
+            except (ConnectionError, TimeoutError, OSError) as exc:
+                failed_connection = self.connection
+                if failed_connection is not None:
+                    failed_connection.disconnected_at_utc = self._utcnow()
+                    failed_connection.disconnect_reason = "connection_establishment_failed"
+                try:
+                    self.client.close()
+                except (ConnectionError, TimeoutError, OSError) as close_error:
+                    self._record_diagnostic(
+                        kind="reconnect_close_error",
+                        error=str(close_error),
+                        connection_id=(
+                            failed_connection.connection_id
+                            if failed_connection is not None else None
+                        ),
+                    )
+                if stop_fn is not None and stop_fn():
+                    raise ReconnectStopRequested(
+                        "Stop requested after reconnect connection-establishment failure"
+                    ) from exc
+                if (
+                    self.config.max_reconnect_attempts is not None
+                    and attempt >= self.config.max_reconnect_attempts
+                ):
+                    raise ReconnectExhaustedError(
+                        "WebSocket reconnect attempts exhausted"
+                    ) from exc
+                attempt += 1
+                delay = min(self.config.max_reconnect_backoff_seconds, delay * 2)
+                continue
             failure_reason = "snapshot_wait_timeout"
             try:
                 self._wait_for_snapshot(
@@ -422,7 +453,7 @@ class CoinbaseWebSocketService:
                 )
             except EnvelopeSequenceGapError:
                 failure_reason = "sequence_gap_before_snapshot"
-            except ConnectionError:
+            except (ConnectionError, TimeoutError, OSError):
                 failure_reason = "connection_failed_before_snapshot"
             if self.order_book.is_synced():
                 return connection
