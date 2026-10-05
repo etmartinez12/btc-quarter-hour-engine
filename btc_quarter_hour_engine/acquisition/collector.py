@@ -141,6 +141,7 @@ class WebSocketCollector:
                 try:
                     self.service.handle_message(
                         frame.raw_bytes, frame_index=frame_index, ingest_time_utc=frame.received_at_utc,
+                        include_book_snapshot=False,
                     )
                 except EnvelopeSequenceGapError:
                     self._reconnect()

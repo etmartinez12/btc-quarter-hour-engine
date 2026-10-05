@@ -104,6 +104,7 @@ def _bbo_state_row(
     frame_index: int | None,
     ingest_time_utc: datetime,
 ) -> dict[str, Any]:
+    top = book.top_of_book()
     return {
         "source": FORWARD_SOURCE,
         "product_id": book.product_id,
@@ -114,13 +115,13 @@ def _bbo_state_row(
         "state_time_utc": source_time_utc,
         "ingest_time_utc": ingest_time_utc,
         "state": book.state.value,
-        "best_bid": book.best_bid,
-        "best_ask": book.best_ask,
-        "best_bid_size": book.best_bid_size,
-        "best_ask_size": book.best_ask_size,
-        "spread": book.spread,
-        "midpoint": book.midpoint,
-        "book_synced": book.is_synced(),
+        "best_bid": top["best_bid"],
+        "best_ask": top["best_ask"],
+        "best_bid_size": top["best_bid_size"],
+        "best_ask_size": top["best_ask_size"],
+        "spread": top["spread"],
+        "midpoint": top["midpoint"],
+        "book_synced": top["book_synced"],
         "book_schema_version": COINBASE_BBO_STATE_SCHEMA_VERSION,
     }
 
@@ -217,6 +218,7 @@ class CoinbaseWebSocketService:
 
     def handle_message(
         self, message: Any, *, frame_index: int | None = None, ingest_time_utc: datetime | None = None,
+        include_book_snapshot: bool = True,
     ) -> dict[str, Any]:
         payload = parse_coinbase_ws_message(message)
         ingest_time_utc = ingest_time_utc or self._utcnow()
@@ -227,7 +229,10 @@ class CoinbaseWebSocketService:
             previous_sequence = self.connection.last_envelope_sequence_num
             if previous_sequence is not None and envelope_sequence <= previous_sequence:
                 self.connection.stale_sequence_count += 1
-                return {"status": "stale_sequence_ignored", "book": self.order_book.snapshot()}
+                result: dict[str, Any] = {"status": "stale_sequence_ignored"}
+                if include_book_snapshot:
+                    result["book"] = self.order_book.snapshot()
+                return result
             if previous_sequence is not None and envelope_sequence > previous_sequence + 1:
                 self.connection.sequence_gap_count += 1
                 self.connection.invalidated_at_utc = self._utcnow()
@@ -281,8 +286,13 @@ class CoinbaseWebSocketService:
             if message_type == "snapshot":
                 if self.connection is not None:
                     self.connection.snapshot_synced_at_utc = self._utcnow()
-                return {"status": "snapshot_synced", "book": self.order_book.snapshot()}
-            return {"status": "l2_update_applied", "book": self.order_book.snapshot()}
+                status = "snapshot_synced"
+            else:
+                status = "l2_update_applied"
+            result: dict[str, Any] = {"status": status}
+            if include_book_snapshot:
+                result["book"] = self.order_book.snapshot()
+            return result
 
         if message_type == "heartbeat":
             if self.connection is not None:
@@ -360,6 +370,7 @@ class CoinbaseWebSocketService:
             try:
                 self.handle_message(
                     frame.raw_bytes, frame_index=frame_index, ingest_time_utc=frame.received_at_utc,
+                    include_book_snapshot=False,
                 )
             except EnvelopeSequenceGapError:
                 raise

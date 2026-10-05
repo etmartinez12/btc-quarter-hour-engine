@@ -168,6 +168,23 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert [f.decode("utf-8") for f in frames] == messages
 
 
+def test_collector_receive_path_does_not_materialize_full_book(tmp_path, monkeypatch):
+    messages = [
+        _snapshot(1, "2024-01-01T00:00:00Z"),
+        _update(2, "2024-01-01T00:00:01Z", "bid", 100.5, 2.0),
+    ]
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+
+    def fail_snapshot():
+        raise AssertionError("collector receive path must not materialize full book")
+
+    monkeypatch.setattr(service.order_book, "snapshot", fail_snapshot)
+    result = collector.run(max_messages=len(messages))
+
+    assert result.bbo_state_row_count == 2
+    assert service.order_book.is_synced()
+
+
 def test_collector_keeps_transient_cross_multi_update_envelope_synced(tmp_path):
     update_time = "2024-01-01T00:14:59.900Z"
     messages = [
