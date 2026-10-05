@@ -237,6 +237,10 @@ def _at(second: str) -> datetime:
     return datetime.fromisoformat(f"2024-01-01T13:{second}+00:00")
 
 
+def _utc(timestamp: str) -> datetime:
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
 def _frame(channel, timestamp, sequence, *, updates=None, event_type="update", counter=1):
     if channel == "l2_data":
         events = [{"type": event_type, "product_id": "BTC-USD", "updates": [
@@ -279,7 +283,7 @@ def _replay(raw_frames, **kwargs):
     )
 
 
-def test_final_replay_late_arriving_l2_mutation_excludes_future_ask():
+def test_future_envelope_blocks_later_sequence_even_if_later_sequence_has_preboundary_event_time():
     ledger = _replay([
         _snapshot(), _heartbeat(),
         _update(3, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
@@ -288,20 +292,24 @@ def test_final_replay_late_arriving_l2_mutation_excludes_future_ask():
     assert len(ledger) == 1
     row = ledger[0]
     assert row.boundary_time_utc == _at("15:00")
-    assert (row.best_bid, row.best_ask, row.midpoint) == (100.5, 101, 100.75)
-    assert (row.source_sequence_num, row.connection_id, row.session_id) == (4, "conn-1", "session-1")
+    assert (row.best_bid, row.best_ask, row.midpoint) == (100, 101, 100.5)
+    assert (row.source_sequence_num, row.source_state_time_utc) == (1, _at("14:50"))
+    assert (row.connection_id, row.session_id) == ("conn-1", "session-1")
     assert row.canonical_target_eligible and row.eligibility_reason == "eligible"
     assert row.derived_at_utc == _at("15:00.100000")
 
 
-def test_one_envelope_replays_individual_update_times():
+def test_straddling_envelope_is_excluded_atomically_from_boundary():
     ledger = _replay([
         _snapshot(), _heartbeat(),
         _update(3,
             ("bid", "2024-01-01T13:14:59.900Z", 100.5, 1),
             ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
     ])
-    assert (ledger[0].best_bid, ledger[0].best_ask) == (100.5, 101)
+    row = ledger[0]
+    assert row.eligible and row.book_synced
+    assert (row.best_bid, row.best_ask, row.midpoint) == (100, 101, 100.5)
+    assert (row.source_sequence_num, row.source_state_time_utc) == (1, _at("14:50"))
 
 def test_same_timestamp_envelope_mutations_replay_as_one_atomic_batch():
     ledger = _replay([
@@ -317,18 +325,128 @@ def test_same_timestamp_envelope_mutations_replay_as_one_atomic_batch():
     assert row.eligibility_reason == "eligible"
 
 
-def test_future_mutation_in_envelope_cannot_rescue_invalid_pre_boundary_state():
+def test_straddling_envelope_is_excluded_atomically_and_applied_at_later_boundary():
     ledger = _replay([
         _snapshot(), _heartbeat(),
         _update(3,
             ("bid", "2024-01-01T13:14:59.900Z", 102, 1),
+            ("offer", "2024-01-01T13:15:00.100Z", 101, 0),
             ("offer", "2024-01-01T13:15:00.100Z", 103, 1)),
-    ])
+        _heartbeat("2024-01-01T13:29:59Z", sequence=4),
+    ], session_completed_at_utc=_at("30:00"))
+    before, after = ledger
+    assert before.eligible and before.book_synced
+    assert (before.best_bid, before.best_ask) == (100, 101)
+    assert (before.source_sequence_num, before.source_state_time_utc) == (1, _at("14:50"))
+    assert after.eligible and after.book_synced
+    assert (after.best_bid, after.best_ask, after.midpoint) == (102, 103, 102.5)
+    assert (after.source_sequence_num, after.source_state_time_utc) == (3, _at("15:00.100000"))
+
+
+def test_cross_envelope_timestamp_inversion_preserves_delivery_order():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("offer", "2024-01-01T13:14:59.900Z", 101, 0),
+            ("offer", "2024-01-01T13:14:59.900Z", 102, 1)),
+        _update(4,
+            ("offer", "2024-01-01T13:14:59.850Z", 102, 0),
+            ("offer", "2024-01-01T13:14:59.850Z", 103, 1)),
+    ], session_completed_at_utc=_at("15:00"))
     row = ledger[0]
-    assert not row.eligible
-    assert row.eligibility_reason == "crossed_book"
-    assert row.best_bid is None
-    assert row.best_ask is None
+    assert row.eligible
+    assert (row.best_bid, row.best_ask, row.midpoint) == (100, 103, 101.5)
+    assert (row.source_sequence_num, row.source_state_time_utc) == (4, _at("14:59.850000"))
+
+
+def test_future_envelope_blocks_later_preboundary_envelope_until_later_boundary():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("offer", "2024-01-01T13:15:00.100Z", 101, 0),
+            ("offer", "2024-01-01T13:15:00.100Z", 102, 1)),
+        _update(4,
+            ("offer", "2024-01-01T13:14:59.950Z", 102, 0),
+            ("offer", "2024-01-01T13:14:59.950Z", 103, 1)),
+        _heartbeat("2024-01-01T13:29:59Z", sequence=5),
+    ], session_completed_at_utc=_at("30:00"))
+    at_1500, at_1515 = ledger
+    assert at_1500.eligible
+    assert (at_1500.best_bid, at_1500.best_ask) == (100, 101)
+    assert (at_1500.source_sequence_num, at_1500.source_state_time_utc) == (1, _at("14:50"))
+    assert at_1515.eligible
+    assert (at_1515.best_bid, at_1515.best_ask) == (100, 103)
+    assert (at_1515.source_sequence_num, at_1515.source_state_time_utc) == (4, _at("14:59.950000"))
+
+
+def test_preboundary_multi_update_envelope_is_applied_as_one_atomic_batch():
+    ledger = _replay([
+        _snapshot(), _heartbeat(),
+        _update(3,
+            ("bid", "2024-01-01T13:14:58.900Z", 102, 1),
+            ("offer", "2024-01-01T13:14:59.100Z", 101, 0),
+            ("offer", "2024-01-01T13:14:59.200Z", 103, 1)),
+    ], session_completed_at_utc=_at("15:00"))
+    row = ledger[0]
+    assert row.eligible and row.book_synced
+    assert (row.best_bid, row.best_ask, row.midpoint) == (102, 103, 102.5)
+    assert (row.source_sequence_num, row.source_state_time_utc) == (3, _at("14:59.200000"))
+
+
+def test_heartbeat_remains_independent_of_future_l2_prefix_blocker():
+    ledger = _replay([
+        _snapshot(), _heartbeat("2024-01-01T13:14:00Z"),
+        _update(3, ("bid", "2024-01-01T13:15:00.100Z", 100.5, 1)),
+        _heartbeat("2024-01-01T13:14:59.500Z", sequence=4),
+    ], session_completed_at_utc=_at("15:00"))
+    row = ledger[0]
+    assert row.eligible and row.book_synced
+    assert (row.best_bid, row.best_ask) == (100, 101)
+    assert row.source_sequence_num == 1
+
+
+def test_real_shaped_1715_boundary_uses_last_committed_complete_envelope():
+    ledger = _replay([
+        _frame("l2_data", "2026-10-05T17:14:50Z", 2534, event_type="snapshot", updates=[
+            ("bid", "1970-01-01T00:00:00Z", 85255.47, 1),
+            ("offer", "1970-01-01T00:00:00Z", 85255.49, 1),
+        ]),
+        _heartbeat("2026-10-05T17:14:55Z", sequence=2535),
+        _frame("l2_data", "2026-10-05T17:14:59.977369Z", 2536, updates=[
+            ("bid", "2026-10-05T17:14:59.977369Z", 85255.48, 1),
+        ]),
+        _frame("l2_data", "2026-10-05T17:15:00.045315Z", 2537, updates=[
+            ("offer", "2026-10-05T17:15:00.045315Z", 85255.50, 1),
+        ]),
+    ], session_completed_at_utc=_utc("2026-10-05T17:15:00Z"))
+    row = ledger[0]
+    assert row.eligible and row.book_synced
+    assert (row.best_bid, row.best_ask) == (85255.48, 85255.49)
+    assert row.midpoint == pytest.approx(85255.485)
+    assert row.source_sequence_num == 2536
+    assert row.source_state_time_utc == _utc("2026-10-05T17:14:59.977369Z")
+
+
+def test_real_shaped_1730_boundary_uses_last_committed_complete_envelope():
+    ledger = _replay([
+        _frame("l2_data", "2026-10-05T17:29:50Z", 19647, event_type="snapshot", updates=[
+            ("bid", "1970-01-01T00:00:00Z", 85375.15, 1),
+            ("offer", "1970-01-01T00:00:00Z", 85375.17, 1),
+        ]),
+        _heartbeat("2026-10-05T17:29:55Z", sequence=19648),
+        _frame("l2_data", "2026-10-05T17:29:59.966539Z", 19649, updates=[
+            ("bid", "2026-10-05T17:29:59.966539Z", 85375.16, 1),
+        ]),
+        _frame("l2_data", "2026-10-05T17:30:00.028495Z", 19650, updates=[
+            ("offer", "2026-10-05T17:30:00.028495Z", 85375.18, 1),
+        ]),
+    ], session_completed_at_utc=_utc("2026-10-05T17:30:00Z"))
+    row = ledger[0]
+    assert row.eligible and row.book_synced
+    assert (row.best_bid, row.best_ask) == (85375.16, 85375.17)
+    assert row.midpoint == pytest.approx(85375.165)
+    assert row.source_sequence_num == 19649
+    assert row.source_state_time_utc == _utc("2026-10-05T17:29:59.966539Z")
 
 
 def test_exact_boundary_mutation_inclusive_and_one_microsecond_future_exclusive():
@@ -361,7 +479,7 @@ def test_valid_envelope_transient_cross_resolves_before_boundary_with_provenance
     assert row.source_sequence_num == 3
 
 
-def test_later_boundary_recovers_after_transient_cross_at_prior_boundary():
+def test_later_boundary_applies_previously_straddling_envelope_atomically():
     ledger = _replay([
         _snapshot(), _heartbeat(),
         _update(3,
@@ -371,10 +489,9 @@ def test_later_boundary_recovers_after_transient_cross_at_prior_boundary():
         _heartbeat("2024-01-01T13:29:59Z", sequence=4),
     ], session_completed_at_utc=_at("30:00"))
     assert len(ledger) == 2
-    crossed, recovered = ledger
-    assert not crossed.eligible
-    assert crossed.eligibility_reason == "crossed_book"
-    assert crossed.best_bid is None and crossed.best_ask is None
+    prior, recovered = ledger
+    assert prior.eligible and prior.book_synced
+    assert (prior.best_bid, prior.best_ask) == (100, 101)
     assert recovered.eligible and recovered.book_synced
     assert (recovered.best_bid, recovered.best_ask, recovered.midpoint) == (102, 103, 102.5)
     assert recovered.source_state_time_utc == _at("15:00.100000")
@@ -390,7 +507,7 @@ def test_recovered_book_still_requires_fresh_heartbeat():
             ("offer", "2024-01-01T13:15:00.100Z", 103, 1)),
     ], session_completed_at_utc=_at("30:00"))
     assert len(ledger) == 2
-    assert ledger[0].eligibility_reason == "crossed_book"
+    assert ledger[0].eligible and ledger[0].book_synced
     assert ledger[1].book_synced
     assert (ledger[1].best_bid, ledger[1].best_ask) == (102, 103)
     assert not ledger[1].eligible
@@ -419,9 +536,9 @@ def test_future_complete_envelope_invalidity_does_not_poison_prior_boundary():
     ], session_completed_at_utc=_at("15:00"))
     row = ledger[0]
     assert row.eligible and row.book_synced
-    assert (row.best_bid, row.best_ask) == (100.5, 101)
-    assert row.source_state_time_utc == _at("14:59.900000")
-    assert row.source_sequence_num == 3
+    assert (row.best_bid, row.best_ask) == (100, 101)
+    assert row.source_state_time_utc == _at("14:50")
+    assert row.source_sequence_num == 1
 
 
 def test_ineligible_ledger_reasons_and_no_price_freshness():

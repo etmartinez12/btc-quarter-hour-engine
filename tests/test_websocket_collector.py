@@ -449,7 +449,7 @@ def test_collector_raw_segments_replay_to_same_observations_as_live(tmp_path):
     assert replayed_rows == live_rows
 
 
-def test_final_canonical_replay_includes_late_arriving_pre_boundary_l2(tmp_path):
+def test_final_canonical_replay_blocks_late_arriving_pre_boundary_l2(tmp_path):
     messages = [
         _snapshot(1, "2024-01-01T13:14:50Z"),
         _heartbeat(2, "2024-01-01T13:14:55Z"),
@@ -459,15 +459,15 @@ def test_final_canonical_replay_includes_late_arriving_pre_boundary_l2(tmp_path)
     collector, service, _, _ = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
     row = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"]).iloc[0]
-    assert row["best_bid"] == 100.5
+    assert row["best_bid"] == 100.0
     assert row["best_ask"] == 101.0
-    assert row["midpoint"] == 100.75
+    assert row["midpoint"] == 100.5
     assert bool(row["canonical_target_eligible"])
     assert result.manifest["quarter_hour_summary"]["eligible_boundaries"] == 1
     assert result.manifest["session_id"] == service.session_id
 
 
-def test_final_replay_uses_each_update_time_in_one_envelope(tmp_path):
+def test_final_replay_excludes_straddling_envelope_without_changing_normalized_updates(tmp_path):
     before, after = "2024-01-01T13:14:59.900Z", "2024-01-01T13:15:00.100Z"
     messages = [
         _snapshot(199, "2024-01-01T13:14:50Z"),
@@ -480,7 +480,7 @@ def test_final_replay_uses_each_update_time_in_one_envelope(tmp_path):
     collector, _, _, _ = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
     row = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"]).iloc[0]
-    assert (row["best_bid"], row["best_ask"]) == (100.5, 101)
+    assert (row["best_bid"], row["best_ask"], row["midpoint"]) == (100.0, 101.0, 100.5)
     updates = pd.read_parquet(result.level2_update_artifacts[0]["path"])
     assert set(updates["event_time_utc"]) >= {pd.Timestamp(before), pd.Timestamp(after)}
 
