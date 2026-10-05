@@ -21,6 +21,10 @@ class ReconnectExhaustedError(RuntimeError):
     """Raised when the configured number of fresh-connection attempts fails."""
 
 
+class ReconnectStopRequested(RuntimeError):
+    """Raised when a caller requests shutdown during reconnect recovery."""
+
+
 class EnvelopeSequenceGapError(ValueError):
     """Raised when a connection-level Coinbase envelope sequence gap is found."""
 
@@ -350,7 +354,7 @@ class CoinbaseWebSocketService:
                 self.connection.malformed_level2_count += 1
         self.mark_invalid("malformed_source_state")
 
-    def _wait_for_snapshot(self, *, deadline_seconds: float) -> None:
+    def _wait_for_snapshot(self, *, deadline_seconds: float, stop_fn: Any = None) -> None:
         """Keep receiving messages on the current connection until the order
         book becomes synced (a snapshot has been applied) or ``deadline_seconds``
         of monotonic budget elapses, whichever comes first.
@@ -362,8 +366,13 @@ class CoinbaseWebSocketService:
         """
         start = self.monotonic_fn()
         while (self.monotonic_fn() - start) < deadline_seconds:
+            if stop_fn is not None and stop_fn():
+                raise ReconnectStopRequested("Stop requested while waiting for a snapshot")
             try:
-                frame = self.client.receive_message()
+                receive_timeout = self.config.receive_timeout_seconds
+                if stop_fn is not None:
+                    receive_timeout = min(receive_timeout, 0.25)
+                frame = self.client.receive_message(timeout=receive_timeout)
             except TimeoutError:
                 continue
             frame_index = self.on_reconnect_frame(frame) if self.on_reconnect_frame is not None else None
@@ -380,7 +389,7 @@ class CoinbaseWebSocketService:
             if self.order_book.is_synced():
                 return
 
-    def reconnect(self) -> ConnectionDiagnostics:
+    def reconnect(self, *, stop_fn: Any = None) -> ConnectionDiagnostics:
         if self.client is not None:
             self.client.close()
         self.mark_invalid("reconnect")
@@ -390,11 +399,27 @@ class CoinbaseWebSocketService:
         delay = self.config.initial_reconnect_backoff_seconds
         attempt = 1
         while True:
-            self.sleep_fn(delay)
+            if stop_fn is not None and stop_fn():
+                raise ReconnectStopRequested("Stop requested during reconnect")
+            if stop_fn is None:
+                self.sleep_fn(delay)
+            else:
+                remaining = delay
+                while remaining > 0:
+                    if stop_fn():
+                        raise ReconnectStopRequested("Stop requested during reconnect backoff")
+                    interval = min(0.25, remaining)
+                    self.sleep_fn(interval)
+                    remaining -= interval
+            if stop_fn is not None and stop_fn():
+                raise ReconnectStopRequested("Stop requested during reconnect backoff")
             connection = self.connect_and_subscribe()
             failure_reason = "snapshot_wait_timeout"
             try:
-                self._wait_for_snapshot(deadline_seconds=self.config.snapshot_wait_timeout_seconds)
+                self._wait_for_snapshot(
+                    deadline_seconds=self.config.snapshot_wait_timeout_seconds,
+                    stop_fn=stop_fn,
+                )
             except EnvelopeSequenceGapError:
                 failure_reason = "sequence_gap_before_snapshot"
             except ConnectionError:
@@ -412,4 +437,5 @@ class CoinbaseWebSocketService:
 
 __all__ = [
     "CoinbaseWebSocketService", "ConnectionDiagnostics", "EnvelopeSequenceGapError", "ReconnectExhaustedError",
+    "ReconnectStopRequested",
 ]

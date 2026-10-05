@@ -700,9 +700,23 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
         _update(3, ("bid", "2024-01-01T13:15:00Z", 100.5, 1)),
         _update(4, ("offer", "2024-01-01T13:15:00.000001Z", 101.5, 1)),
     ]
+    causal_prefix = [
+        _snapshot(),
+        _heartbeat(),
+        _update(3, ("bid", "2024-01-01T13:15:00Z", 100.5, 1)),
+        _update(4, ("offer", "2024-01-01T13:14:59.900Z", 101.5, 1)),
+        _update(5, ("bid", "2024-01-01T13:15:00.100Z", 100.75, 1)),
+    ]
+    stale_delivery = [
+        _snapshot(),
+        _heartbeat(),
+        _heartbeat("2024-01-01T13:15:05Z", sequence=2),
+        _update(3, ("bid", "2024-01-01T13:15:01Z", 100.5, 1)),
+    ]
     integrity_cases = [
         [_snapshot(), _heartbeat(), _update(4, ("bid", "2024-01-01T13:14:59Z", 100.5, 1))],
         [_snapshot(), _heartbeat(), b"malformed source frame"],
+        [_heartbeat("2024-01-01T13:15:01Z", sequence=1), b"malformed source frame"],
         [_snapshot(), _heartbeat("2024-01-01T13:14:00Z"), _heartbeat("2024-01-01T13:15:01Z", sequence=3)],
     ]
     reconnect = [
@@ -715,6 +729,8 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
         [(raw, "conn-1") for raw in base],
         [(raw, "conn-1") for raw in straddling],
         [(raw, "conn-1") for raw in exact_boundary],
+        [(raw, "conn-1") for raw in causal_prefix],
+        [(raw, "conn-1") for raw in stale_delivery],
         *[[(raw, "conn-1") for raw in case] for case in integrity_cases],
         reconnect,
     ]
@@ -731,20 +747,19 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
         ]
         connections = [{"connection_id": "conn-1"}, {"connection_id": "conn-2"}]
         accumulator = CanonicalReplayAccumulator(
-            frames_factory=lambda rows=recorded: iter(rows),
             product_id="BTC-USD",
             session_id="session-1",
             heartbeat_timeout_seconds=30,
-            connections_factory=lambda records=connections: records,
         )
-        for raw, connection_id, frame_index, _ingest_time in recorded:
-            accumulator.consume(raw, connection_id, frame_index)
+        for raw, connection_id, frame_index, ingest_time in recorded:
+            accumulator.consume(raw, connection_id, frame_index, ingest_time)
         assert accumulator.frame_count == len(recorded)
         assert not hasattr(accumulator, "frames")
         streamed = accumulator.finalize(
             session_started_at_utc=None,
             session_completed_at_utc=None,
             derived_at_utc=_utc("2024-01-01T14:00:00Z"),
+            connections=connections,
         )
         offline = replay_recorded_frames(
             [(raw, connection_id, frame_index) for raw, connection_id, frame_index, _ in recorded],
@@ -755,3 +770,41 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
             derived_at_utc=_utc("2024-01-01T14:00:00Z"),
         )
         assert streamed == offline
+
+
+def test_streaming_accumulator_retains_only_compact_state_for_long_streams():
+    accumulator = CanonicalReplayAccumulator(
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+    )
+    messages = [
+        (_snapshot(), 1),
+        (_heartbeat(), 2),
+        *[
+            (
+                _update(
+                    sequence,
+                    ("bid", "2024-01-01T13:15:01Z", 100.5, 1),
+                ),
+                sequence,
+            )
+            for sequence in range(3, 1003)
+        ],
+    ]
+    ingest_time = _utc("2024-01-01T13:14:50Z")
+    for frame_index, (raw, _sequence) in enumerate(messages):
+        accumulator.consume(
+            raw,
+            "conn-1",
+            frame_index,
+            ingest_time + timedelta(seconds=frame_index),
+        )
+
+    state = accumulator._connections["conn-1"]
+    assert accumulator.frame_count == len(messages)
+    assert state.delivery_count == len(messages)
+    assert len(state.boundary_candidates) <= 2
+    assert not hasattr(accumulator, "frames")
+    assert not hasattr(accumulator, "frames_factory")
+    assert not hasattr(accumulator, "connections_factory")

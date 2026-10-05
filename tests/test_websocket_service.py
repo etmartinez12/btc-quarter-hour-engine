@@ -539,6 +539,23 @@ def test_reconnect_gives_up_waiting_once_deadline_elapses_without_a_snapshot():
         service.reconnect()
 
 
+def test_reconnect_stop_callback_interrupts_snapshot_wait():
+    from btc_quarter_hour_engine.acquisition.websocket_service import ReconnectStopRequested
+
+    service, _ = _service(
+        [], max_reconnect_attempts=None, initial_reconnect_backoff_seconds=0,
+        snapshot_wait_timeout_seconds=1000.0,
+    )
+    checks = {"count": 0}
+
+    def stop_after_connect():
+        checks["count"] += 1
+        return checks["count"] >= 3
+
+    with pytest.raises(ReconnectStopRequested):
+        service.reconnect(stop_fn=stop_after_connect)
+
+
 def test_mark_invalid_records_reason_and_invalidates_book():
     service, _ = _service([])
     service.connect_and_subscribe()

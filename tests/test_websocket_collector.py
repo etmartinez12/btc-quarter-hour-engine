@@ -262,6 +262,53 @@ def test_final_checkpoint_flushes_below_threshold_and_requested_stop_is_clean(tm
     assert service.level2_update_rows == []
 
 
+def test_collector_finalization_never_rereads_raw_segments(tmp_path, monkeypatch):
+    collector, *_rest, writer = _build_collector(
+        tmp_path,
+        [
+            _snapshot(1, "2024-01-01T00:14:50Z"),
+            _heartbeat(2, "2024-01-01T00:14:55Z"),
+            _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
+        ],
+    )
+
+    def fail_history_read(*_args, **_kwargs):
+        raise AssertionError("collector finalization must use its incremental replay state")
+
+    monkeypatch.setattr(writer, "iter_sealed_frames", fail_history_read)
+    result = collector.run(max_messages=3)
+
+    assert result.observation_count == 1
+    assert result.raw_frame_count == 3
+
+
+def test_sigterm_during_unbounded_reconnect_finishes_cleanly(tmp_path):
+    collector, service, transport, writer = _build_collector(
+        tmp_path,
+        [_snapshot(1, "2024-01-01T00:14:50Z")],
+        config_kwargs={
+            "initial_reconnect_backoff_seconds": 0,
+            "snapshot_wait_timeout_seconds": 1000,
+            "max_reconnect_attempts": None,
+        },
+        transport_kwargs={"connection_errors_after": 2},
+    )
+    stop_checks = {"count": 0}
+
+    def stop_during_snapshot_wait():
+        stop_checks["count"] += 1
+        return stop_checks["count"] >= 5
+
+    result = collector.run(stop_fn=stop_during_snapshot_wait)
+
+    assert result.termination_reason == "requested_stop"
+    assert result.manifest_path.exists()
+    assert writer.pending_frame_count == 0
+    assert transport.connect_count == 2
+    assert transport.close_count >= 2
+    assert service.connection.disconnect_reason == "requested_stop"
+
+
 def test_sigterm_handler_only_sets_the_stop_event():
     stop_event = threading.Event()
     handler = _sigterm_stop_handler(stop_event)

@@ -21,7 +21,12 @@ from btc_quarter_hour_engine.storage.forward_schema import (
 )
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
 
-from .websocket_service import CoinbaseWebSocketService, EnvelopeSequenceGapError, ReconnectExhaustedError
+from .websocket_service import (
+    CoinbaseWebSocketService,
+    EnvelopeSequenceGapError,
+    ReconnectExhaustedError,
+    ReconnectStopRequested,
+)
 
 
 @dataclass(slots=True)
@@ -91,6 +96,7 @@ class WebSocketCollector:
     _level2_update_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
     _bbo_state_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
     _canonical_accumulator: CanonicalReplayAccumulator = field(init=False)
+    _stop_fn: Any = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.sleep_fn is None:
@@ -102,16 +108,10 @@ class WebSocketCollector:
         self.raw_segment_writer.bind_session(self.service.session_id)
         self.service.on_reconnect_frame = self._record_frame
         self._canonical_accumulator = CanonicalReplayAccumulator(
-            frames_factory=self._iter_sealed_frames,
             product_id=self.service.config.product_id,
             session_id=self.service.session_id,
             heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
-            connections_factory=self._connections,
         )
-
-    def _iter_sealed_frames(self):
-        for frame in self.raw_segment_writer.iter_sealed_frames():
-            yield frame.raw_bytes, frame.connection_id, frame.frame_index, frame.ingest_time_utc
 
     def _connections(self) -> list[Any]:
         connections = [*self.service.connection_history]
@@ -128,7 +128,12 @@ class WebSocketCollector:
             raw=frame.raw_bytes, message_type=message_type, connection_id=connection_id,
             sequence_num=sequence_num, ingest_time_utc=frame.received_at_utc,
         )
-        self._canonical_accumulator.consume(frame.raw_bytes, connection_id, frame_index)
+        self._canonical_accumulator.consume(
+            frame.raw_bytes,
+            connection_id,
+            frame_index,
+            frame.received_at_utc,
+        )
         self._frame_count += 1
         return frame_index
 
@@ -144,6 +149,7 @@ class WebSocketCollector:
         self._checkpoint_started_monotonic = start_monotonic
         message_count = 0
         termination_reason = "requested_stop"
+        self._stop_fn = stop_fn
         try:
             self.service.connect_and_subscribe()
             self.connection_count += 1
@@ -184,6 +190,8 @@ class WebSocketCollector:
                 self._maybe_flush_normalized_checkpoint()
         except KeyboardInterrupt:
             termination_reason = "keyboard_interrupt"
+        except ReconnectStopRequested:
+            termination_reason = "requested_stop"
         except ReconnectExhaustedError:
             termination_reason = "reconnect_exhausted"
         except BaseException:
@@ -202,11 +210,12 @@ class WebSocketCollector:
             return self._finalize(started_at=started_at, completed_at=completed_at, termination_reason=termination_reason)
         finally:
             self.service.on_reconnect_frame = None
+            self._stop_fn = None
 
     def _reconnect(self) -> None:
         self._flush_normalized_checkpoint()
         self.raw_segment_writer.seal()
-        self.service.reconnect()
+        self.service.reconnect(stop_fn=self._stop_fn)
         self.connection_count += 1
         self.reconnect_count += 1
 
@@ -264,6 +273,7 @@ class WebSocketCollector:
             session_started_at_utc=started_at,
             session_completed_at_utc=completed_at,
             derived_at_utc=completed_at,
+            connections=connections,
         )
         bbo_rows = [_observation_row(observation) for observation in observations]
         bbo_artifacts = self._write_artifacts(
