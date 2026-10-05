@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -422,6 +422,398 @@ def replay_recorded_frames(
     return result
 
 
+def _source_times(event: Mapping[str, Any]) -> list[datetime]:
+    kind = event.get("type")
+    if kind == "heartbeat":
+        return [require_utc(event["time_utc"])]
+    if kind == "snapshot":
+        return [require_utc(event["event_time_utc"])]
+    if kind == "l2_data":
+        effective = require_utc(event["event_time_utc"])
+        return [effective, *[
+            require_utc(update.get("event_time_utc") or effective)
+            for update in event["updates"]
+        ]]
+    return []
+
+
+def _bounded_session_summary(
+    frames_factory: Callable[[], Iterable[tuple[bytes, str, int, datetime]]],
+    connections: Iterable[Any],
+) -> tuple[list[str], dict[str, tuple[datetime | None, datetime | None]], datetime | None, datetime | None, tuple[datetime, datetime] | None, bool]:
+    from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
+
+    metadata = {_connection_field(c, "connection_id"): c for c in connections}
+    ids = list(metadata)
+    sequence_by_connection: dict[str, int] = {}
+    first_last: dict[str, tuple[datetime | None, datetime | None]] = {}
+    observed_min: datetime | None = None
+    observed_max: datetime | None = None
+    first_sample: tuple[datetime, datetime] | None = None
+    last_sample: tuple[datetime, datetime] | None = None
+    has_deliveries = False
+
+    def note(connection_id: str, timestamp: datetime) -> None:
+        nonlocal observed_min, observed_max
+        first, last = first_last.get(connection_id, (None, None))
+        first_last[connection_id] = (
+            min(first, timestamp) if first is not None else timestamp,
+            max(last, timestamp) if last is not None else timestamp,
+        )
+        observed_min = min(observed_min, timestamp) if observed_min is not None else timestamp
+        observed_max = max(observed_max, timestamp) if observed_max is not None else timestamp
+
+    for raw, connection_id, _frame_index, ingest_time in frames_factory():
+        has_deliveries = True
+        if connection_id not in metadata and connection_id not in ids:
+            ids.append(connection_id)
+        try:
+            event = parse_coinbase_ws_message(raw)
+        except (ValueError, UnicodeError):
+            continue
+        kind = event.get("type")
+        source_time = (
+            event.get("time_utc") if kind == "heartbeat"
+            else event.get("envelope_time_utc") if kind == "snapshot"
+            else event.get("event_time_utc") if kind == "l2_data"
+            else None
+        )
+        if kind in {"snapshot", "l2_data", "heartbeat"} and source_time is not None:
+            sample = (require_utc(source_time), require_utc(ingest_time))
+            if first_sample is None:
+                first_sample = sample
+            last_sample = sample
+
+        sequence = sequence_by_connection.get(connection_id)
+        current = event["envelope"].sequence_num
+        if sequence is not None and current <= sequence:
+            continue
+        event_times = _source_times(event)
+        if sequence is not None and current > sequence + 1:
+            if kind == "snapshot":
+                gap_time = require_utc(event["event_time_utc"])
+            elif kind == "heartbeat":
+                gap_time = require_utc(event["time_utc"])
+            elif kind == "l2_data":
+                for timestamp in event_times:
+                    note(connection_id, timestamp)
+                gap_time = require_utc(event["event_time_utc"])
+            else:
+                envelope_time = event.get("envelope_time_utc") or event.get("time_utc") or event["envelope"].timestamp_utc
+                gap_time = require_utc(envelope_time)
+            sequence_by_connection[connection_id] = current
+            note(connection_id, gap_time)
+            continue
+        sequence_by_connection[connection_id] = current
+        if kind not in {"snapshot", "l2_data", "heartbeat"}:
+            continue
+        for timestamp in event_times:
+            note(connection_id, timestamp)
+
+    return ids, first_last, observed_min, observed_max, (
+        (first_sample, last_sample) if first_sample is not None and last_sample is not None else None
+    ), has_deliveries
+
+
+def _replay_connection_at_boundary(
+    frames_factory: Callable[[], Iterable[tuple[bytes, str, int, datetime]]],
+    *,
+    connection_id: str,
+    boundary: datetime,
+    product_id: str,
+) -> tuple[Level2OrderBook, datetime | None, datetime | None, int | None, str | None]:
+    from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
+
+    sequence: int | None = None
+    invalid = False
+    wire_book = Level2OrderBook(product_id=product_id)
+    book = Level2OrderBook(product_id=product_id)
+    has_snapshot = False
+    state_time: datetime | None = None
+    state_sequence: int | None = None
+    heartbeat: datetime | None = None
+    first_control: tuple[datetime, int, str, Any] | None = None
+    blocked = False
+    last_time: datetime | None = None
+    canonical_reason: str | None = None
+    canonical_message: str | None = None
+
+    for arrival, (raw, frame_connection_id, _frame_index, _ingest_time) in enumerate(frames_factory()):
+        if frame_connection_id != connection_id:
+            continue
+        try:
+            event = parse_coinbase_ws_message(raw)
+        except (ValueError, UnicodeError):
+            invalid = True
+            if last_time is not None:
+                candidate = (last_time, arrival, "malformed", None)
+                first_control = min(first_control, candidate) if first_control is not None else candidate
+            continue
+        kind = event.get("type")
+        envelope = event["envelope"]
+        envelope_time = event.get("envelope_time_utc") or event.get("time_utc") or envelope.timestamp_utc
+        current = envelope.sequence_num
+        if sequence is not None and current <= sequence:
+            continue
+        if sequence is not None and current > sequence + 1:
+            if kind == "snapshot":
+                gap_time = require_utc(event["event_time_utc"])
+            elif kind == "heartbeat":
+                gap_time = require_utc(event["time_utc"])
+            elif kind == "l2_data":
+                gap_time = require_utc(event["event_time_utc"])
+                last_time = max(last_time, gap_time) if last_time is not None else gap_time
+                for update in event["updates"]:
+                    update_time = require_utc(update.get("event_time_utc") or gap_time)
+                    last_time = max(last_time, update_time)
+            else:
+                gap_time = require_utc(envelope_time)
+            invalid = True
+            candidate = (gap_time, arrival, "gap", None)
+            first_control = min(first_control, candidate) if first_control is not None else candidate
+            last_time = max(last_time, gap_time) if last_time is not None else gap_time
+            sequence = current
+            continue
+        sequence = current
+        if kind not in {"snapshot", "l2_data", "heartbeat"}:
+            continue
+        if kind == "snapshot":
+            event_time = require_utc(event["event_time_utc"])
+        elif kind == "heartbeat":
+            event_time = require_utc(event["time_utc"])
+        else:
+            event_time = require_utc(event["event_time_utc"])
+            for update in event["updates"]:
+                update_time = require_utc(update.get("event_time_utc") or event_time)
+                last_time = max(last_time, update_time) if last_time is not None else update_time
+        last_time = max(last_time, event_time) if last_time is not None else event_time
+        if kind == "heartbeat":
+            if not invalid and event_time <= boundary:
+                heartbeat = max(heartbeat, event_time) if heartbeat is not None else event_time
+            continue
+        if event["product_id"] != product_id or invalid:
+            continue
+
+        updates = event["updates"]
+        envelope_invalid: tuple[str, str] | None = None
+        if kind == "snapshot":
+            try:
+                wire_book.apply_snapshot(
+                    product_id=product_id,
+                    levels={
+                        "bid": [update for update in updates if update["side"] == "bid"],
+                        "ask": [update for update in updates if update["side"] == "ask"],
+                    },
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                envelope_invalid = (_envelope_integrity_reason(wire_book.bids, wire_book.asks, exc), str(exc))
+        elif wire_book.is_synced():
+            try:
+                wire_book.apply_updates(updates)
+            except (ValueError, KeyError, TypeError) as exc:
+                envelope_invalid = (_envelope_integrity_reason(wire_book.bids, wire_book.asks, exc), str(exc))
+
+        if envelope_invalid is not None:
+            invalid = True
+            candidate = (event_time, arrival, "envelope_invalid", envelope_invalid)
+            first_control = min(first_control, candidate) if first_control is not None else candidate
+            continue
+
+        if not blocked and canonical_reason is None:
+            if event_time > boundary:
+                blocked = True
+            else:
+                try:
+                    if kind == "snapshot":
+                        book.apply_snapshot(
+                            product_id=product_id,
+                            levels={
+                                "bid": [update for update in updates if update["side"] == "bid"],
+                                "ask": [update for update in updates if update["side"] == "ask"],
+                            },
+                        )
+                        has_snapshot = True
+                        state_time = event_time
+                        state_sequence = current
+                    elif has_snapshot:
+                        book.apply_updates(updates)
+                        state_time = event_time
+                        state_sequence = current
+                except (ValueError, KeyError, TypeError) as exc:
+                    canonical_reason = _envelope_integrity_reason(book.bids, book.asks, exc)
+                    canonical_message = str(exc)
+                    book.invalidate(str(exc))
+
+    if canonical_reason is not None:
+        book.invalidate(canonical_message or canonical_reason)
+        return book, heartbeat, state_time, state_sequence, canonical_reason
+    if first_control is not None and first_control[0] <= boundary:
+        kind = first_control[2]
+        if kind in {"gap", "malformed", "envelope_invalid"}:
+            reason = (
+                "sequence_gap" if kind == "gap"
+                else "malformed_source_state" if kind == "malformed"
+                else first_control[3][0]
+            )
+            message = (
+                "sequence gap" if kind == "gap"
+                else "malformed_source_state" if kind == "malformed"
+                else first_control[3][1]
+            )
+            book.invalidate(message)
+            return book, heartbeat, state_time, state_sequence, reason
+        if kind == "canonical_invalid":
+            return book, heartbeat, state_time, state_sequence, first_control[3]
+    return book, heartbeat, state_time, state_sequence, None
+
+
+def replay_recorded_frames_bounded(
+    frames_factory: Callable[[], Iterable[tuple[bytes, str, int, datetime]]],
+    *,
+    product_id: str,
+    session_id: str,
+    heartbeat_timeout_seconds: float,
+    connections: Iterable[Any] | None = None,
+    session_started_at_utc: datetime | None = None,
+    session_completed_at_utc: datetime | None = None,
+    derived_at_utc: datetime | None = None,
+) -> list[QuarterHourObservation]:
+    """Replay a repeatable durable frame source without retaining session history."""
+    if heartbeat_timeout_seconds < 0:
+        raise ValueError("Heartbeat timeout must be nonnegative")
+    start = require_utc(session_started_at_utc) if session_started_at_utc is not None else None
+    end = require_utc(session_completed_at_utc) if session_completed_at_utc is not None else None
+    if start is not None and end is not None and end < start:
+        raise ValueError("Session completion precedes session start")
+    connection_records = list(connections or ())
+    ids, first_last, observed_min, observed_max, samples, has_deliveries = _bounded_session_summary(
+        frames_factory, connection_records,
+    )
+    if samples is not None:
+        first_source, first_ingest = samples[0]
+        last_source, last_ingest = samples[1]
+        if start is not None:
+            start = first_source - max(timedelta(0), first_ingest - start)
+        if end is not None:
+            end = last_source + max(timedelta(0), end - last_ingest)
+    if observed_min is None and (start is None or end is None):
+        return []
+    start = min(start, observed_min) if start is not None and observed_min is not None else (start or observed_min)
+    end = max(end, observed_max) if end is not None and observed_max is not None else (end or observed_max)
+    if start is None or end is None or end < start:
+        return []
+    derived_at = require_utc(derived_at_utc) if derived_at_utc is not None else end
+    boundary = floor_to_quarter_hour(start)
+    if boundary < start:
+        boundary += timedelta(minutes=15)
+    metadata = {_connection_field(c, "connection_id"): c for c in connection_records}
+    for connection_id in ids:
+        metadata.setdefault(connection_id, None)
+    ordered_ids = sorted(
+        ids,
+        key=lambda cid: (
+            first_last.get(cid, (None, None))[0] or datetime.max.replace(tzinfo=timezone.utc),
+            ids.index(cid),
+        ),
+    )
+    bounds: dict[str, tuple[datetime | None, datetime | None]] = {}
+    for connection_id in ids:
+        meta = metadata.get(connection_id)
+        disconnected = _connection_field(meta, "source_disconnected_at_utc")
+        if disconnected is not None:
+            disconnected = require_utc(disconnected)
+        bounds[connection_id] = (first_last.get(connection_id, (None, None))[0], disconnected)
+    for cid in ordered_ids[:-1]:
+        bounds[cid] = (bounds[cid][0], first_last.get(cid, (None, None))[1] or bounds[cid][0])
+
+    result: list[QuarterHourObservation] = []
+    while boundary <= end:
+        active: str | None = None
+        for cid in ordered_ids:
+            connected, _disconnected = bounds[cid]
+            if connected is not None and connected <= boundary:
+                active = cid
+        if active is not None:
+            connected, disconnected = bounds[active]
+            if disconnected is not None and disconnected < boundary:
+                active = None
+        if active is None:
+            result.append(
+                derive_quarter_hour_observation(
+                    book=Level2OrderBook(product_id=product_id),
+                    timestamp_utc=boundary,
+                    product_id=product_id,
+                    session_id=session_id,
+                    derived_at_utc=derived_at,
+                    heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                    integrity_reason="connection_unhealthy" if has_deliveries else "no_synced_snapshot",
+                )
+            )
+        else:
+            book, heartbeat, state_time, state_sequence, reason = _replay_connection_at_boundary(
+                frames_factory,
+                connection_id=active,
+                boundary=boundary,
+                product_id=product_id,
+            )
+            result.append(
+                derive_quarter_hour_observation(
+                    book=book,
+                    timestamp_utc=boundary,
+                    product_id=product_id,
+                    session_id=session_id,
+                    connection_id=active,
+                    source_state_time_utc=state_time,
+                    source_sequence_num=state_sequence,
+                    derived_at_utc=derived_at,
+                    last_heartbeat_at=heartbeat,
+                    heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                    integrity_reason=reason,
+                )
+            )
+        boundary += timedelta(minutes=15)
+    return result
+
+
+@dataclass(slots=True)
+class CanonicalReplayAccumulator:
+    """Bounded-memory canonical finalizer backed by durable raw segment iteration."""
+
+    frames_factory: Callable[[], Iterable[tuple[bytes, str, int, datetime]]]
+    product_id: str
+    session_id: str
+    heartbeat_timeout_seconds: float
+    connections_factory: Callable[[], Iterable[Any]]
+    frame_count: int = 0
+    connection_ids: set[str | None] = field(default_factory=set)
+
+    def consume(self, raw: bytes, connection_id: str | None, frame_index: int) -> None:
+        if not isinstance(raw, bytes):
+            raise TypeError("Recorded frames must retain their original bytes")
+        if frame_index < 0:
+            raise ValueError("frame_index must be nonnegative")
+        self.frame_count += 1
+        self.connection_ids.add(connection_id)
+
+    def finalize(
+        self,
+        *,
+        session_started_at_utc: datetime | None,
+        session_completed_at_utc: datetime | None,
+        derived_at_utc: datetime,
+    ) -> list[QuarterHourObservation]:
+        return replay_recorded_frames_bounded(
+            self.frames_factory,
+            product_id=self.product_id,
+            session_id=self.session_id,
+            heartbeat_timeout_seconds=self.heartbeat_timeout_seconds,
+            connections=self.connections_factory(),
+            session_started_at_utc=session_started_at_utc,
+            session_completed_at_utc=session_completed_at_utc,
+            derived_at_utc=derived_at_utc,
+        )
+
+
 def replay_events(
     events: Iterable[Mapping[str, Any]],
     *,
@@ -446,5 +838,7 @@ __all__ = [
     "floor_to_quarter_hour",
     "process_parsed_event",
     "replay_recorded_frames",
+    "replay_recorded_frames_bounded",
+    "CanonicalReplayAccumulator",
     "replay_events",
 ]

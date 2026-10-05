@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any
 
-from btc_quarter_hour_engine.market_data.replay import replay_recorded_frames
-from .coinbase_websocket import parse_coinbase_ws_message
+from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
 from btc_quarter_hour_engine.storage.forward_manifest import build_forward_manifest, write_forward_manifest
 from btc_quarter_hour_engine.storage.forward_parquet import ForwardParquetStore
 from btc_quarter_hour_engine.storage.forward_schema import (
@@ -80,15 +80,44 @@ class WebSocketCollector:
     source: str = FORWARD_SOURCE
     data_kind: str = DATA_KIND_QUARTER_HOUR_BBO
     sleep_fn: Any = field(default=None)
+    flush_row_threshold: int = 100_000
+    flush_interval_seconds: float = 300.0
     connection_count: int = field(default=0, init=False)
     reconnect_count: int = field(default=0, init=False)
     _frame_count: int = field(default=0, init=False)
+    _checkpoint_started_monotonic: float = field(default=0.0, init=False)
+    _level2_update_row_count: int = field(default=0, init=False)
+    _bbo_state_row_count: int = field(default=0, init=False)
+    _level2_update_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _bbo_state_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _canonical_accumulator: CanonicalReplayAccumulator = field(init=False)
 
     def __post_init__(self) -> None:
         if self.sleep_fn is None:
             self.sleep_fn = time.sleep
+        if self.flush_row_threshold < 1:
+            raise ValueError("flush_row_threshold must be >= 1")
+        if not math.isfinite(self.flush_interval_seconds) or self.flush_interval_seconds <= 0:
+            raise ValueError("flush_interval_seconds must be > 0")
         self.raw_segment_writer.bind_session(self.service.session_id)
         self.service.on_reconnect_frame = self._record_frame
+        self._canonical_accumulator = CanonicalReplayAccumulator(
+            frames_factory=self._iter_sealed_frames,
+            product_id=self.service.config.product_id,
+            session_id=self.service.session_id,
+            heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
+            connections_factory=self._connections,
+        )
+
+    def _iter_sealed_frames(self):
+        for frame in self.raw_segment_writer.iter_sealed_frames():
+            yield frame.raw_bytes, frame.connection_id, frame.frame_index, frame.ingest_time_utc
+
+    def _connections(self) -> list[Any]:
+        connections = [*self.service.connection_history]
+        if self.service.connection is not None:
+            connections.append(self.service.connection)
+        return connections
 
     def _record_frame(self, frame: Any) -> int:
         connection_id = self.service.connection.connection_id if self.service.connection else None
@@ -99,6 +128,7 @@ class WebSocketCollector:
             raw=frame.raw_bytes, message_type=message_type, connection_id=connection_id,
             sequence_num=sequence_num, ingest_time_utc=frame.received_at_utc,
         )
+        self._canonical_accumulator.consume(frame.raw_bytes, connection_id, frame_index)
         self._frame_count += 1
         return frame_index
 
@@ -111,6 +141,7 @@ class WebSocketCollector:
     ) -> CollectorResult:
         started_at = self.service._utcnow()
         start_monotonic = self.service.monotonic_fn()
+        self._checkpoint_started_monotonic = start_monotonic
         message_count = 0
         termination_reason = "requested_stop"
         try:
@@ -126,6 +157,7 @@ class WebSocketCollector:
                 if stop_fn is not None and stop_fn():
                     termination_reason = "requested_stop"
                     break
+                self._maybe_flush_normalized_checkpoint()
                 try:
                     frame = self.service.client.receive_message()
                 except TimeoutError:
@@ -149,6 +181,7 @@ class WebSocketCollector:
                     if frame.parse_error:
                         self.service.record_malformed_frame(frame.raw_bytes)
                 message_count += 1
+                self._maybe_flush_normalized_checkpoint()
         except KeyboardInterrupt:
             termination_reason = "keyboard_interrupt"
         except ReconnectExhaustedError:
@@ -171,6 +204,7 @@ class WebSocketCollector:
             self.service.on_reconnect_frame = None
 
     def _reconnect(self) -> None:
+        self._flush_normalized_checkpoint()
         self.raw_segment_writer.seal()
         self.service.reconnect()
         self.connection_count += 1
@@ -188,54 +222,47 @@ class WebSocketCollector:
             timestamp_field=timestamp_field,
         )
 
+    def _maybe_flush_normalized_checkpoint(self) -> None:
+        pending_rows = len(self.service.level2_update_rows) + len(self.service.bbo_state_rows)
+        elapsed = self.service.monotonic_fn() - self._checkpoint_started_monotonic
+        if pending_rows >= self.flush_row_threshold or elapsed >= self.flush_interval_seconds:
+            self._flush_normalized_checkpoint()
+
+    def _flush_normalized_checkpoint(self) -> None:
+        level2_rows = self.service.drain_level2_update_rows()
+        bbo_rows = self.service.drain_bbo_state_rows()
+        self.service.drain_observations()
+        try:
+            level2_artifacts = self._write_artifacts(
+                rows=level2_rows,
+                data_kind=DATA_KIND_LEVEL2_UPDATES,
+                schema_version=FORWARD_LEVEL2_UPDATES_SCHEMA_VERSION,
+                timestamp_field="event_time_utc",
+            )
+            bbo_artifacts = self._write_artifacts(
+                rows=bbo_rows,
+                data_kind=DATA_KIND_BBO_STATE,
+                schema_version=FORWARD_BBO_STATE_SCHEMA_VERSION,
+                timestamp_field="state_time_utc",
+            )
+        except BaseException:
+            self.service.level2_update_rows = level2_rows + self.service.level2_update_rows
+            self.service.bbo_state_rows = bbo_rows + self.service.bbo_state_rows
+            raise
+        self._level2_update_row_count += len(level2_rows)
+        self._bbo_state_row_count += len(bbo_rows)
+        self._level2_update_artifacts.extend(level2_artifacts)
+        self._bbo_state_artifacts.extend(bbo_artifacts)
+        self._checkpoint_started_monotonic = self.service.monotonic_fn()
+
     def _finalize(self, *, started_at: datetime, completed_at: datetime, termination_reason: str) -> CollectorResult:
         self.service.drain_observations()
-        raw_frames = [
-            (raw, frame["connection_id"], frame["frame_index"])
-            for segment in self.raw_segment_writer.sealed_segments
-            for raw, frame in zip(
-                self.raw_segment_writer.read_segment_frames(segment["path"]), segment["frames"], strict=True,
-            )
-        ]
-        source_samples: list[tuple[datetime, datetime]] = []
-        for segment in self.raw_segment_writer.sealed_segments:
-            for raw, metadata in zip(
-                self.raw_segment_writer.read_segment_frames(segment["path"]), segment["frames"], strict=True,
-            ):
-                try:
-                    event = parse_coinbase_ws_message(raw)
-                except (ValueError, UnicodeError):
-                    continue
-                kind = event.get("type")
-                if kind not in {"snapshot", "l2_data", "heartbeat"}:
-                    continue
-                source_time = (
-                    event.get("time_utc") if kind == "heartbeat" else
-                    event.get("envelope_time_utc") if kind == "snapshot" else
-                    event.get("event_time_utc")
-                )
-                if source_time is not None:
-                    source_samples.append((
-                        source_time,
-                        datetime.fromisoformat(metadata["ingest_time_utc"].replace("Z", "+00:00")),
-                    ))
-        if source_samples:
-            first_source, first_ingest = source_samples[0]
-            last_source, last_ingest = source_samples[-1]
-            source_start = first_source - max(timedelta(0), first_ingest - started_at)
-            source_end = last_source + max(timedelta(0), completed_at - last_ingest)
-        else:
-            source_start, source_end = started_at, completed_at
-        connections = [*self.service.connection_history]
-        if self.service.connection is not None:
-            connections.append(self.service.connection)
+        connections = self._connections()
         self.connection_count = len(connections)
         self.reconnect_count = max(0, self.connection_count - 1)
-        observations = replay_recorded_frames(
-            raw_frames, product_id=self.service.config.product_id, session_id=self.service.session_id,
-            heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
-            connections=connections,
-            session_started_at_utc=source_start, session_completed_at_utc=source_end,
+        observations = self._canonical_accumulator.finalize(
+            session_started_at_utc=started_at,
+            session_completed_at_utc=completed_at,
             derived_at_utc=completed_at,
         )
         bbo_rows = [_observation_row(observation) for observation in observations]
@@ -244,27 +271,25 @@ class WebSocketCollector:
             timestamp_field="boundary_time_utc",
         )
 
-        level2_update_rows = self.service.drain_level2_update_rows()
-        level2_update_artifacts = self._write_artifacts(
-            rows=level2_update_rows,
-            data_kind=DATA_KIND_LEVEL2_UPDATES,
-            schema_version=FORWARD_LEVEL2_UPDATES_SCHEMA_VERSION,
-            timestamp_field="event_time_utc",
-        )
-
-        bbo_state_rows = self.service.drain_bbo_state_rows()
-        bbo_state_artifacts = self._write_artifacts(
-            rows=bbo_state_rows, data_kind=DATA_KIND_BBO_STATE, schema_version=FORWARD_BBO_STATE_SCHEMA_VERSION,
-            timestamp_field="state_time_utc",
-        )
+        self._flush_normalized_checkpoint()
+        level2_update_artifacts = self._level2_update_artifacts
+        bbo_state_artifacts = self._bbo_state_artifacts
 
         normalized_artifacts = [*bbo_artifacts, *level2_update_artifacts, *bbo_state_artifacts]
         eligible_count = sum(1 for observation in observations if observation.canonical_target_eligible)
+        level2_message_count = sum(c.level2_messages_received for c in connections)
+        heartbeat_message_count = sum(c.heartbeat_messages_received for c in connections)
         coverage = {
             "observation_count": len(observations),
             "eligible_observation_count": eligible_count,
-            "level2_update_row_count": len(level2_update_rows),
-            "bbo_state_row_count": len(bbo_state_rows),
+            "level2_update_row_count": self._level2_update_row_count,
+            "normalized_l2_rows": self._level2_update_row_count,
+            "bbo_state_row_count": self._bbo_state_row_count,
+            "bbo_state_rows": self._bbo_state_row_count,
+            "boundary_rows": len(observations),
+            "raw_frame_count": self._frame_count,
+            "level2_message_count": level2_message_count,
+            "heartbeat_message_count": heartbeat_message_count,
             "connection_count": self.connection_count,
             "reconnect_count": self.reconnect_count,
             "first_observation_utc": (
@@ -324,14 +349,14 @@ class WebSocketCollector:
             bbo_normalized_artifacts=bbo_artifacts,
             level2_update_artifacts=level2_update_artifacts,
             bbo_state_artifacts=bbo_state_artifacts,
-            level2_update_row_count=len(level2_update_rows),
-            bbo_state_row_count=len(bbo_state_rows),
+            level2_update_row_count=self._level2_update_row_count,
+            bbo_state_row_count=self._bbo_state_row_count,
             connection_count=self.connection_count,
             reconnect_count=self.reconnect_count,
             termination_reason=termination_reason,
             raw_frame_count=self._frame_count,
-            level2_message_count=sum(c.level2_messages_received for c in connections),
-            heartbeat_message_count=sum(c.heartbeat_messages_received for c in connections),
+            level2_message_count=level2_message_count,
+            heartbeat_message_count=heartbeat_message_count,
         )
 
 

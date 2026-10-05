@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from btc_quarter_hour_engine.storage.forward_schema import (
@@ -35,6 +36,14 @@ class _BufferedFrame:
             "raw_frame_sha256": self.raw_frame_sha256,
             "message_type": self.message_type,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SealedRawFrame:
+    raw_bytes: bytes
+    connection_id: str | None
+    frame_index: int
+    ingest_time_utc: datetime
 
 
 class RawSegmentWriter:
@@ -171,6 +180,7 @@ class RawSegmentWriter:
         )
         record = {
             "path": str(artifact.path),
+            "metadata_path": str(artifact.metadata_path),
             "sha256": artifact.sha256,
             "byte_count": artifact.byte_count,
             "session_id": self.session_id,
@@ -178,7 +188,6 @@ class RawSegmentWriter:
             "segment_index": self._segment_index,
             "raw_segment_schema_version": COINBASE_WS_RAW_SEGMENT_SCHEMA_VERSION,
             "frame_count": len(frames),
-            "frames": frame_provenance,
             "first_sequence_num": sequence_nums[0] if sequence_nums else None,
             "last_sequence_num": sequence_nums[-1] if sequence_nums else None,
             "first_ingest_time_utc": first.ingest_time_utc.isoformat().replace("+00:00", "Z"),
@@ -198,19 +207,56 @@ class RawSegmentWriter:
 
     def read_segment_frames(self, path: str | Path) -> list[bytes]:
         """Split a sealed segment into its exact original frame bytes."""
-        payload = self.raw_store.read_response(path)
-        frames: list[bytes] = []
+        return list(self.iter_segment_frames(path))
+
+    def iter_segment_frames(self, path: str | Path) -> Iterator[bytes]:
+        """Yield exact frames from one sealed segment in recorded order."""
         offset = 0
-        while offset < len(payload):
-            if offset + 8 > len(payload):
-                raise ValueError(f"Corrupt sealed segment framing at offset {offset}: {path}")
-            length = int.from_bytes(payload[offset : offset + 8], "big", signed=False)
-            offset += 8
-            if offset + length > len(payload):
-                raise ValueError(f"Corrupt sealed segment framing at offset {offset}: {path}")
-            frames.append(payload[offset : offset + length])
-            offset += length
-        return frames
+        with gzip.open(path, "rb") as handle:
+            while True:
+                header = handle.read(8)
+                if not header:
+                    return
+                if len(header) != 8:
+                    raise ValueError(f"Corrupt sealed segment framing at offset {offset}: {path}")
+                length = int.from_bytes(header, "big", signed=False)
+                offset += 8
+                frame = handle.read(length)
+                if len(frame) != length:
+                    raise ValueError(f"Corrupt sealed segment framing at offset {offset}: {path}")
+                yield frame
+                offset += length
+
+    def iter_sealed_frames(self) -> Iterator[SealedRawFrame]:
+        """Yield sealed frames with durable provenance in original delivery order."""
+        for segment in sorted(self.sealed_segments, key=lambda item: item["segment_index"]):
+            metadata_path = Path(segment["metadata_path"])
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            request = metadata.get("request_metadata")
+            provenance = request.get("frames") if isinstance(request, dict) else None
+            if not isinstance(provenance, list):
+                raise ValueError(f"Raw segment metadata has no frame provenance: {metadata_path}")
+            count = 0
+            for raw_bytes, frame in zip(
+                self.iter_segment_frames(segment["path"]), provenance, strict=True,
+            ):
+                try:
+                    ingest_time = datetime.fromisoformat(frame["ingest_time_utc"].replace("Z", "+00:00"))
+                    frame_index = int(frame["frame_index"])
+                    connection_id = frame["connection_id"]
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid frame provenance in {metadata_path}") from exc
+                if ingest_time.tzinfo is None or ingest_time.utcoffset() is None:
+                    raise ValueError(f"Naive ingest timestamp in {metadata_path}")
+                yield SealedRawFrame(
+                    raw_bytes=raw_bytes,
+                    connection_id=connection_id,
+                    frame_index=frame_index,
+                    ingest_time_utc=ingest_time.astimezone(timezone.utc),
+                )
+                count += 1
+            if count != segment["frame_count"]:
+                raise ValueError(f"Raw segment frame count mismatch: {segment['path']}")
 
 
 __all__ = ["RawSegmentWriter"]

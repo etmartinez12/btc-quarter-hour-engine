@@ -13,6 +13,7 @@ from btc_quarter_hour_engine.market_data.boundary_observations import (
 from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook
 from btc_quarter_hour_engine.market_data.replay import (
     BoundaryEventProcessor,
+    CanonicalReplayAccumulator,
     floor_to_quarter_hour,
     process_parsed_event,
     replay_recorded_frames,
@@ -675,3 +676,80 @@ def test_canonical_timestamps_reject_naive_datetimes():
         derive_quarter_hour_observation(book=Level2OrderBook(product_id="BTC-USD"), timestamp_utc=naive)
     with pytest.raises(ValueError, match="timezone-aware"):
         _replay([], session_started_at_utc=naive)
+
+
+def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edge_cases():
+    base = [
+        _snapshot(),
+        _heartbeat(),
+        _update(3, ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1)),
+        _update(4, ("bid", "2024-01-01T13:14:59.950Z", 100.5, 1)),
+    ]
+    straddling = [
+        _snapshot(),
+        _heartbeat(),
+        _update(
+            3,
+            ("bid", "2024-01-01T13:14:59.900Z", 100.5, 1),
+            ("offer", "2024-01-01T13:15:00.100Z", 101.5, 1),
+        ),
+    ]
+    exact_boundary = [
+        _snapshot(),
+        _heartbeat(),
+        _update(3, ("bid", "2024-01-01T13:15:00Z", 100.5, 1)),
+        _update(4, ("offer", "2024-01-01T13:15:00.000001Z", 101.5, 1)),
+    ]
+    integrity_cases = [
+        [_snapshot(), _heartbeat(), _update(4, ("bid", "2024-01-01T13:14:59Z", 100.5, 1))],
+        [_snapshot(), _heartbeat(), b"malformed source frame"],
+        [_snapshot(), _heartbeat("2024-01-01T13:14:00Z"), _heartbeat("2024-01-01T13:15:01Z", sequence=3)],
+    ]
+    reconnect = [
+        (_snapshot(), "conn-1"),
+        (_heartbeat(), "conn-1"),
+        (_snapshot("2024-01-01T13:15:05Z"), "conn-2"),
+        (_heartbeat("2024-01-01T13:15:10Z", sequence=2), "conn-2"),
+    ]
+    scenarios = [
+        [(raw, "conn-1") for raw in base],
+        [(raw, "conn-1") for raw in straddling],
+        [(raw, "conn-1") for raw in exact_boundary],
+        *[[(raw, "conn-1") for raw in case] for case in integrity_cases],
+        reconnect,
+    ]
+
+    for scenario in scenarios:
+        recorded = [
+            (
+                raw if isinstance(raw, bytes) else raw.encode(),
+                connection_id,
+                frame_index,
+                _utc("2024-01-01T13:14:50Z") + timedelta(seconds=frame_index),
+            )
+            for frame_index, (raw, connection_id) in enumerate(scenario)
+        ]
+        connections = [{"connection_id": "conn-1"}, {"connection_id": "conn-2"}]
+        accumulator = CanonicalReplayAccumulator(
+            frames_factory=lambda rows=recorded: iter(rows),
+            product_id="BTC-USD",
+            session_id="session-1",
+            heartbeat_timeout_seconds=30,
+            connections_factory=lambda records=connections: records,
+        )
+        for raw, connection_id, frame_index, _ingest_time in recorded:
+            accumulator.consume(raw, connection_id, frame_index)
+        streamed = accumulator.finalize(
+            session_started_at_utc=None,
+            session_completed_at_utc=None,
+            derived_at_utc=_utc("2024-01-01T14:00:00Z"),
+        )
+        offline = replay_recorded_frames(
+            [(raw, connection_id, frame_index) for raw, connection_id, frame_index, _ in recorded],
+            product_id="BTC-USD",
+            session_id="session-1",
+            heartbeat_timeout_seconds=30,
+            connections=connections,
+            derived_at_utc=_utc("2024-01-01T14:00:00Z"),
+        )
+        assert streamed == offline

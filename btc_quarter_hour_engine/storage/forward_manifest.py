@@ -70,6 +70,27 @@ def build_forward_dataset_id(
     return hashlib.sha256(payload).hexdigest()
 
 
+def _raw_segment_summaries(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fields = (
+        "path",
+        "metadata_path",
+        "sha256",
+        "byte_count",
+        "session_id",
+        "connection_id",
+        "segment_index",
+        "raw_segment_schema_version",
+        "frame_count",
+        "first_sequence_num",
+        "last_sequence_num",
+        "first_ingest_time_utc",
+        "last_ingest_time_utc",
+        "first_received_at_utc",
+        "last_received_at_utc",
+    )
+    return [{key: segment[key] for key in fields if key in segment} for segment in segments]
+
+
 def _group_normalized_artifacts(
     artifacts: list[dict[str, Any]] | dict[str, Any] | None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -126,7 +147,7 @@ def build_forward_manifest(
     schema_version: str | None = None,
     purpose: str | None = None,
 ) -> dict[str, Any]:
-    segments = raw_segments if raw_segments is not None else (raw_artifacts or [])
+    segments = _raw_segment_summaries(raw_segments if raw_segments is not None else (raw_artifacts or []))
     resolved_session_id = (
         session_id
         if session_id is not None

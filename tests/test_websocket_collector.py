@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
+import threading
 
 import pandas as pd
 import pytest
 
 from btc_quarter_hour_engine.acquisition.coinbase_websocket import CoinbaseWebSocketClient, parse_coinbase_ws_message
 from btc_quarter_hour_engine.acquisition.collector import WebSocketCollector
+from btc_quarter_hour_engine.acquisition.cli import _sigterm_stop_handler
 from btc_quarter_hour_engine.acquisition.config import CoinbaseWebSocketConfig
 from btc_quarter_hour_engine.acquisition.websocket_service import CoinbaseWebSocketService
 from btc_quarter_hour_engine.market_data.replay import replay_events
@@ -166,6 +169,125 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert raw_writer.raw_store.verify_digest(segment["path"], segment["sha256"])
     frames = raw_writer.read_segment_frames(segment["path"])
     assert [f.decode("utf-8") for f in frames] == messages
+
+
+def test_small_row_threshold_checkpoints_without_reconnect_and_preserves_all_rows(tmp_path, monkeypatch):
+    updates = [
+        _update(sequence, f"2024-01-01T00:15:{second:02d}Z", "bid", 100 + second / 10, 1)
+        for sequence, second in enumerate(range(3, 11), start=3)
+    ]
+    messages = [_snapshot(1, "2024-01-01T00:14:50Z"), _heartbeat(2, "2024-01-01T00:14:55Z"), *updates]
+    collector, service, transport, _ = _build_collector(tmp_path, messages)
+    collector.flush_row_threshold = 5
+    max_buffered = {"rows": 0}
+    maybe_flush = WebSocketCollector._maybe_flush_normalized_checkpoint
+
+    def track_and_flush(self):
+        max_buffered["rows"] = max(
+            max_buffered["rows"],
+            len(self.service.level2_update_rows) + len(self.service.bbo_state_rows),
+        )
+        maybe_flush(self)
+
+    monkeypatch.setattr(WebSocketCollector, "_maybe_flush_normalized_checkpoint", track_and_flush)
+    result = collector.run(max_messages=len(messages))
+
+    assert len(result.level2_update_artifacts) > 1
+    assert len(result.bbo_state_artifacts) > 1
+    assert transport.connect_count == result.connection_count == 1
+    assert result.reconnect_count == 0
+    assert result.level2_update_row_count == 2 + len(updates)
+    assert result.bbo_state_row_count == 1 + len(updates)
+    assert service.level2_update_rows == []
+    assert service.bbo_state_rows == []
+    assert service.observations == []
+    assert max_buffered["rows"] <= collector.flush_row_threshold + 2
+
+    l2 = pd.concat([pd.read_parquet(item["path"]) for item in result.level2_update_artifacts], ignore_index=True)
+    assert len(l2) == 2 + len(updates)
+    assert l2["session_id"].nunique() == 1
+    assert l2["session_id"].iloc[0] == service.session_id
+    assert l2["frame_index"].min() == 0
+    assert l2["frame_index"].max() == len(messages) - 1
+    assert len(l2.drop_duplicates(["frame_index", "side", "price"])) == len(l2)
+
+    states = pd.concat([pd.read_parquet(item["path"]) for item in result.bbo_state_artifacts], ignore_index=True)
+    assert len(states) == 1 + len(updates)
+    assert states["frame_index"].tolist() == [0, *range(2, len(messages))]
+    assert result.manifest["coverage"]["normalized_l2_rows"] == result.level2_update_row_count
+    assert result.manifest["coverage"]["bbo_state_rows"] == result.bbo_state_row_count
+
+
+def test_time_threshold_checkpoints_rows_below_count_limit(tmp_path):
+    updates = [
+        _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 1),
+        _update(4, "2024-01-01T00:15:02Z", "ask", 101.5, 1),
+    ]
+    collector, service, transport, _ = _build_collector(
+        tmp_path,
+        [_snapshot(1, "2024-01-01T00:14:50Z"), _heartbeat(2, "2024-01-01T00:14:55Z"), *updates],
+    )
+    ticks = {"now": 0.0}
+    service.monotonic_fn = lambda: ticks["now"]
+    original_recv = transport.recv
+
+    def advancing_recv(timeout=None):
+        result = original_recv(timeout)
+        ticks["now"] += 5.0
+        return result
+
+    transport.recv = advancing_recv
+    collector.flush_row_threshold = 1000
+    collector.flush_interval_seconds = 2.0
+    result = collector.run(max_messages=4)
+    assert len(result.level2_update_artifacts) > 1
+    assert transport.connect_count == 1
+    assert result.level2_update_row_count == 4
+    assert result.bbo_state_row_count == 3
+
+
+def test_final_checkpoint_flushes_below_threshold_and_requested_stop_is_clean(tmp_path):
+    collector, service, transport, writer = _build_collector(
+        tmp_path,
+        [_snapshot(1, "2024-01-01T00:14:50Z"), _heartbeat(2, "2024-01-01T00:14:55Z")],
+    )
+    collector.flush_row_threshold = 1000
+    result = collector.run(stop_fn=lambda: not transport.messages)
+    assert result.termination_reason == "requested_stop"
+    assert transport.close_count == 1
+    assert writer.pending_frame_count == 0
+    assert result.level2_update_row_count == 2
+    assert result.bbo_state_row_count == 1
+    assert result.manifest_path.exists()
+    assert service.level2_update_rows == []
+
+
+def test_sigterm_handler_only_sets_the_stop_event():
+    stop_event = threading.Event()
+    handler = _sigterm_stop_handler(stop_event)
+    handler(15, None)
+    assert stop_event.is_set()
+
+
+def test_checkpoint_failure_restores_drained_rows_and_never_writes_manifest(tmp_path):
+    collector, service, _, writer = _build_collector(
+        tmp_path,
+        [_snapshot(1, "2024-01-01T00:14:50Z")],
+    )
+    collector.flush_row_threshold = 1
+
+    class FailingStore:
+        def write_rows(self, **_kwargs):
+            raise OSError("checkpoint failed")
+
+    collector.forward_store = FailingStore()
+    with pytest.raises(OSError, match="checkpoint failed"):
+        collector.run(max_messages=1)
+
+    assert len(service.level2_update_rows) == 2
+    assert len(service.bbo_state_rows) == 1
+    assert writer.active_partial_path.exists()
+    assert not list((tmp_path / "manifests").rglob("*.json")) if (tmp_path / "manifests").exists() else True
 
 
 def test_collector_receive_path_does_not_materialize_full_book(tmp_path, monkeypatch):
@@ -490,7 +612,8 @@ def test_binary_transport_bytes_survive_final_raw_segment(tmp_path):
     collector, _, _, writer = _build_collector(tmp_path, [payload])
     result = collector.run(max_messages=1)
     assert writer.read_segment_frames(result.raw_segments[0]["path"]) == [payload]
-    assert result.raw_segments[0]["frames"][0]["raw_frame_sha256"]
+    sidecar = json.loads(Path(result.raw_segments[0]["metadata_path"]).read_text())
+    assert sidecar["request_metadata"]["frames"][0]["raw_frame_sha256"]
 
 
 def test_unexpected_failure_leaves_durable_partial_without_success_manifest(tmp_path):
@@ -552,7 +675,8 @@ def test_reconnect_frames_are_recorded_with_new_epoch_and_row_provenance(tmp_pat
     assert result.raw_frame_count == 5
     assert len(result.raw_segments) == 2
     assert result.raw_segments[0]["connection_id"] != result.raw_segments[1]["connection_id"]
-    assert result.raw_segments[1]["frames"][0]["frame_index"] == 2
+    second_sidecar = json.loads(Path(result.raw_segments[1]["metadata_path"]).read_text())
+    assert second_sidecar["request_metadata"]["frames"][0]["frame_index"] == 2
     updates = pd.concat([pd.read_parquet(item["path"]) for item in result.level2_update_artifacts])
     assert updates["frame_index"].notna().all()
     assert set(updates["connection_id"]) == {c.connection_id for c in [*service.connection_history, service.connection]}
