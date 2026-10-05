@@ -739,6 +739,8 @@ def test_bounded_streaming_accumulator_matches_offline_replay_for_scientific_edg
         )
         for raw, connection_id, frame_index, _ingest_time in recorded:
             accumulator.consume(raw, connection_id, frame_index)
+        assert accumulator.frame_count == len(recorded)
+        assert not hasattr(accumulator, "frames")
         streamed = accumulator.finalize(
             session_started_at_utc=None,
             session_completed_at_utc=None,

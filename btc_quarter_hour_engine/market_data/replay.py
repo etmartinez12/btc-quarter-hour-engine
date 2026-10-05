@@ -776,8 +776,20 @@ def replay_recorded_frames_bounded(
 
 
 @dataclass(slots=True)
+class _CanonicalIngestState:
+    sequence: int | None = None
+    invalid: bool = False
+    wire_book: Level2OrderBook = field(default_factory=Level2OrderBook)
+
+
+@dataclass(slots=True)
 class CanonicalReplayAccumulator:
-    """Bounded-memory canonical finalizer backed by durable raw segment iteration."""
+    """Consume raw frames incrementally and finalize by bounded durable replay.
+
+    Only the latest per-connection sequence/integrity/book state is retained.
+    Boundary candidates are computed from immutable raw segments at shutdown
+    so late source-time inversions and future-envelope blockers remain exact.
+    """
 
     frames_factory: Callable[[], Iterable[tuple[bytes, str, int, datetime]]]
     product_id: str
@@ -786,14 +798,51 @@ class CanonicalReplayAccumulator:
     connections_factory: Callable[[], Iterable[Any]]
     frame_count: int = 0
     connection_ids: set[str | None] = field(default_factory=set)
+    _ingest_states: dict[str | None, _CanonicalIngestState] = field(default_factory=dict, init=False)
 
     def consume(self, raw: bytes, connection_id: str | None, frame_index: int) -> None:
         if not isinstance(raw, bytes):
             raise TypeError("Recorded frames must retain their original bytes")
         if frame_index < 0:
             raise ValueError("frame_index must be nonnegative")
+        from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
+
+        state = self._ingest_states.setdefault(
+            connection_id,
+            _CanonicalIngestState(wire_book=Level2OrderBook(product_id=self.product_id)),
+        )
         self.frame_count += 1
         self.connection_ids.add(connection_id)
+        try:
+            event = parse_coinbase_ws_message(raw)
+        except (ValueError, UnicodeError):
+            state.invalid = True
+            return
+        sequence_num = event["envelope"].sequence_num
+        if state.sequence is not None and sequence_num <= state.sequence:
+            return
+        if state.sequence is not None and sequence_num > state.sequence + 1:
+            state.sequence = sequence_num
+            state.invalid = True
+            return
+        state.sequence = sequence_num
+        if state.invalid or event.get("type") not in {"snapshot", "l2_data"}:
+            return
+        if event.get("product_id") != self.product_id:
+            return
+        try:
+            if event["type"] == "snapshot":
+                state.wire_book.apply_snapshot(
+                    product_id=self.product_id,
+                    levels={
+                        "bid": [update for update in event["updates"] if update["side"] == "bid"],
+                        "ask": [update for update in event["updates"] if update["side"] == "ask"],
+                    },
+                )
+            elif state.wire_book.is_synced():
+                state.wire_book.apply_updates(event["updates"])
+        except (ValueError, KeyError, TypeError):
+            state.invalid = True
 
     def finalize(
         self,
