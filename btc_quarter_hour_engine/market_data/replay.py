@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .boundary_observations import QuarterHourObservation, derive_quarter_hour_observation, require_utc
-from .order_book import Level2OrderBook, OrderBookState
+from .order_book import Level2OrderBook
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -121,42 +121,6 @@ def _connection_field(connection: Any, name: str) -> Any:
     return connection.get(name) if isinstance(connection, Mapping) else getattr(connection, name, None)
 
 
-def _apply_replay_updates_without_integrity_commit(
-    bids: dict[float, float],
-    asks: dict[float, float],
-    updates: Iterable[Mapping[str, Any]],
-) -> None:
-    """Apply parsed mutations without validating an event-time subgroup."""
-    for update in updates:
-        side = update.get("side")
-        if side == "bid":
-            levels = bids
-        elif side == "ask":
-            levels = asks
-        else:
-            raise ValueError(f"Unsupported replay side: {side!r}")
-        price = update["price"]
-        quantity = update["quantity"]
-        if quantity == 0:
-            levels.pop(price, None)
-        else:
-            levels[price] = quantity
-
-
-def _set_boundary_book_integrity(book: Level2OrderBook, *, has_snapshot: bool) -> None:
-    """Commit only the candidate's integrity at the boundary, not mid-envelope."""
-    if not has_snapshot:
-        return
-    if not book.bids or not book.asks:
-        book.invalidate("Order book requires both bid and ask sides")
-        return
-    if max(book.bids) > min(book.asks):
-        book.invalidate("Crossed book: best_bid exceeds best_ask")
-        return
-    book.state = OrderBookState.SYNCED
-    book.last_error = None
-
-
 def _envelope_integrity_reason(
     bids: Mapping[float, float],
     asks: Mapping[float, float],
@@ -171,6 +135,14 @@ def _envelope_integrity_reason(
     return "malformed_source_state"
 
 
+@dataclass(slots=True)
+class _ReplayL2Envelope:
+    effective_time_utc: datetime
+    kind: str
+    updates: list[Mapping[str, Any]]
+    sequence_num: int
+
+
 def replay_recorded_frames(
     frames: Iterable[tuple[bytes, str, int]],
     *,
@@ -182,11 +154,18 @@ def replay_recorded_frames(
     session_completed_at_utc: datetime | None = None,
     derived_at_utc: datetime | None = None,
 ) -> list[QuarterHourObservation]:
-    """Finalize raw frames: validate envelope sequences in delivery order, then replay source-time mutations.
+    """Finalize raw frames using connection delivery order for causal L2 state.
 
     Connection diagnostics may be mappings or objects with ``connection_id``,
     ``connected_at_utc`` and ``disconnected_at_utc`` attributes. A missing
     disconnect is bounded by the next connection's start when known.
+
+    Complete L2 envelopes are atomic. Their effective source time is the
+    normalized event time (the maximum update time for incremental envelopes),
+    but per-update times never reorder mutations across envelopes. At each
+    boundary, replay commits the longest delivery-ordered prefix with
+    effective times at or before that boundary; a future envelope blocks all
+    later envelopes from leapfrogging it.
     """
     from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
 
@@ -197,8 +176,7 @@ def replay_recorded_frames(
     if start is not None and end is not None and end < start:
         raise ValueError("Session completion precedes session start")
 
-    # Validate envelopes in recorded delivery order before sorting their
-    # mutations by source time for boundary reconstruction.
+    # Preserve recorded delivery order independently for each connection.
     deliveries: dict[str, list[tuple[int, int, bytes]]] = {}
     for arrival, (raw, connection_id, frame_index) in enumerate(frames):
         if not isinstance(raw, bytes):
@@ -209,14 +187,17 @@ def replay_recorded_frames(
         _connection_field(c, "connection_id"): c for c in (connections or ())
     }
     ids = list(dict.fromkeys([*metadata, *deliveries]))
-    timeline: dict[str, list[tuple[datetime, int, int, str, Any, int | None]]] = {}
+    controls: dict[str, list[tuple[datetime, int, str, Any, int | None]]] = {}
+    l2_envelopes: dict[str, list[_ReplayL2Envelope]] = {}
     bounds: dict[str, tuple[datetime | None, datetime | None]] = {}
+    source_end_times: dict[str, datetime | None] = {}
     observed_times: list[datetime] = []
     for connection_id in ids:
         sequence: int | None = None
         invalid = False
         wire_book = Level2OrderBook(product_id=product_id)
-        actions: list[tuple[datetime, int, int, str, Any, int | None]] = []
+        connection_controls: list[tuple[datetime, int, str, Any, int | None]] = []
+        connection_l2: list[_ReplayL2Envelope] = []
         first_time: datetime | None = None
         last_time: datetime | None = None
         for _frame_index, arrival, raw in deliveries.get(connection_id, []):
@@ -225,7 +206,7 @@ def replay_recorded_frames(
             except (ValueError, UnicodeError):
                 invalid = True
                 if last_time is not None:
-                    actions.append((last_time, arrival, 0, "malformed", None, sequence))
+                    connection_controls.append((last_time, arrival, "malformed", None, sequence))
                 continue
             kind = event.get("type")
             envelope = event["envelope"]
@@ -238,15 +219,23 @@ def replay_recorded_frames(
             if sequence is not None and current > sequence + 1:
                 gap_time = envelope_time
                 if kind == "snapshot":
-                    gap_time = envelope_time or require_utc(event["event_time_utc"])
+                    gap_time = require_utc(event["event_time_utc"])
                 elif kind == "heartbeat":
                     gap_time = require_utc(event["time_utc"])
                 elif kind == "l2_data":
-                    times = [require_utc(u.get("event_time_utc") or envelope_time) for u in event["updates"]]
-                    if times:
-                        gap_time = min(times)
+                    gap_time = require_utc(event["event_time_utc"])
+                    update_times = [
+                        require_utc(update.get("event_time_utc") or gap_time)
+                        for update in event["updates"]
+                    ]
+                    observed_times.extend(update_times)
+                    if update_times:
+                        first_time = min(first_time, *update_times) if first_time else min(update_times)
+                        last_time = max(last_time, *update_times) if last_time else max(update_times)
+                if gap_time is None:
+                    continue
                 invalid = True
-                actions.append((gap_time, arrival, 0, "gap", None, current))
+                connection_controls.append((gap_time, arrival, "gap", None, current))
                 observed_times.append(gap_time)
                 first_time = min(first_time, gap_time) if first_time else gap_time
                 last_time = max(last_time, gap_time) if last_time else gap_time
@@ -256,14 +245,18 @@ def replay_recorded_frames(
             if kind not in {"snapshot", "l2_data", "heartbeat"}:
                 continue
             if kind == "snapshot":
-                event_time = envelope_time or require_utc(event["event_time_utc"])
+                event_time = require_utc(event["event_time_utc"])
             elif kind == "heartbeat":
                 event_time = require_utc(event["time_utc"])
             else:
-                times = [require_utc(u.get("event_time_utc") or envelope_time) for u in event["updates"]]
-                event_time = min(times) if times else envelope_time
+                event_time = require_utc(event["event_time_utc"])
+                times = [
+                    require_utc(update.get("event_time_utc") or event_time)
+                    for update in event["updates"]
+                ]
                 observed_times.extend(times)
                 if times:
+                    first_time = min(first_time, *times) if first_time is not None else min(times)
                     last_time = max(last_time, *times) if last_time is not None else max(times)
             if event_time is None:
                 continue
@@ -272,70 +265,53 @@ def replay_recorded_frames(
             last_time = max(last_time, event_time) if last_time else event_time
             if kind == "heartbeat":
                 if not invalid:
-                    actions.append((event_time, arrival, 0, "heartbeat", None, None))
+                    connection_controls.append((event_time, arrival, "heartbeat", None, None))
                 continue
             if event["product_id"] != product_id:
                 continue
             if invalid:
                 continue
+            updates = event["updates"]
             if kind == "snapshot":
                 try:
                     wire_book.apply_snapshot(
                         product_id=product_id,
                         levels={
-                            "bid": [u for u in event["updates"] if u["side"] == "bid"],
-                            "ask": [u for u in event["updates"] if u["side"] == "ask"],
+                            "bid": [update for update in updates if update["side"] == "bid"],
+                            "ask": [update for update in updates if update["side"] == "ask"],
                         },
                     )
                 except (ValueError, KeyError, TypeError) as exc:
                     invalid = True
                     failure_reason = _envelope_integrity_reason(wire_book.bids, wire_book.asks, exc)
-                    actions.append((event_time, arrival, 0, "envelope_invalid", (failure_reason, str(exc)), current))
+                    connection_controls.append((
+                        event_time, arrival, "envelope_invalid", (failure_reason, str(exc)), current,
+                    ))
                 else:
-                    actions.append((event_time, arrival, 0, "snapshot", event["updates"], current))
+                    connection_l2.append(_ReplayL2Envelope(event_time, kind, updates, current))
             else:
-                update_batches: dict[datetime, tuple[int, list[Mapping[str, Any]]]] = {}
-                for offset, update in enumerate(event["updates"]):
-                    when = require_utc(update.get("event_time_utc") or envelope_time)
-                    if when not in update_batches:
-                        update_batches[when] = (offset, [])
-                    update_batches[when][1].append(update)
-                batch_actions = [
-                    (when, arrival, first_offset, "update_batch", batch, current)
-                    for when, (first_offset, batch) in update_batches.items()
-                ]
                 if wire_book.is_synced():
                     try:
-                        wire_book.apply_updates(event["updates"])
+                        wire_book.apply_updates(updates)
                     except (ValueError, KeyError, TypeError) as exc:
-                        # The complete envelope only becomes known invalid at its
-                        # latest source time; never move that knowledge backward.
-                        actions.extend(batch_actions)
                         invalid = True
-                        latest_time = max(update_batches, default=event_time)
-                        candidate_bids, candidate_asks = dict(wire_book.bids), dict(wire_book.asks)
-                        try:
-                            _apply_replay_updates_without_integrity_commit(
-                                candidate_bids, candidate_asks, event["updates"],
-                            )
-                        except (ValueError, KeyError, TypeError):
-                            pass
-                        failure_reason = _envelope_integrity_reason(candidate_bids, candidate_asks, exc)
-                        actions.append((
-                            latest_time, arrival, len(event["updates"]), "envelope_invalid",
-                            (failure_reason, str(exc)), current,
+                        failure_reason = _envelope_integrity_reason(wire_book.bids, wire_book.asks, exc)
+                        connection_controls.append((
+                            event_time, arrival, "envelope_invalid", (failure_reason, str(exc)), current,
                         ))
                     else:
-                        actions.extend(batch_actions)
+                        connection_l2.append(_ReplayL2Envelope(event_time, kind, updates, current))
                 else:
-                    actions.extend(batch_actions)
+                    connection_l2.append(_ReplayL2Envelope(event_time, kind, updates, current))
         meta = metadata.get(connection_id)
         # Connection diagnostics are wall-clock ingest times, not Coinbase
         # source times. Comparing them to event-time boundaries mixes clocks.
         disconnected = _connection_field(meta, "source_disconnected_at_utc")
         disconnected = require_utc(disconnected) if disconnected is not None else None
         bounds[connection_id] = (first_time, disconnected)
-        timeline[connection_id] = sorted(actions, key=lambda a: (a[0], a[1], a[2]))
+        source_end_times[connection_id] = last_time
+        controls[connection_id] = sorted(connection_controls, key=lambda action: (action[0], action[1]))
+        l2_envelopes[connection_id] = connection_l2
 
     if not observed_times and (start is None or end is None):
         return []
@@ -355,11 +331,10 @@ def replay_recorded_frames(
     # that instant. A disconnected interval cannot inherit its old book.
     ordered_ids = sorted(ids, key=lambda cid: (bounds[cid][0] or datetime.max.replace(tzinfo=timezone.utc), ids.index(cid)))
     for cid in ordered_ids[:-1]:
-        bounds[cid] = (bounds[cid][0], max(
-            (action[0] for action in timeline[cid]), default=bounds[cid][0],
-        ))
+        bounds[cid] = (bounds[cid][0], source_end_times[cid] or bounds[cid][0])
     books = {cid: Level2OrderBook(product_id=product_id) for cid in ids}
-    cursors = {cid: 0 for cid in ids}
+    control_cursors = {cid: 0 for cid in ids}
+    l2_cursors = {cid: 0 for cid in ids}
     heartbeats: dict[str, datetime | None] = {cid: None for cid in ids}
     state_times: dict[str, datetime | None] = {cid: None for cid in ids}
     state_sequences: dict[str, int | None] = {cid: None for cid in ids}
@@ -386,49 +361,54 @@ def replay_recorded_frames(
                 )
             )
         else:
-            actions = timeline[active]
             book = books[active]
-            while cursors[active] < len(actions) and actions[cursors[active]][0] <= boundary:
-                when, _, _, kind, payload, sequence = actions[cursors[active]]
-                cursors[active] += 1
-                if kind == "heartbeat":
-                    heartbeats[active] = when
-                    continue
-                if kind == "gap":
-                    book.invalidate("sequence gap")
-                    reasons[active] = "sequence_gap"
-                    state_times[active], state_sequences[active] = when, sequence
-                    continue
-                if kind == "malformed":
-                    book.invalidate("malformed_source_state")
-                    reasons[active] = "malformed_source_state"
-                    state_times[active], state_sequences[active] = when, sequence
-                    continue
-                if kind == "envelope_invalid":
-                    reasons[active], message = payload
-                    book.invalidate(message)
-                    state_times[active], state_sequences[active] = when, sequence
-                    continue
-                if reasons[active] is not None:
-                    continue
+            envelopes = l2_envelopes[active]
+            while (
+                reasons[active] is None
+                and l2_cursors[active] < len(envelopes)
+                and envelopes[l2_cursors[active]].effective_time_utc <= boundary
+            ):
+                envelope_action = envelopes[l2_cursors[active]]
+                l2_cursors[active] += 1
                 try:
-                    if kind == "snapshot":
+                    if envelope_action.kind == "snapshot":
                         book.apply_snapshot(
                             product_id=product_id,
-                            levels={"bid": [u for u in payload if u["side"] == "bid"],
-                                    "ask": [u for u in payload if u["side"] == "ask"]},
+                            levels={
+                                "bid": [update for update in envelope_action.updates if update["side"] == "bid"],
+                                "ask": [update for update in envelope_action.updates if update["side"] == "ask"],
+                            },
                         )
                         has_snapshot[active] = True
-                        state_times[active], state_sequences[active] = when, sequence
-                    elif kind == "update_batch" and has_snapshot[active]:
-                        _apply_replay_updates_without_integrity_commit(book.bids, book.asks, payload)
-                        state_times[active], state_sequences[active] = when, sequence
+                        state_times[active] = envelope_action.effective_time_utc
+                        state_sequences[active] = envelope_action.sequence_num
+                    elif has_snapshot[active]:
+                        book.apply_updates(envelope_action.updates)
+                        state_times[active] = envelope_action.effective_time_utc
+                        state_sequences[active] = envelope_action.sequence_num
                 except (ValueError, KeyError, TypeError) as exc:
+                    reasons[active] = _envelope_integrity_reason(book.bids, book.asks, exc)
                     book.invalidate(str(exc))
-                    reasons[active] = "malformed_source_state"
-                    state_times[active], state_sequences[active] = when, sequence
-            if reasons[active] is None:
-                _set_boundary_book_integrity(book, has_snapshot=has_snapshot[active])
+
+            connection_controls = controls[active]
+            while (
+                control_cursors[active] < len(connection_controls)
+                and connection_controls[control_cursors[active]][0] <= boundary
+            ):
+                when, _, kind, payload, _sequence = connection_controls[control_cursors[active]]
+                control_cursors[active] += 1
+                if kind == "heartbeat":
+                    heartbeats[active] = when
+                elif reasons[active] is None:
+                    if kind == "gap":
+                        reasons[active] = "sequence_gap"
+                        book.invalidate("sequence gap")
+                    elif kind == "malformed":
+                        reasons[active] = "malformed_source_state"
+                        book.invalidate("malformed_source_state")
+                    elif kind == "envelope_invalid":
+                        reasons[active], message = payload
+                        book.invalidate(message)
             result.append(
                 derive_quarter_hour_observation(
                     book=book, timestamp_utc=boundary, product_id=product_id,
