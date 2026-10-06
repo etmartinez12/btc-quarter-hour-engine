@@ -85,6 +85,9 @@ btc_quarter_hour_engine/
     websocket_raw.py exact-byte sealed raw websocket segment writer
     forward_parquet.py  normalized forward (websocket-derived) Parquet output
     forward_manifest.py forward acquisition manifest builder
+  research/
+    forward_dataset.py sealed-prefix canonical boundary and target extraction
+    cli.py           offline research dataset builder
   market_data/
     order_book.py    sequence-validated L2 order book
     replay.py        provisional live boundaries and canonical sealed-source replay
@@ -142,13 +145,13 @@ future WebSocket BBO observations:
 - `acquisition/coinbase_websocket.py` — explicit dataclasses (`CoinbaseMessageEnvelope`, `Level2Event`, `Level2UpdateEntry`, `HeartbeatEvent`) modeling the *real* Coinbase Advanced Trade websocket wire shape: one outer envelope (`channel`, `sequence_num`, `timestamp`, `events`) shared by every message, with `channel: "l2_data"` events carrying `type: "snapshot"|"update"` plus an `updates` array (`side: "bid"|"offer"`, `price_level`, `new_quantity`, `event_time`), and `channel: "heartbeats"` events carrying `current_time`/`heartbeat_counter`. Malformed frames never raise inside the receive path: `CoinbaseWebSocketClient.receive_message()` always returns a frame with the exact raw bytes, setting `message=None`/`parse_error=...` on a parse failure instead, so raw capture happens strictly *before* (and independent of) parsing.
 - `acquisition/websocket_transport.py` — concrete `WebsocketsTransport`, a thin wrapper over `websockets.sync.client.connect` (blocking, no asyncio required).
 - `market_data/order_book.py` — `Level2OrderBook`, a sequence-validated L2 book. `classify_sequence()`/`validate_sequence()` return a `SequenceDisposition` (`IN_ORDER` / `STALE` / `GAP`): a `STALE` (duplicate/redelivered) sequence number is dropped safely without raising or invalidating the book, while only a genuine `GAP` raises `SequenceGapError` and invalidates it — previously both were treated identically. `reset()` (in-band resnapshot, same connection, sequence continuity preserved) is distinct from `reset_for_new_connection()` (genuine reconnect; Coinbase sequence numbers are scoped per-connection, so the old connection's last sequence number must not be compared against the new one).
-- `market_data/replay.py` — live boundary processing is operational/provisional only. Finalization replays sealed raw frames through `replay_recorded_frames`: validate L2 envelope sequences in arrival order within each connection, reset the book on reconnect, and apply valid individual updates by their own source event times. Updates at the boundary are included; later updates are excluded, even when a pre-boundary mutation arrives after them.
+- `market_data/replay.py` — live boundary processing is operational/provisional only. Normal collector finalization uses the incremental `CanonicalReplayAccumulator`; `replay_recorded_frames()` remains the independent offline audit oracle. Both preserve sequence validation in delivery order, reconnect isolation, and causal treatment of source-time updates.
 - `acquisition/websocket_service.py` — `CoinbaseWebSocketService`: connection lifecycle, stale-vs-gap sequence handling, heartbeat-health tracking, and reconnect-with-wait-for-snapshot, all routed through the shared boundary processor above. `now_fn`/`monotonic_fn` are both injectable for fully deterministic tests. Every superseded connection's diagnostics are retained in `connection_history` (not overwritten) so past reconnects remain auditable. In addition to quarter-hour BBO observations, every applied book mutation is accumulated as a normalized `level2_update_rows` entry (one row per individual price-level change, full per-update event time) and a `bbo_state_rows` entry (the resulting best-bid/ask snapshot), drained via `drain_level2_update_rows()`/`drain_bbo_state_rows()`.
 - `storage/websocket_raw.py` — `RawSegmentWriter`: durably appends exact text or binary frame bytes to a `.partial` artifact (no re-serialization), then seals immutable, content-addressed, gzip-compressed segments with per-frame provenance. Unexpected failure retains the incomplete partial; it is not a sealed artifact or completed manifest.
 - `storage/forward_schema.py` — the single source of truth for every forward-collection `data_kind`/schema-version/source constant (`quarter_hour_bbo`, `level2_updates`, `bbo_state`, `websocket_segments`, `websocket_frames`), imported everywhere those values are needed instead of being hard-coded.
 - `storage/forward_parquet.py` — `ForwardParquetStore`: writes derived quarter-hour BBO, `level2_updates`, and `bbo_state` rows to dated, normalized Parquet partitions.
 - `storage/forward_manifest.py` — a dedicated forward-session manifest records connection diagnostics, integrity counters, boundary summary, raw and normalized artifacts, and a dataset ID derived from ordered sealed hashes and schema versions rather than completion time.
-- `acquisition/collector.py` — `WebSocketCollector` records every received raw frame before interpretation. Normal completion or Ctrl+C seals raw data, persists normalized L2/BBO rows, generates the **final canonical** quarter-hour ledger from sealed-source replay, and writes a session manifest. Unexpected failure closes the transport without claiming a completed session.
+- `acquisition/collector.py` — `WebSocketCollector` records every received raw frame before interpretation. Normal completion or Ctrl+C seals raw data, persists normalized L2/BBO rows, generates the **final canonical** quarter-hour ledger with the incremental accumulator, and writes a session manifest. Unexpected failure closes the transport without claiming a completed session.
 
 ### Eligibility rule
 
@@ -179,11 +182,26 @@ btc-qh-collect-coinbase-bbo \
 
 Omit `--max-messages`/`--max-duration-seconds` to run indefinitely (e.g. under a supervisor process); the collector reconnects automatically on connection errors, a genuine sequence gap, or a stale heartbeat, up to `CoinbaseWebSocketConfig.max_reconnect_attempts` (default: unlimited).
 
-On duration/explicit stop or Ctrl+C, the collector seals raw frames, writes normalized updates and operational BBO state, replays sealed frames to persist the final canonical boundary ledger, and writes a completed session manifest under `data_lake/manifests/forward_sessions/`. On unexpected failure, a durable `.partial` file remains and no completed-success manifest is written.
+On duration/explicit stop or Ctrl+C, the collector seals raw frames, writes normalized updates and operational BBO state, finalizes the canonical boundary ledger through the incremental accumulator, and writes a completed session manifest under `data_lake/manifests/forward_sessions/`. The offline `replay_recorded_frames()` path remains an audit oracle, not normal production finalization. On unexpected failure, a durable `.partial` file remains and no completed-success manifest is written.
 
 ### Raw segment layout and replay
 
-Sealed raw segments live under `data_lake/raw/coinbase_advanced/websocket_segments/BTC-USD/<sha256>.json.gz`, with 8-byte-length-prefixed exact original frame bytes, including binary and malformed frames. Segment metadata retains session, connection, frame index, sequence, ingest time and frame hash. `RawSegmentWriter.read_segment_frames(path)` recovers the byte strings. Final replay uses sequence validation in recorded arrival order, then event-time ordering of valid individual mutations; live output can differ under late arrival and is never the final scientific artifact.
+Sealed raw segments live under `data_lake/raw/coinbase_advanced/websocket_segments/BTC-USD/<sha256>.json.gz`, with 8-byte-length-prefixed exact original frame bytes, including binary and malformed frames. Segment metadata retains session, connection, frame index, sequence, ingest time and frame hash. `RawSegmentWriter.read_segment_frames(path)` recovers the byte strings. Normal collector finalization uses the incremental accumulator. `replay_recorded_frames()` is retained as the independent offline audit oracle; both preserve delivery-order sequence validation and causal event-time mutation semantics.
+
+## Forward Research Dataset Extraction
+
+Build an offline research snapshot from immutable sealed raw segments while the collector continues running:
+
+```bash
+btc-qh-build-forward-research-dataset \
+  --input-root /var/lib/btc-qh/data_lake_prod \
+  --output-root /var/lib/btc-qh/research \
+  --product BTC-USD
+```
+
+The production source is read-only. Discovery snapshots sealed segment metadata once; active `.partial` files are ignored and never opened. Each immutable dataset ID records its exact source hashes and extraction semantics in a self-contained manifest. The input is a `sealed_prefix_snapshot`, not necessarily a completed collector session: active and future frames are excluded, and a later snapshot may supersede it without changing the prior dataset.
+
+Canonical labels use only exact `t` and `t+15m` boundary rows, and require both boundaries to be eligible with finite positive midpoint prices. Missing boundaries are not bridged, flat moves remain unlabeled, and no candles, interpolation, nearest-time matching, or forward filling are used.
 
 Normalized output lives under `data_lake/normalized/coinbase_advanced/BTC-USD/<data_kind>/date=YYYY-MM-DD/part-<sha256>.parquet` for three `data_kind` values:
 
