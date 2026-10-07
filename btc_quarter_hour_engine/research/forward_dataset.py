@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -537,6 +538,27 @@ def _check_separate_output_root(input_root: Path, output_root: Path) -> None:
         raise ValueError("output_root must be separate from and outside input_root")
 
 
+def _logical_source_path(input_root: Path, source_path: Path) -> str:
+    root = input_root.resolve()
+    resolved_path = source_path.resolve()
+    try:
+        relative = resolved_path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Discovered source path escapes input_root: {source_path}"
+        ) from exc
+    return relative.as_posix()
+
+
+def _validate_source_paths(
+    input_root: Path,
+    segments: Sequence[DiscoveredRawSegment],
+) -> None:
+    for segment in segments:
+        _logical_source_path(input_root, segment.path)
+        _logical_source_path(input_root, segment.metadata_path)
+
+
 def _dataset_identity(
     *,
     source: str,
@@ -544,6 +566,7 @@ def _dataset_identity(
     segments: Sequence[DiscoveredRawSegment],
     heartbeat_timeout_seconds: float,
     git_sha: str,
+    active_partial_count_ignored: int,
 ) -> tuple[str, dict[str, Any]]:
     identity = {
         "dataset_schema_version": RESEARCH_DATASET_SCHEMA_VERSION,
@@ -555,6 +578,7 @@ def _dataset_identity(
                 "session_id": segment.session_id,
                 "segment_index": segment.segment_index,
                 "sha256": segment.sha256,
+                "metadata_sha256": segment.metadata_sha256,
                 "raw_segment_schema_version": segment.raw_segment_schema_version,
                 "provenance_sha256": segment.provenance_sha256,
             }
@@ -567,6 +591,7 @@ def _dataset_identity(
         "price_definition": "best_bid_ask_midpoint",
         "flat_move_policy": "unlabeled",
         "input_mode": RESEARCH_INPUT_MODE,
+        "active_partial_count_ignored": active_partial_count_ignored,
         "software_git_sha": git_sha,
     }
     serialized = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -584,6 +609,7 @@ def _build_manifest(
     active_partial_count_ignored: int,
     heartbeat_timeout_seconds: float,
     git_sha: str,
+    input_root: Path,
     boundary_artifact: dict[str, Any],
     target_artifact: dict[str, Any],
 ) -> dict[str, Any]:
@@ -633,6 +659,7 @@ def _build_manifest(
     try:
         package_version = version("btc-quarter-hour-engine")
     except PackageNotFoundError:
+        # The source checkout's declared project version is fixed in pyproject.toml.
         package_version = "0.1.0"
 
     return {
@@ -663,8 +690,8 @@ def _build_manifest(
                 "frame_count": segment.frame_count,
                 "first_ingest_time_utc": _iso(segment.first_ingest_time_utc),
                 "last_ingest_time_utc": _iso(segment.last_ingest_time_utc),
-                "path": str(segment.path),
-                "metadata_path": str(segment.metadata_path),
+                "path": _logical_source_path(input_root, segment.path),
+                "metadata_path": _logical_source_path(input_root, segment.metadata_path),
                 "byte_count": segment.byte_count,
                 "raw_segment_schema_version": segment.raw_segment_schema_version,
                 "provenance_sha256": segment.provenance_sha256,
@@ -716,7 +743,7 @@ def build_research_dataset(
     active_partial_count_ignored: int = 0,
     git_sha: str | None = None,
 ) -> ResearchDatasetResult:
-    """Build an immutable dataset from only the previously discovered segments."""
+    """Build from a fixed discovery snapshot; bare sequences supply no partial-file count."""
     input_path = Path(input_root)
     output_path = Path(output_root)
     if not input_path.is_dir():
@@ -728,8 +755,11 @@ def build_research_dataset(
         active_partial_count_ignored = discovered_segments.active_partial_count_ignored
     else:
         segments = tuple(discovered_segments)
+        # A bare sequence carries no discovery-time active-partial diagnostic.
+        active_partial_count_ignored = 0
     if not segments:
         raise ValueError("No sealed raw segments were discovered")
+    _validate_source_paths(input_path, segments)
     if any(segment.product_id != product_id for segment in segments):
         raise ValueError(f"Discovered segment product does not match requested product {product_id}")
     grouped = _group_and_validate_segments(segments)
@@ -739,10 +769,17 @@ def build_research_dataset(
     timeout = config.heartbeat_timeout_seconds
     if not math.isfinite(timeout) or timeout < 0:
         raise ValueError("Canonical heartbeat timeout must be finite and nonnegative")
-    resolved_git_sha = git_sha or _git_sha() or "unknown"
+    resolved_git_sha = git_sha if git_sha is not None else _git_sha()
+    if not isinstance(resolved_git_sha, str) or not resolved_git_sha.strip():
+        raise ValueError(
+            "Research dataset construction requires an explicit software Git SHA"
+        )
+    resolved_git_sha = resolved_git_sha.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40}", resolved_git_sha) is None:
+        raise ValueError("Software Git SHA must be a 40-character hexadecimal Git object ID")
+    resolved_git_sha = resolved_git_sha.lower()
 
     all_observations: list[QuarterHourObservation] = []
-    session_summaries: dict[str, tuple[datetime, datetime]] = {}
     total_frames = 0
     for session_id, session_segments in sorted(grouped.items()):
         accumulator = CanonicalReplayAccumulator(
@@ -765,7 +802,6 @@ def build_research_dataset(
                 total_frames += 1
         if first_ingest_time is None or last_ingest_time is None:
             raise ValueError(f"Session {session_id} has no frames in its sealed prefix")
-        session_summaries[session_id] = (first_ingest_time, last_ingest_time)
         all_observations.extend(
             accumulator.finalize(
                 session_started_at_utc=first_ingest_time,
@@ -797,6 +833,7 @@ def build_research_dataset(
         segments=ordered_segments,
         heartbeat_timeout_seconds=timeout,
         git_sha=resolved_git_sha,
+        active_partial_count_ignored=active_partial_count_ignored,
     )
 
     dataset_dir = output_path / "datasets" / dataset_id
@@ -821,6 +858,7 @@ def build_research_dataset(
         active_partial_count_ignored=active_partial_count_ignored,
         heartbeat_timeout_seconds=timeout,
         git_sha=resolved_git_sha,
+        input_root=input_path,
         boundary_artifact=boundary_artifact_record,
         target_artifact=target_artifact_record,
     )

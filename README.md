@@ -199,7 +199,7 @@ btc-qh-build-forward-research-dataset \
   --product BTC-USD
 ```
 
-The production source is read-only. Discovery snapshots sealed segment metadata once; active `.partial` files are ignored and never opened. Each immutable dataset ID records its exact source hashes and extraction semantics in a self-contained manifest. The input is a `sealed_prefix_snapshot`, not necessarily a completed collector session: active and future frames are excluded, and a later snapshot may supersede it without changing the prior dataset.
+The production source is read-only. Discovery snapshots sealed segment metadata once; active `.partial` files are ignored and never opened. Each immutable dataset ID binds the exact raw and metadata sidecar hashes, provenance, discovery-time partial count, configuration, and required software Git SHA. Its manifest uses logical source paths relative to `--input-root`, so equivalent snapshots remain portable across mount points. The input is a `sealed_prefix_snapshot`, not necessarily a completed collector session: active and future frames are excluded, and a later snapshot may supersede it without changing the prior dataset.
 
 Canonical labels use only exact `t` and `t+15m` boundary rows, and require both boundaries to be eligible with finite positive midpoint prices. Missing boundaries are not bridged, flat moves remain unlabeled, and no candles, interpolation, nearest-time matching, or forward filling are used.
 

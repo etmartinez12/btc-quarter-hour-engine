@@ -3,6 +3,8 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import shutil
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -15,6 +17,8 @@ from btc_quarter_hour_engine.research.forward_dataset import (
     discover_sealed_segments,
 )
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
+
+TEST_GIT_SHA = "a" * 40
 
 
 def _wire_frame(channel: str, timestamp: datetime, sequence: int, *, kind: str = "") -> bytes:
@@ -93,11 +97,12 @@ def _write_session(
 
 def _build(input_root: Path, output_root: Path, discovered=None, **kwargs):
     selected = discovered or discover_sealed_segments(input_root)
+    git_sha = kwargs.pop("git_sha", TEST_GIT_SHA)
     return build_research_dataset(
         input_root=input_root,
         output_root=output_root,
         discovered_segments=selected,
-        git_sha="test-git-sha",
+        git_sha=git_sha,
         **kwargs,
     )
 
@@ -371,6 +376,20 @@ def test_build_fails_for_product_mismatch_and_output_under_input(tmp_path):
             _build(input_root, output_root, discovered)
 
 
+def test_fabricated_source_path_outside_input_root_is_rejected(tmp_path):
+    input_root = tmp_path / "production"
+    _write_session(input_root)
+    discovered = discover_sealed_segments(input_root)
+    escaped = replace(
+        discovered.segments[0],
+        path=tmp_path / "outside.json.gz",
+    )
+
+    with pytest.raises(ValueError, match="escapes input_root"):
+        _build(input_root, tmp_path / "research", (escaped,))
+    assert not (tmp_path / "research").exists()
+
+
 def test_idempotent_build_and_source_hash_change_create_immutable_snapshots(tmp_path):
     input_root = tmp_path / "production"
     output_root = tmp_path / "research"
@@ -399,3 +418,113 @@ def test_idempotent_build_and_source_hash_change_create_immutable_snapshots(tmp_
     assert newer.dataset_id != first.dataset_id
     assert first.manifest_path.read_bytes() == first_manifest
     assert first.dataset_dir != newer.dataset_dir
+
+
+def test_git_sha_is_required_and_changes_dataset_identity(tmp_path, monkeypatch):
+    import btc_quarter_hour_engine.research.forward_dataset as research
+
+    input_root = tmp_path / "production"
+    _write_session(input_root)
+    discovered = discover_sealed_segments(input_root)
+    monkeypatch.setattr(research, "_git_sha", lambda: None)
+
+    with pytest.raises(ValueError, match="requires an explicit software Git SHA"):
+        build_research_dataset(
+            input_root=input_root,
+            output_root=tmp_path / "missing-sha",
+            discovered_segments=discovered,
+        )
+    assert not list((tmp_path / "missing-sha").rglob("manifest.json"))
+    with pytest.raises(ValueError, match="40-character hexadecimal"):
+        _build(
+            input_root,
+            tmp_path / "invalid-sha",
+            discovered,
+            git_sha="not-a-git-sha",
+        )
+    assert not list((tmp_path / "invalid-sha").rglob("manifest.json"))
+
+    first = _build(
+        input_root, tmp_path / "research-a", discovered, git_sha="b" * 40
+    )
+    second = _build(
+        input_root, tmp_path / "research-b", discovered, git_sha="c" * 40
+    )
+    assert first.dataset_id != second.dataset_id
+    assert first.manifest["software"]["git_sha"] == "b" * 40
+    assert second.manifest["software"]["git_sha"] == "c" * 40
+
+
+def test_identity_binds_active_partial_count_without_changing_research_rows(tmp_path):
+    input_root = tmp_path / "production"
+    _write_session(input_root)
+    discovered = discover_sealed_segments(input_root)
+    no_partial_metadata = replace(discovered, active_partial_count_ignored=0)
+    one_partial_metadata = replace(discovered, active_partial_count_ignored=1)
+
+    first = _build(input_root, tmp_path / "research-a", no_partial_metadata)
+    second = _build(input_root, tmp_path / "research-b", one_partial_metadata)
+
+    assert first.dataset_id != second.dataset_id
+    assert (
+        first.manifest["source_summary"]["active_partial_count_ignored"],
+        second.manifest["source_summary"]["active_partial_count_ignored"],
+    ) == (0, 1)
+    assert [artifact["sha256"] for artifact in first.manifest["artifacts"]] == [
+        artifact["sha256"] for artifact in second.manifest["artifacts"]
+    ]
+    assert pd.read_parquet(first.boundary_artifact).equals(
+        pd.read_parquet(second.boundary_artifact)
+    )
+    assert pd.read_parquet(first.target_artifact).equals(
+        pd.read_parquet(second.target_artifact)
+    )
+
+
+def test_portable_manifest_across_equivalent_source_and_output_roots(tmp_path):
+    first_input = tmp_path / "production-a"
+    _write_session(first_input)
+    second_input = tmp_path / "mount" / "production-b"
+    second_input.parent.mkdir()
+    shutil.copytree(first_input, second_input)
+    first = _build(first_input, tmp_path / "research-a")
+    second = _build(second_input, tmp_path / "research-b")
+
+    assert first.dataset_id == second.dataset_id
+    assert first.manifest_path.read_bytes() == second.manifest_path.read_bytes()
+    assert (
+        first.manifest["software"]["package_version"]
+        == second.manifest["software"]["package_version"]
+    )
+    manifest_bytes = first.manifest_path.read_bytes()
+    assert str(first_input).encode() not in manifest_bytes
+    assert str(second_input).encode() not in manifest_bytes
+    for segment in first.manifest["source_segments"]:
+        assert not Path(segment["path"]).is_absolute()
+        assert not Path(segment["metadata_path"]).is_absolute()
+        assert segment["path"].startswith("raw/")
+        assert segment["metadata_path"].startswith("raw/")
+
+
+def test_metadata_sha_participates_in_identity_without_raw_change(tmp_path):
+    first_input = tmp_path / "production-a"
+    _write_session(first_input)
+    second_input = tmp_path / "production-b"
+    shutil.copytree(first_input, second_input)
+    first_discovery = discover_sealed_segments(first_input)
+    second_discovery = discover_sealed_segments(second_input)
+    first_segment = first_discovery.segments[0]
+    second_segment = second_discovery.segments[0]
+    assert first_segment.sha256 == second_segment.sha256
+    assert first_segment.metadata_sha256 == second_segment.metadata_sha256
+
+    metadata = json.loads(second_segment.metadata_path.read_text())
+    metadata["request_metadata"]["connection_id"] = "different-segment-metadata"
+    second_segment.metadata_path.write_text(json.dumps(metadata))
+    changed_discovery = discover_sealed_segments(second_input)
+
+    assert changed_discovery.segments[0].sha256 == first_segment.sha256
+    assert changed_discovery.segments[0].metadata_sha256 != first_segment.metadata_sha256
+    first = _build(first_input, tmp_path / "research-a", first_discovery)
+    second = _build(second_input, tmp_path / "research-b", changed_discovery)
+    assert first.dataset_id != second.dataset_id

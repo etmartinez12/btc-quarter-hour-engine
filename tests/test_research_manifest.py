@@ -12,6 +12,8 @@ from btc_quarter_hour_engine.research.forward_dataset import (
 )
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
 
+TEST_GIT_SHA = "d" * 40
+
 
 def _one_frame_input(root):
     writer = RawSegmentWriter(
@@ -34,13 +36,13 @@ def test_manifest_records_reproducibility_and_sealed_prefix_semantics(tmp_path):
         input_root=input_root,
         output_root=tmp_path / "research-a",
         discovered_segments=discovered,
-        git_sha="fixed-git-sha",
+        git_sha=TEST_GIT_SHA,
     )
     second = build_research_dataset(
         input_root=input_root,
         output_root=tmp_path / "research-b",
         discovered_segments=discovered,
-        git_sha="fixed-git-sha",
+        git_sha=TEST_GIT_SHA,
     )
     manifest = first.manifest
 
@@ -55,7 +57,7 @@ def test_manifest_records_reproducibility_and_sealed_prefix_semantics(tmp_path):
         "canonical_relative_to_included_prefix": True,
         "description": manifest["snapshot_semantics"]["description"],
     }
-    assert manifest["software"]["git_sha"] == "fixed-git-sha"
+    assert manifest["software"]["git_sha"] == TEST_GIT_SHA
     assert manifest["source_summary"]["frame_count"] == 1
     assert manifest["boundary_summary"]["total"] == 0
     assert manifest["boundary_summary"]["eligible"] == 0
