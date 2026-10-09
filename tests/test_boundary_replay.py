@@ -101,6 +101,53 @@ def test_boundary_crossed_with_stale_heartbeat_is_ineligible():
     assert observations[0].eligible is False
 
 
+def test_provisional_path_includes_refill_effective_exactly_at_boundary():
+    book = Level2OrderBook(product_id="BTC-USD")
+    processor = BoundaryEventProcessor(product_id="BTC-USD", heartbeat_timeout_seconds=30)
+    process_parsed_event(
+        event=_snapshot_event(1, _utc("2024-01-01T13:14:50Z")),
+        book=book,
+        processor=processor,
+    )
+    process_parsed_event(
+        event=_heartbeat_event(_utc("2024-01-01T13:14:59.950Z")),
+        book=book,
+        processor=processor,
+    )
+    process_parsed_event(
+        event={
+            "type": "l2_data",
+            "sequence_num": 2,
+            "event_time_utc": _utc("2024-01-01T13:14:59.900Z"),
+            "updates": [
+                {"side": "bid", "price": 100.0, "quantity": 0},
+                {"side": "ask", "price": 101.0, "quantity": 0},
+            ],
+        },
+        book=book,
+        processor=processor,
+    )
+
+    observations = process_parsed_event(
+        event={
+            "type": "l2_data",
+            "sequence_num": 3,
+            "event_time_utc": _utc("2024-01-01T13:15:00Z"),
+            "updates": [
+                {"side": "bid", "price": 99.0, "quantity": 2},
+                {"side": "ask", "price": 100.0, "quantity": 3},
+            ],
+        },
+        book=book,
+        processor=processor,
+    )
+
+    assert len(observations) == 1
+    assert observations[0].canonical_target_eligible
+    assert observations[0].eligibility_reason == "eligible"
+    assert (observations[0].best_bid, observations[0].best_ask) == (99.0, 100.0)
+
+
 def test_l2_mutation_path_does_not_infer_gaps_from_l2_only_sequences():
     book = Level2OrderBook(product_id="BTC-USD")
     processor = BoundaryEventProcessor(product_id="BTC-USD", heartbeat_timeout_seconds=30)
@@ -930,3 +977,293 @@ def test_streaming_accumulator_releases_full_books_for_superseded_connections():
         assert state.terminal_state.book_synced
         assert state.terminal_state.best_bid == 100.5
         assert state.terminal_state.best_ask == 101.0
+
+
+def _rebuild_update(sequence, timestamp, updates):
+    return _frame(
+        "l2_data",
+        timestamp,
+        sequence,
+        updates=[
+            (side, timestamp, price, quantity)
+            for side, price, quantity in updates
+        ],
+    )
+
+
+def _assert_streaming_matches_offline(raw_frames, *, completed_at):
+    from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
+
+    accumulator = CanonicalReplayAccumulator(
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+    )
+    last_ingest = _utc("2024-01-01T13:14:50Z")
+    for frame_index, raw in enumerate(raw_frames):
+        try:
+            event = parse_coinbase_ws_message(raw)
+        except ValueError:
+            ingest_time = last_ingest
+        else:
+            ingest_time = (
+                event["time_utc"] if event["type"] == "heartbeat"
+                else event["event_time_utc"]
+            )
+        last_ingest = ingest_time
+        accumulator.consume(
+            raw,
+            "conn-1",
+            frame_index,
+            ingest_time,
+        )
+    streamed = accumulator.finalize(
+        session_started_at_utc=None,
+        session_completed_at_utc=completed_at,
+        derived_at_utc=completed_at,
+    )
+    offline = replay_recorded_frames(
+        [(raw, "conn-1", index) for index, raw in enumerate(raw_frames)],
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+        session_completed_at_utc=completed_at,
+        derived_at_utc=completed_at,
+    )
+    assert streamed == offline
+    return streamed
+
+
+def test_canonical_rebuild_spanning_boundary_is_ineligible_then_recovers():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _heartbeat("2024-01-01T13:14:59.950Z", sequence=4),
+        _rebuild_update(5, "2024-01-01T13:15:00.100Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+        _heartbeat("2024-01-01T13:29:59Z", sequence=6),
+    ]
+
+    ledger = _assert_streaming_matches_offline(frames, completed_at=_at("30:00"))
+
+    assert len(ledger) == 2
+    rebuilding, recovered = ledger
+    assert not rebuilding.book_synced
+    assert not rebuilding.canonical_target_eligible
+    assert rebuilding.eligibility_reason == "book_rebuilding"
+    assert rebuilding.source_sequence_num == 3
+    assert rebuilding.source_state_time_utc == _utc("2024-01-01T13:14:59.900Z")
+    assert (rebuilding.best_bid, rebuilding.best_ask, rebuilding.midpoint) == (None, None, None)
+    assert recovered.canonical_target_eligible
+    assert recovered.eligibility_reason == "eligible"
+    assert (recovered.best_bid, recovered.best_ask, recovered.midpoint) == (99.0, 100.0, 99.5)
+    assert recovered.source_sequence_num == 5
+
+
+def test_canonical_rebuild_completed_between_boundaries_is_eligible():
+    frames = [
+        _frame("l2_data", "2024-01-01T13:00:01Z", 1, event_type="snapshot", updates=[
+            ("bid", "1970-01-01T00:00:00Z", 100, 1),
+            ("offer", "1970-01-01T00:00:00Z", 101, 1),
+        ]),
+        _heartbeat("2024-01-01T13:00:02Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:05:00Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _rebuild_update(4, "2024-01-01T13:05:05Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+        _heartbeat("2024-01-01T13:14:59Z", sequence=5),
+    ]
+
+    ledger = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))
+
+    row = ledger[-1]
+    assert row.boundary_time_utc == _at("15:00")
+    assert row.canonical_target_eligible
+    assert row.eligibility_reason == "eligible"
+    assert (row.best_bid, row.best_ask, row.midpoint) == (99.0, 100.0, 99.5)
+    assert row.source_sequence_num == 4
+
+
+def test_refill_exactly_at_boundary_is_included_by_both_replay_paths():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _heartbeat("2024-01-01T13:14:59.950Z", sequence=4),
+        _rebuild_update(5, "2024-01-01T13:15:00Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+    ]
+
+    row = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))[0]
+
+    assert row.canonical_target_eligible
+    assert row.eligibility_reason == "eligible"
+    assert (row.best_bid, row.best_ask, row.midpoint) == (99.0, 100.0, 99.5)
+    assert row.source_sequence_num == 5
+
+
+def test_sequence_gap_during_rebuild_is_fatal_and_blocks_later_refill():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _heartbeat("2024-01-01T13:14:59.950Z", sequence=4),
+        _rebuild_update(6, "2024-01-01T13:15:00.100Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+        _heartbeat("2024-01-01T13:29:59Z", sequence=7),
+    ]
+
+    ledger = _assert_streaming_matches_offline(frames, completed_at=_at("30:00"))
+
+    assert ledger[0].eligibility_reason == "book_rebuilding"
+    assert ledger[1].eligibility_reason == "sequence_gap"
+    assert not ledger[1].book_synced
+    assert not ledger[1].canonical_target_eligible
+    assert (ledger[1].best_bid, ledger[1].best_ask, ledger[1].midpoint) == (None, None, None)
+
+
+def test_malformed_update_during_rebuild_is_fatal_not_recoverable():
+    malformed = _frame(
+        "l2_data",
+        "2024-01-01T13:15:00Z",
+        5,
+        updates=[
+            ("offer", "2024-01-01T13:15:00Z", 100.0, -1),
+        ],
+    )
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _heartbeat("2024-01-01T13:14:59.950Z", sequence=4),
+        malformed,
+        _rebuild_update(6, "2024-01-01T13:15:01Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+    ]
+
+    ledger = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))
+
+    assert ledger[0].eligibility_reason == "malformed_source_state"
+    assert not ledger[0].book_synced
+    assert (ledger[0].best_bid, ledger[0].best_ask, ledger[0].midpoint) == (None, None, None)
+
+
+def test_crossed_refill_candidate_during_rebuild_remains_fatal():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("offer", 101.0, 0),
+        ]),
+        _rebuild_update(4, "2024-01-01T13:15:00.100Z", [
+            ("bid", 102.0, 1),
+            ("offer", 101.0, 1),
+        ]),
+        _rebuild_update(5, "2024-01-01T13:15:01Z", [
+            ("offer", 103.0, 1),
+        ]),
+    ]
+
+    ledger = _assert_streaming_matches_offline(frames, completed_at=_at("30:00"))
+
+    assert ledger[0].eligibility_reason == "book_rebuilding"
+    assert ledger[1].eligibility_reason == "crossed_book"
+    assert not ledger[1].book_synced
+    assert not ledger[1].canonical_target_eligible
+    assert (ledger[1].best_bid, ledger[1].best_ask, ledger[1].midpoint) == (None, None, None)
+
+
+def test_stale_duplicate_during_rebuild_does_not_suppress_sequence_contiguous_refill():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("offer", 101.0, 0),
+        ]),
+        _rebuild_update(3, "2024-01-01T13:14:59.950Z", [
+            ("offer", 101.0, 1),
+        ]),
+        _heartbeat("2024-01-01T13:14:59.975Z", sequence=4),
+        _rebuild_update(5, "2024-01-01T13:15:00Z", [
+            ("offer", 100.0, 1),
+        ]),
+    ]
+
+    row = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))[0]
+
+    assert row.canonical_target_eligible
+    assert row.eligibility_reason == "eligible"
+    assert (row.best_bid, row.best_ask) == (100.0, 100.0)
+
+
+def test_new_connection_during_rebuild_requires_a_fresh_snapshot():
+    frames = [
+        (_snapshot(), "conn-1", 0),
+        (_heartbeat("2024-01-01T13:14:55Z", sequence=2), "conn-1", 1),
+        (_rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("offer", 101.0, 0),
+        ]), "conn-1", 2),
+        (_heartbeat("2024-01-01T13:15:00Z", sequence=1), "conn-2", 3),
+        (_rebuild_update(2, "2024-01-01T13:15:01Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]), "conn-2", 4),
+    ]
+    end = _at("15:00")
+    accumulator = CanonicalReplayAccumulator(
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+    )
+    for raw, connection_id, frame_index in frames:
+        accumulator.consume(
+            raw,
+            connection_id,
+            frame_index,
+            _utc("2024-01-01T13:14:50Z") + timedelta(seconds=frame_index),
+        )
+
+    streamed = accumulator.finalize(
+        session_started_at_utc=None,
+        session_completed_at_utc=end,
+        derived_at_utc=end,
+    )
+    offline = replay_recorded_frames(
+        frames,
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+        session_completed_at_utc=end,
+        derived_at_utc=end,
+    )
+
+    assert streamed == offline
+    assert streamed[-1].connection_id == "conn-2"
+    assert streamed[-1].eligibility_reason == "no_synced_snapshot"
+    assert not streamed[-1].book_synced
+    assert (streamed[-1].best_bid, streamed[-1].best_ask) == (None, None)

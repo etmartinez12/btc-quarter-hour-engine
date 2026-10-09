@@ -424,6 +424,68 @@ def test_collector_keeps_transient_cross_multi_update_envelope_synced(tmp_path):
     assert state_frame.iloc[-1]["best_ask"] == 103.0
 
 
+def test_collector_persists_rebuild_mutations_and_truthful_partial_bbo_state(tmp_path):
+    messages = [
+        _snapshot(1, "2024-01-01T13:14:50Z"),
+        _heartbeat(2, "2024-01-01T13:14:55Z"),
+        _l2_message("update", 3, "2024-01-01T13:14:59.900Z", [
+            {"side": "offer", "price_level": "101.0", "new_quantity": "0",
+             "event_time": "2024-01-01T13:14:59.900Z"},
+        ]),
+        _heartbeat(4, "2024-01-01T13:14:59.950Z"),
+        _l2_message("update", 5, "2024-01-01T13:15:00.100Z", [
+            {"side": "offer", "price_level": "100.5", "new_quantity": "1",
+             "event_time": "2024-01-01T13:15:00.100Z"},
+        ]),
+        _heartbeat(6, "2024-01-01T13:29:59Z"),
+        _heartbeat(7, "2024-01-01T13:30:00Z"),
+    ]
+    collector, service, transport, _ = _build_collector(tmp_path, messages)
+
+    result = collector.run(max_messages=len(messages))
+
+    assert result.connection_count == 1
+    assert result.reconnect_count == 0
+    assert transport.connect_count == 1
+    assert service.connection.invalidated_at_utc is None
+    assert result.manifest["integrity"]["book_rebuild_count"] == 1
+    assert result.manifest["integrity"]["book_recovery_count"] == 1
+    assert result.manifest["connections"][0]["book_rebuild_count"] == 1
+    assert result.manifest["connections"][0]["book_recovery_count"] == 1
+    assert result.manifest["forward_manifest_schema_version"] == "3"
+    assert result.manifest["schema_versions"]["bbo_state"] == "1"
+    assert result.manifest["schema_versions"]["quarter_hour_bbo"] == "1"
+
+    l2 = pd.read_parquet(result.level2_update_artifacts[0]["path"])
+    assert len(l2) == 4  # snapshot levels plus both accepted rebuild mutations
+    assert set(l2["sequence_num"]) == {1, 3, 5}
+
+    states = pd.read_parquet(result.bbo_state_artifacts[0]["path"])
+    assert states["state"].tolist() == ["SYNCED", "REBUILDING", "SYNCED"]
+    rebuilding = states.iloc[1]
+    assert not bool(rebuilding["book_synced"])
+    assert rebuilding["best_bid"] == 100.0
+    assert pd.isna(rebuilding["best_ask"])
+    assert pd.isna(rebuilding["spread"])
+    assert pd.isna(rebuilding["midpoint"])
+    assert states.iloc[2]["best_ask"] == 100.5
+
+    boundaries = pd.read_parquet(result.bbo_normalized_artifacts[0]["path"])
+    at_1515 = boundaries.loc[
+        boundaries["boundary_time_utc"] == pd.Timestamp("2024-01-01T13:15:00Z")
+    ].iloc[0]
+    assert not bool(at_1515["canonical_target_eligible"])
+    assert at_1515["eligibility_reason"] == "book_rebuilding"
+    assert pd.isna(at_1515["best_bid"])
+    assert pd.isna(at_1515["midpoint"])
+    at_1530 = boundaries.loc[
+        boundaries["boundary_time_utc"] == pd.Timestamp("2024-01-01T13:30:00Z")
+    ].iloc[0]
+    assert bool(at_1530["canonical_target_eligible"])
+    assert at_1530["eligibility_reason"] == "eligible"
+    assert (at_1530["best_bid"], at_1530["best_ask"]) == (100.0, 100.5)
+
+
 def test_collector_with_no_eligible_observations_reports_ineligibility_reason(tmp_path):
     messages = [_heartbeat(1, "2024-01-01T00:00:00Z")]
     collector, *_ = _build_collector(tmp_path, messages)

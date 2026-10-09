@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook
+from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook, OrderBookState
 from btc_quarter_hour_engine.market_data.replay import BoundaryEventProcessor, process_parsed_event
 from btc_quarter_hour_engine.storage.forward_schema import (
     COINBASE_BBO_STATE_SCHEMA_VERSION, COINBASE_L2_UPDATE_SCHEMA_VERSION, FORWARD_SOURCE,
@@ -55,6 +55,8 @@ class ConnectionDiagnostics:
     malformed_frame_count: int = 0
     malformed_level2_count: int = 0
     crossed_book_count: int = 0
+    book_rebuild_count: int = 0
+    book_recovery_count: int = 0
 
 
 def _level2_update_rows(
@@ -140,7 +142,9 @@ class CoinbaseWebSocketService:
     construction, across reconnects; ``level2_update_rows``/``bbo_state_rows``
     accumulate normalized per-message-update and per-mutation book-state rows
     respectively (finer-grained than the boundary observations, for full
-    forward-collection fidelity). Callers (the collector) drain all three
+    forward-collection fidelity). BBO-state rows also retain one-sided or
+    empty ``REBUILDING`` states without presenting them as synced books.
+    Callers (the collector) drain all three
     with :meth:`drain_observations`/:meth:`drain_level2_update_rows`/
     :meth:`drain_bbo_state_rows`.
 
@@ -260,9 +264,10 @@ class CoinbaseWebSocketService:
                 self.connection.level2_messages_received += 1
             connection_id = self.connection.connection_id if self.connection else None
             sequence_num = payload.get("sequence_num")
+            previous_book_state = self.order_book.state
             new_observations = process_parsed_event(event=payload, book=self.order_book, processor=self.boundary_processor)
             self.observations.extend(new_observations)
-            if not self.order_book.is_synced():
+            if not self.order_book.is_synced() and self.order_book.state != OrderBookState.REBUILDING:
                 if self.connection is not None:
                     reason = self.order_book.last_error or "malformed level2 state"
                     if "crossed" in reason.lower():
@@ -273,6 +278,26 @@ class CoinbaseWebSocketService:
                 raise ValueError(self.order_book.last_error or "Order book failed to synchronize")
             if self.connection is not None:
                 self.connection.last_sequence_num = sequence_num
+                if previous_book_state == OrderBookState.SYNCED and self.order_book.state == OrderBookState.REBUILDING:
+                    self.connection.book_rebuild_count += 1
+                    self._record_diagnostic(
+                        kind="book_state_transition",
+                        connection_id=connection_id,
+                        sequence_num=sequence_num,
+                        source_time_utc=(payload.get("event_time_utc") or payload.get("envelope_time_utc")).isoformat(),
+                        from_state=previous_book_state.value,
+                        to_state=self.order_book.state.value,
+                    )
+                elif previous_book_state == OrderBookState.REBUILDING and self.order_book.state == OrderBookState.SYNCED:
+                    self.connection.book_recovery_count += 1
+                    self._record_diagnostic(
+                        kind="book_state_transition",
+                        connection_id=connection_id,
+                        sequence_num=sequence_num,
+                        source_time_utc=(payload.get("event_time_utc") or payload.get("envelope_time_utc")).isoformat(),
+                        from_state=previous_book_state.value,
+                        to_state=self.order_book.state.value,
+                    )
             envelope_time_utc = payload.get("envelope_time_utc") or self._utcnow()
             self.level2_update_rows.extend(
                 _level2_update_rows(
@@ -281,16 +306,19 @@ class CoinbaseWebSocketService:
                     frame_index=frame_index, ingest_time_utc=ingest_time_utc,
                 )
             )
-            if self.order_book.is_synced():
-                self.bbo_state_rows.append(
-                    _bbo_state_row(book=self.order_book, connection_id=connection_id,
-                                   source_time_utc=payload.get("event_time_utc") or envelope_time_utc,
-                                   session_id=self.session_id, frame_index=frame_index, ingest_time_utc=ingest_time_utc)
-                )
+            self.bbo_state_rows.append(
+                _bbo_state_row(book=self.order_book, connection_id=connection_id,
+                               source_time_utc=payload.get("event_time_utc") or envelope_time_utc,
+                               session_id=self.session_id, frame_index=frame_index, ingest_time_utc=ingest_time_utc)
+            )
             if message_type == "snapshot":
                 if self.connection is not None:
                     self.connection.snapshot_synced_at_utc = self._utcnow()
                 status = "snapshot_synced"
+            elif self.order_book.state == OrderBookState.REBUILDING:
+                status = "l2_rebuild_in_progress"
+            elif previous_book_state == OrderBookState.REBUILDING:
+                status = "l2_rebuild_complete"
             else:
                 status = "l2_update_applied"
             result: dict[str, Any] = {"status": status}
