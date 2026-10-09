@@ -323,7 +323,8 @@ class WebSocketCollector:
         counters = (
             "sequence_gap_count", "stale_sequence_count", "heartbeat_timeout_count",
             "heartbeat_discontinuity_count", "malformed_frame_count",
-            "malformed_level2_count", "crossed_book_count",
+            "malformed_level2_count", "crossed_book_count", "book_rebuild_count",
+            "book_recovery_count",
         )
         integrity = {name: sum(getattr(connection, name) for connection in connections) for name in counters}
         manifest = build_forward_manifest(

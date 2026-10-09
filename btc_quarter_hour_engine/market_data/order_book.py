@@ -9,11 +9,17 @@ from typing import Any
 class OrderBookState(str, Enum):
     UNINITIALIZED = "UNINITIALIZED"
     SYNCED = "SYNCED"
+    REBUILDING = "REBUILDING"
     INVALID = "INVALID"
 
 
 class Level2OrderBook:
-    """Minimal, deterministic Coinbase L2 book state machine."""
+    """Deterministic Coinbase L2 book with recoverable and fatal states.
+
+    A complete update envelope may commit a temporarily one-sided or empty
+    candidate as ``REBUILDING``. Sequence-contiguous envelopes can restore
+    ``SYNCED``; malformed or crossed candidates transition to ``INVALID``.
+    """
 
     def __init__(self, *, product_id: str | None = None) -> None:
         self.product_id = product_id
@@ -148,37 +154,45 @@ class Level2OrderBook:
     def apply_snapshot(self, *, product_id: str | None, levels: Mapping[str, list[Mapping[str, Any]]]) -> None:
         if product_id is not None:
             self.product_id = product_id
-        self.bids.clear()
-        self.asks.clear()
-        for side in ("bid", "ask"):
-            for level in list(levels.get(side, []) or levels.get(f"{side}s", []) or []):
-                if not isinstance(level, Mapping):
-                    raise ValueError(f"Malformed {side} level")
-                price = self._require_valid_price(level.get("price"), field_name=f"{side} price")
-                qty = self._require_valid_quantity(level.get("quantity"), field_name=f"{side} quantity")
-                self._apply_level(side=side, price=price, quantity=qty)
+        staged_bids: dict[float, float] = {}
+        staged_asks: dict[float, float] = {}
         try:
-            self._validate_book_integrity()
+            if not isinstance(levels, Mapping):
+                raise ValueError("Malformed order book snapshot")
+            for side in ("bid", "ask"):
+                for level in list(levels.get(side, []) or levels.get(f"{side}s", []) or []):
+                    if not isinstance(level, Mapping):
+                        raise ValueError(f"Malformed {side} level")
+                    price = self._require_valid_price(level.get("price"), field_name=f"{side} price")
+                    qty = self._require_valid_quantity(level.get("quantity"), field_name=f"{side} quantity")
+                    self._apply_level_to(
+                        staged_bids,
+                        staged_asks,
+                        side=side,
+                        price=price,
+                        quantity=qty,
+                    )
+            self._validate_candidate_book(staged_bids, staged_asks)
         except ValueError as exc:
+            self.bids = staged_bids
+            self.asks = staged_asks
             self.invalidate(str(exc))
             raise
+        except TypeError as exc:
+            self.bids = staged_bids
+            self.asks = staged_asks
+            self.invalidate(str(exc))
+            raise ValueError(str(exc)) from exc
+        self.bids = staged_bids
+        self.asks = staged_asks
         self.state = OrderBookState.SYNCED
+        self.last_error = None
 
     def apply_update(self, *, side: str, price: Any, quantity: Any) -> None:
-        normalized_side = self._normalize_side(side)
-        price_value = self._require_valid_price(price, field_name=f"{normalized_side} price")
-        quantity_value = self._require_valid_quantity(quantity, field_name=f"{normalized_side} quantity")
-        if self.state != OrderBookState.SYNCED:
-            raise ValueError("Order book is not synchronized")
-        self._apply_level(side=normalized_side, price=price_value, quantity=quantity_value)
-        try:
-            self._validate_book_integrity()
-        except ValueError as exc:
-            self.invalidate(str(exc))
-            raise
+        self.apply_updates([{"side": side, "price": price, "quantity": quantity}])
 
     def apply_updates(self, updates: Iterable[Mapping[str, Any]]) -> None:
-        if self.state != OrderBookState.SYNCED:
+        if self.state not in {OrderBookState.SYNCED, OrderBookState.REBUILDING}:
             raise ValueError("Order book is not synchronized")
 
         normalized_updates: list[tuple[str, float, float]] = []
@@ -198,6 +212,15 @@ class Level2OrderBook:
         staged_asks = dict(self.asks)
         for side, price, quantity in normalized_updates:
             self._apply_level_to(staged_bids, staged_asks, side=side, price=price, quantity=quantity)
+        if not staged_bids or not staged_asks:
+            # Coinbase can clear a complete book in-band and refill it in
+            # later sequence-contiguous envelopes. Commit each full envelope,
+            # but never present this intermediate state as a canonical BBO.
+            self.bids = staged_bids
+            self.asks = staged_asks
+            self.state = OrderBookState.REBUILDING
+            self.last_error = None
+            return
         try:
             self._validate_candidate_book(staged_bids, staged_asks)
         except ValueError as exc:

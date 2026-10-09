@@ -6,8 +6,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .boundary_observations import QuarterHourObservation, derive_quarter_hour_observation, require_utc
-from .order_book import Level2OrderBook
+from .boundary_observations import (
+    QuarterHourObservation,
+    derive_quarter_hour_observation,
+    is_exact_quarter_hour_boundary,
+    require_utc,
+)
+from .order_book import Level2OrderBook, OrderBookState
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -62,7 +67,7 @@ class BoundaryEventProcessor:
             cursor += timedelta(minutes=15)
         observations: list[QuarterHourObservation] = []
         for boundary in boundaries:
-            if book.is_synced():
+            if book.is_synced() or book.state == OrderBookState.REBUILDING:
                 observations.append(
                     derive_quarter_hour_observation(
                         book=book, timestamp_utc=boundary, product_id=self.product_id,
@@ -83,7 +88,19 @@ def process_parsed_event(
 ) -> list[QuarterHourObservation]:
     """Apply a parsed event for provisional live processing or legacy replay."""
     event_type = event.get("type")
-    observations = processor.observe(book=book, event_time_utc=_event_time(event))
+    event_time_utc = _event_time(event)
+    inclusive_l2_boundary = (
+        event_type == "l2_data"
+        and event_time_utc is not None
+        and is_exact_quarter_hour_boundary(event_time_utc)
+    )
+    observations = processor.observe(
+        book=book,
+        event_time_utc=(
+            event_time_utc - timedelta(microseconds=1)
+            if inclusive_l2_boundary else event_time_utc
+        ),
+    )
     if event_type == "heartbeat":
         time_utc = event.get("time_utc")
         processor.observe_heartbeat(time_utc=time_utc or datetime.now(timezone.utc))
@@ -95,6 +112,8 @@ def process_parsed_event(
         # A redelivered/duplicate message for this connection epoch: its
         # effect is already reflected in the book, so it is safely dropped
         # without invalidating the book or marking a gap.
+        if inclusive_l2_boundary:
+            observations.extend(processor.observe(book=book, event_time_utc=event_time_utc))
         return observations
     try:
         if event_type == "snapshot":
@@ -111,10 +130,14 @@ def process_parsed_event(
             book.apply_updates(event.get("updates", []))
     except ValueError:
         processor.note_gap()
+        if inclusive_l2_boundary:
+            observations.extend(processor.observe(book=book, event_time_utc=event_time_utc))
         return observations
     if sequence_num is not None:
         book.last_sequence_num = sequence_num
     processor.note_synced()
+    if inclusive_l2_boundary:
+        observations.extend(processor.observe(book=book, event_time_utc=event_time_utc))
     return observations
 
 
@@ -291,7 +314,7 @@ def replay_recorded_frames(
                 else:
                     connection_l2.append(_ReplayL2Envelope(event_time, kind, updates, current))
             else:
-                if wire_book.is_synced():
+                if wire_book.state in {OrderBookState.SYNCED, OrderBookState.REBUILDING}:
                     try:
                         wire_book.apply_updates(updates)
                     except (ValueError, KeyError, TypeError) as exc:
@@ -608,7 +631,7 @@ def _replay_connection_at_boundary(
                 )
             except (ValueError, KeyError, TypeError) as exc:
                 envelope_invalid = (_envelope_integrity_reason(wire_book.bids, wire_book.asks, exc), str(exc))
-        elif wire_book.is_synced():
+        elif wire_book.state in {OrderBookState.SYNCED, OrderBookState.REBUILDING}:
             try:
                 wire_book.apply_updates(updates)
             except (ValueError, KeyError, TypeError) as exc:
@@ -791,6 +814,7 @@ class _CompactBoundaryState:
     best_ask: float | None
     best_ask_size: float | None
     book_synced: bool
+    book_state: OrderBookState
 
 
 @dataclass(slots=True)
@@ -826,6 +850,7 @@ class _StreamingConnectionState:
                 best_ask=None,
                 best_ask_size=None,
                 book_synced=False,
+                book_state=OrderBookState.UNINITIALIZED,
             )
         top = self.book.top_of_book()
         return _CompactBoundaryState(
@@ -837,6 +862,7 @@ class _StreamingConnectionState:
             best_ask=top["best_ask"],
             best_ask_size=top["best_ask_size"],
             book_synced=self.book.is_synced(),
+            book_state=self.book.state,
         )
 
     def note_source_time(self, timestamp: datetime) -> None:
@@ -898,6 +924,7 @@ class _StreamingConnectionState:
                 best_ask=None,
                 best_ask_size=None,
                 book_synced=False,
+                book_state=OrderBookState.UNINITIALIZED,
             )
         if self.terminal_state is not None:
             return self.terminal_state
@@ -934,6 +961,12 @@ def _freeze_boundary_observation(
                 "ask": [{"price": state.best_ask, "quantity": state.best_ask_size}],
             },
         )
+    elif state.book_state == OrderBookState.REBUILDING:
+        if state.best_bid is not None and state.best_bid_size is not None:
+            book.bids = {state.best_bid: state.best_bid_size}
+        if state.best_ask is not None and state.best_ask_size is not None:
+            book.asks = {state.best_ask: state.best_ask_size}
+        book.state = OrderBookState.REBUILDING
     integrity_reason = None
     if control is not None and control[0] <= boundary:
         integrity_reason = control[2]
@@ -1230,6 +1263,7 @@ class CanonicalReplayAccumulator:
                     best_ask=None,
                     best_ask_size=None,
                     book_synced=False,
+                    book_state=OrderBookState.UNINITIALIZED,
                 )
                 results.append(
                     _freeze_boundary_observation(

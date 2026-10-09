@@ -178,14 +178,81 @@ def test_apply_updates_allows_transient_crossed_gce_shaped_batch():
     assert book.last_error is None
 
 
-def test_apply_updates_allows_temporarily_one_sided_book():
+def test_apply_updates_commits_one_sided_candidate_as_rebuilding_then_recovers():
     book = _synced_book()
-    book.apply_updates([
-        {"side": "ask", "price": 101.0, "quantity": 0},
-        {"side": "ask", "price": 102.0, "quantity": 1.0},
-    ])
+    book.apply_updates([{"side": "ask", "price": 101.0, "quantity": 0}])
+
+    assert book.state == OrderBookState.REBUILDING
+    assert not book.is_synced()
+    assert book.best_bid == 100.0
+    assert book.best_ask is None
+    assert book.midpoint is None
+    assert book.last_error is None
+
+    book.apply_updates([{"side": "ask", "price": 102.0, "quantity": 1.0}])
+
+    assert book.state == OrderBookState.SYNCED
     assert book.is_synced()
     assert book.best_ask == 102.0
+
+
+def test_apply_updates_allows_a_complete_empty_book_clear_and_refill():
+    book = _synced_book()
+    book.apply_updates([
+        {"side": "bid", "price": 100.0, "quantity": 0},
+        {"side": "ask", "price": 101.0, "quantity": 0},
+    ])
+
+    assert book.state == OrderBookState.REBUILDING
+    assert book.bids == {}
+    assert book.asks == {}
+    assert not book.is_synced()
+    assert book.top_of_book()["midpoint"] is None
+
+    book.apply_updates([
+        {"side": "bid", "price": 99.0, "quantity": 2.0},
+        {"side": "ask", "price": 100.0, "quantity": 3.0},
+    ])
+
+    assert book.state == OrderBookState.SYNCED
+    assert book.is_synced()
+    assert (book.best_bid, book.best_ask) == (99.0, 100.0)
+
+
+def test_crossed_candidate_during_rebuild_is_fatal_and_not_committed():
+    book = _synced_book()
+    book.apply_updates([{"side": "ask", "price": 101.0, "quantity": 0}])
+    before_bids = dict(book.bids)
+    before_asks = dict(book.asks)
+
+    with pytest.raises(ValueError, match="Crossed book"):
+        book.apply_updates([
+            {"side": "bid", "price": 102.0, "quantity": 1.0},
+            {"side": "ask", "price": 101.0, "quantity": 1.0},
+        ])
+
+    assert book.state == OrderBookState.INVALID
+    assert book.bids == before_bids
+    assert book.asks == before_asks
+    with pytest.raises(ValueError, match="not synchronized"):
+        book.apply_updates([{"side": "ask", "price": 103.0, "quantity": 1.0}])
+
+
+def test_malformed_envelope_during_rebuild_is_fatal_and_atomic():
+    book = _synced_book()
+    book.apply_updates([{"side": "ask", "price": 101.0, "quantity": 0}])
+    before_bids = dict(book.bids)
+    before_asks = dict(book.asks)
+
+    with pytest.raises(ValueError, match="Invalid ask quantity"):
+        book.apply_updates([
+            {"side": "ask", "price": 102.0, "quantity": 1.0},
+            {"side": "ask", "price": 103.0, "quantity": -1.0},
+        ])
+
+    assert book.state == OrderBookState.INVALID
+    assert book.bids == before_bids
+    assert book.asks == before_asks
 
 
 def test_apply_updates_rejects_final_cross_without_committing_any_levels():
@@ -247,6 +314,23 @@ def test_snapshot_requires_two_sided_book():
     with pytest.raises(ValueError, match="both bid and ask"):
         book.apply_snapshot(product_id="BTC-USD", levels={"bid": [{"price": 1.0, "quantity": 1.0}], "ask": []})
     assert book.state == OrderBookState.INVALID
+
+
+@pytest.mark.parametrize(
+    "levels",
+    [
+        {"bid": [None], "ask": [{"price": 101.0, "quantity": 1.0}]},
+        {"bid": [{"price": 100.0, "quantity": -1.0}], "ask": [{"price": 101.0, "quantity": 1.0}]},
+    ],
+)
+def test_malformed_snapshot_is_fatal(levels):
+    book = _synced_book()
+
+    with pytest.raises(ValueError):
+        book.apply_snapshot(product_id="BTC-USD", levels=levels)
+
+    assert book.state == OrderBookState.INVALID
+    assert not book.is_synced()
 
 
 def test_reset_clears_book_but_retains_l2_sequence_provenance():

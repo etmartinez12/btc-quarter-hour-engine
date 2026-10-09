@@ -411,6 +411,122 @@ def test_multi_update_l2_envelope_is_applied_atomically_and_records_one_bbo():
     assert service.bbo_state_rows[-1]["best_ask"] == 103.0
 
 
+def test_live_service_accepts_same_connection_clear_heartbeat_and_refill():
+    service, transport = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:14:50Z"))
+    service.handle_message(_heartbeat(2, "2024-01-01T00:14:55Z"))
+    clear = _l2_message(
+        "update",
+        3,
+        "2024-01-01T00:14:59Z",
+        [
+            {"side": "bid", "price_level": "100.0", "new_quantity": "0"},
+            {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+        ],
+    )
+
+    result = service.handle_message(clear)
+
+    assert result["status"] == "l2_rebuild_in_progress"
+    assert service.order_book.state == OrderBookState.REBUILDING
+    assert not service.order_book.is_synced()
+    assert service.connection.invalidated_at_utc is None
+    assert service.connection.malformed_level2_count == 0
+    assert service.connection.crossed_book_count == 0
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.last_sequence_num == 3
+    assert service.bbo_state_rows[-1]["state"] == "REBUILDING"
+    assert service.bbo_state_rows[-1]["book_synced"] is False
+    assert service.bbo_state_rows[-1]["best_bid"] is None
+    assert service.bbo_state_rows[-1]["best_ask"] is None
+
+    before_heartbeat = dict(service.order_book.bids), dict(service.order_book.asks)
+    service.handle_message(_heartbeat(4, "2024-01-01T00:15:00Z"))
+    assert (service.order_book.bids, service.order_book.asks) == before_heartbeat
+    assert service.order_book.state == OrderBookState.REBUILDING
+    assert service.connection.last_envelope_sequence_num == 4
+
+    result = service.handle_message(_l2_message(
+        "update",
+        5,
+        "2024-01-01T00:15:01Z",
+        [
+            {"side": "bid", "price_level": "99.0", "new_quantity": "2.0"},
+            {"side": "offer", "price_level": "100.0", "new_quantity": "3.0"},
+        ],
+    ))
+
+    assert result["status"] == "l2_rebuild_complete"
+    assert service.order_book.state == OrderBookState.SYNCED
+    assert (service.order_book.best_bid, service.order_book.best_ask) == (99.0, 100.0)
+    assert service.connection.invalidated_at_utc is None
+    assert service.connection.last_sequence_num == 5
+    assert service.connection.last_envelope_sequence_num == 5
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.book_recovery_count == 1
+    assert transport.connect_count == 1
+    assert [event["from_state"] for event in service.diagnostics] == ["SYNCED", "REBUILDING"]
+    assert [event["to_state"] for event in service.diagnostics] == ["REBUILDING", "SYNCED"]
+    assert len(service.level2_update_rows) == 6
+    assert [row["sequence_num"] for row in service.level2_update_rows[-4:]] == [3, 3, 5, 5]
+    assert service.bbo_state_rows[-1]["state"] == "SYNCED"
+    assert service.bbo_state_rows[-1]["sequence_num"] == 5
+
+
+def test_stale_duplicate_during_live_rebuild_is_ignored_without_losing_recovery():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+    service.handle_message(_l2_message("update", 2, "2024-01-01T00:00:01Z", [
+        {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+    ]))
+
+    stale = service.handle_message(_l2_message("update", 2, "2024-01-01T00:00:02Z", [
+        {"side": "offer", "price_level": "101.0", "new_quantity": "1.0"},
+    ]))
+    assert stale["status"] == "stale_sequence_ignored"
+    assert service.order_book.state == OrderBookState.REBUILDING
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.stale_sequence_count == 1
+
+    recovered = service.handle_message(_l2_message("update", 3, "2024-01-01T00:00:03Z", [
+        {"side": "offer", "price_level": "100.5", "new_quantity": "1.0"},
+    ]))
+    assert recovered["status"] == "l2_rebuild_complete"
+    assert service.order_book.is_synced()
+    assert service.connection.book_recovery_count == 1
+
+
+def test_live_service_sequence_gap_during_rebuild_invalidates_the_connection():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:14:50Z"))
+    service.handle_message(_heartbeat(2, "2024-01-01T00:14:55Z"))
+    service.handle_message(_l2_message(
+        "update",
+        3,
+        "2024-01-01T00:14:59Z",
+        [{"side": "offer", "price_level": "101.0", "new_quantity": "0"}],
+    ))
+    service.handle_message(_heartbeat(4, "2024-01-01T00:14:59.500Z"))
+
+    with pytest.raises(ValueError, match="expected 5, received 6"):
+        service.handle_message(_l2_message(
+            "update",
+            6,
+            "2024-01-01T00:15:01Z",
+            [{"side": "offer", "price_level": "100.0", "new_quantity": "1"}],
+        ))
+
+    assert service.order_book.state == OrderBookState.INVALID
+    assert service.connection.invalidated_at_utc is not None
+    assert service.connection.sequence_gap_count == 1
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.book_recovery_count == 0
+    assert service.order_book.last_sequence_num == 3
+
+
 def test_level2_update_rows_and_bbo_state_rows_not_recorded_for_stale_or_gap():
     service, _ = _service([])
     service.connect_and_subscribe()

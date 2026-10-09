@@ -158,7 +158,7 @@ def test_forward_manifest_is_session_shaped_and_content_addressed(tmp_path):
         integrity={"heartbeat_discontinuity_count": 1, "sequence_gap_count": 2},
     )
 
-    assert manifest["forward_manifest_schema_version"] == "2"
+    assert manifest["forward_manifest_schema_version"] == "3"
     assert manifest["session_id"] == "session-1"
     assert manifest["dataset_id"] == build_forward_manifest(
         source="coinbase_advanced",
