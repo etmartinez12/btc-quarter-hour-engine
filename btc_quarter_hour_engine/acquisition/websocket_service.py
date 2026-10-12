@@ -330,7 +330,10 @@ class CoinbaseWebSocketService:
             if self.connection is not None:
                 self.connection.heartbeat_messages_received += 1
             heartbeat_time = payload.get("time_utc") or self._utcnow()
-            new_observations = self.boundary_processor.observe(book=self.order_book, event_time_utc=heartbeat_time)
+            new_observations = self.boundary_processor.observe_source_event(
+                book=self.order_book,
+                event_time_utc=heartbeat_time,
+            )
             self.observations.extend(new_observations)
             self.boundary_processor.observe_heartbeat(time_utc=heartbeat_time)
             self.last_heartbeat_at = heartbeat_time

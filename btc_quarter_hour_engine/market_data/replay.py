@@ -44,6 +44,22 @@ class BoundaryEventProcessor:
     def observe_heartbeat(self, *, time_utc: datetime) -> None:
         self.last_heartbeat_at = require_utc(time_utc)
 
+    def observe_source_event(
+        self,
+        *,
+        book: Level2OrderBook,
+        event_time_utc: datetime | None,
+    ) -> list[QuarterHourObservation]:
+        """Observe a source event without finalizing an exact-time boundary."""
+        return self.observe(
+            book=book,
+            event_time_utc=event_time_utc,
+            defer_exact_boundary=(
+                event_time_utc is not None
+                and is_exact_quarter_hour_boundary(event_time_utc)
+            ),
+        )
+
     def note_gap(self) -> None:
         self.gap_since_sync = True
 
@@ -103,14 +119,9 @@ def process_parsed_event(
     """Apply a parsed event for provisional live processing or legacy replay."""
     event_type = event.get("type")
     event_time_utc = _event_time(event)
-    unresolved_exact_boundary = (
-        event_time_utc is not None
-        and is_exact_quarter_hour_boundary(event_time_utc)
-    )
-    observations = processor.observe(
+    observations = processor.observe_source_event(
         book=book,
         event_time_utc=event_time_utc,
-        defer_exact_boundary=unresolved_exact_boundary,
     )
     if event_type == "heartbeat":
         time_utc = event.get("time_utc")
