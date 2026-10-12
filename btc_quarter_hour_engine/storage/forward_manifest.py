@@ -188,6 +188,8 @@ def build_forward_manifest(
         "malformed_frame_count",
         "malformed_level2_count",
         "crossed_book_count",
+        "book_rebuild_count",
+        "book_recovery_count",
     )
     resolved_integrity = {name: 0 for name in counter_names}
     if integrity:

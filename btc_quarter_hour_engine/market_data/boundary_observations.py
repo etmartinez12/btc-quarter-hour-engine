@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .order_book import Level2OrderBook
+from .order_book import Level2OrderBook, OrderBookState
 from btc_quarter_hour_engine.storage.forward_schema import COINBASE_BOUNDARY_BBO_SCHEMA_VERSION, FORWARD_SOURCE
 
 
@@ -76,7 +76,9 @@ def derive_quarter_hour_observation(
     if integrity_reason:
         reason = integrity_reason
     elif not synced:
-        if book.last_error and "crossed" in book.last_error.lower():
+        if book.state == OrderBookState.REBUILDING:
+            reason = "book_rebuilding"
+        elif book.last_error and "crossed" in book.last_error.lower():
             reason = "crossed_book"
         elif book.last_error and "sequence gap" in book.last_error.lower():
             reason = "sequence_gap"

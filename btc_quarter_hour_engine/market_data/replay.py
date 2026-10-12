@@ -6,8 +6,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .boundary_observations import QuarterHourObservation, derive_quarter_hour_observation, require_utc
-from .order_book import Level2OrderBook
+from .boundary_observations import (
+    QuarterHourObservation,
+    derive_quarter_hour_observation,
+    is_exact_quarter_hour_boundary,
+    require_utc,
+)
+from .order_book import Level2OrderBook, OrderBookState
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -39,30 +44,60 @@ class BoundaryEventProcessor:
     def observe_heartbeat(self, *, time_utc: datetime) -> None:
         self.last_heartbeat_at = require_utc(time_utc)
 
+    def observe_source_event(
+        self,
+        *,
+        book: Level2OrderBook,
+        event_time_utc: datetime | None,
+    ) -> list[QuarterHourObservation]:
+        """Observe a source event without finalizing an exact-time boundary."""
+        return self.observe(
+            book=book,
+            event_time_utc=event_time_utc,
+            defer_exact_boundary=(
+                event_time_utc is not None
+                and is_exact_quarter_hour_boundary(event_time_utc)
+            ),
+        )
+
     def note_gap(self) -> None:
         self.gap_since_sync = True
 
     def note_synced(self) -> None:
         self.gap_since_sync = False
 
-    def observe(self, *, book: Level2OrderBook, event_time_utc: datetime | None) -> list[QuarterHourObservation]:
+    def observe(
+        self,
+        *,
+        book: Level2OrderBook,
+        event_time_utc: datetime | None,
+        defer_exact_boundary: bool = False,
+    ) -> list[QuarterHourObservation]:
         """Emit observations for every quarter-hour boundary newly crossed as of ``event_time_utc``."""
         if event_time_utc is None:
             return []
         event_time_utc = require_utc(event_time_utc)
         floor = floor_to_quarter_hour(event_time_utc)
+        defer_exact = defer_exact_boundary and is_exact_quarter_hour_boundary(event_time_utc)
         if self._last_boundary_checked is None:
             # Bootstrap: allow the very first quarter-hour containing this event to be
             # eligible for emission without walking arbitrarily far into the past.
             self._last_boundary_checked = floor - timedelta(minutes=15)
         boundaries: list[datetime] = []
         cursor = self._last_boundary_checked + timedelta(minutes=15)
-        while cursor <= floor:
+        while (cursor < floor if defer_exact else cursor <= floor):
             boundaries.append(cursor)
             cursor += timedelta(minutes=15)
         observations: list[QuarterHourObservation] = []
         for boundary in boundaries:
-            if book.is_synced():
+            if (
+                book.is_synced()
+                or book.state == OrderBookState.REBUILDING
+                or (
+                    book.state == OrderBookState.INVALID
+                    and book.last_sequence_num is not None
+                )
+            ):
                 observations.append(
                     derive_quarter_hour_observation(
                         book=book, timestamp_utc=boundary, product_id=self.product_id,
@@ -83,7 +118,11 @@ def process_parsed_event(
 ) -> list[QuarterHourObservation]:
     """Apply a parsed event for provisional live processing or legacy replay."""
     event_type = event.get("type")
-    observations = processor.observe(book=book, event_time_utc=_event_time(event))
+    event_time_utc = _event_time(event)
+    observations = processor.observe_source_event(
+        book=book,
+        event_time_utc=event_time_utc,
+    )
     if event_type == "heartbeat":
         time_utc = event.get("time_utc")
         processor.observe_heartbeat(time_utc=time_utc or datetime.now(timezone.utc))
@@ -98,7 +137,6 @@ def process_parsed_event(
         return observations
     try:
         if event_type == "snapshot":
-            book.reset()
             updates = event.get("updates", [])
             book.apply_snapshot(
                 product_id=book.product_id,
@@ -132,6 +170,17 @@ def _envelope_integrity_reason(
     if not bids:
         return "missing_bid"
     if not asks:
+        return "missing_ask"
+    return "malformed_source_state"
+
+
+def _snapshot_integrity_reason(updates: list[Mapping[str, Any]], error: Exception) -> str:
+    if "crossed" in str(error).lower():
+        return "crossed_book"
+    sides = {update.get("side") for update in updates if isinstance(update, Mapping)}
+    if "bid" not in sides:
+        return "missing_bid"
+    if "ask" not in sides:
         return "missing_ask"
     return "malformed_source_state"
 
@@ -284,14 +333,14 @@ def replay_recorded_frames(
                     )
                 except (ValueError, KeyError, TypeError) as exc:
                     invalid = True
-                    failure_reason = _envelope_integrity_reason(wire_book.bids, wire_book.asks, exc)
+                    failure_reason = _snapshot_integrity_reason(updates, exc)
                     connection_controls.append((
                         event_time, arrival, "envelope_invalid", (failure_reason, str(exc)), current,
                     ))
                 else:
                     connection_l2.append(_ReplayL2Envelope(event_time, kind, updates, current))
             else:
-                if wire_book.is_synced():
+                if wire_book.state in {OrderBookState.SYNCED, OrderBookState.REBUILDING}:
                     try:
                         wire_book.apply_updates(updates)
                     except (ValueError, KeyError, TypeError) as exc:
@@ -388,7 +437,11 @@ def replay_recorded_frames(
                         state_times[active] = envelope_action.effective_time_utc
                         state_sequences[active] = envelope_action.sequence_num
                 except (ValueError, KeyError, TypeError) as exc:
-                    reasons[active] = _envelope_integrity_reason(book.bids, book.asks, exc)
+                    reasons[active] = (
+                        _snapshot_integrity_reason(envelope_action.updates, exc)
+                        if envelope_action.kind == "snapshot"
+                        else _envelope_integrity_reason(book.bids, book.asks, exc)
+                    )
                     book.invalidate(str(exc))
 
             connection_controls = controls[active]
@@ -607,8 +660,8 @@ def _replay_connection_at_boundary(
                     },
                 )
             except (ValueError, KeyError, TypeError) as exc:
-                envelope_invalid = (_envelope_integrity_reason(wire_book.bids, wire_book.asks, exc), str(exc))
-        elif wire_book.is_synced():
+                envelope_invalid = (_snapshot_integrity_reason(updates, exc), str(exc))
+        elif wire_book.state in {OrderBookState.SYNCED, OrderBookState.REBUILDING}:
             try:
                 wire_book.apply_updates(updates)
             except (ValueError, KeyError, TypeError) as exc:
@@ -641,7 +694,7 @@ def _replay_connection_at_boundary(
                         state_time = event_time
                         state_sequence = current
                 except (ValueError, KeyError, TypeError) as exc:
-                    canonical_reason = _envelope_integrity_reason(book.bids, book.asks, exc)
+                    canonical_reason = _snapshot_integrity_reason(updates, exc)
                     canonical_message = str(exc)
                     book.invalidate(str(exc))
 
@@ -791,6 +844,7 @@ class _CompactBoundaryState:
     best_ask: float | None
     best_ask_size: float | None
     book_synced: bool
+    book_state: OrderBookState
 
 
 @dataclass(slots=True)
@@ -826,6 +880,7 @@ class _StreamingConnectionState:
                 best_ask=None,
                 best_ask_size=None,
                 book_synced=False,
+                book_state=OrderBookState.UNINITIALIZED,
             )
         top = self.book.top_of_book()
         return _CompactBoundaryState(
@@ -837,6 +892,7 @@ class _StreamingConnectionState:
             best_ask=top["best_ask"],
             best_ask_size=top["best_ask_size"],
             book_synced=self.book.is_synced(),
+            book_state=self.book.state,
         )
 
     def note_source_time(self, timestamp: datetime) -> None:
@@ -898,6 +954,7 @@ class _StreamingConnectionState:
                 best_ask=None,
                 best_ask_size=None,
                 book_synced=False,
+                book_state=OrderBookState.UNINITIALIZED,
             )
         if self.terminal_state is not None:
             return self.terminal_state
@@ -934,6 +991,12 @@ def _freeze_boundary_observation(
                 "ask": [{"price": state.best_ask, "quantity": state.best_ask_size}],
             },
         )
+    elif state.book_state == OrderBookState.REBUILDING:
+        if state.best_bid is not None and state.best_bid_size is not None:
+            book.bids = {state.best_bid: state.best_bid_size}
+        if state.best_ask is not None and state.best_ask_size is not None:
+            book.asks = {state.best_ask: state.best_ask_size}
+        book.state = OrderBookState.REBUILDING
     integrity_reason = None
     if control is not None and control[0] <= boundary:
         integrity_reason = control[2]
@@ -1114,7 +1177,7 @@ class CanonicalReplayAccumulator:
                     },
                 )
             except (ValueError, KeyError, TypeError) as exc:
-                reason = _envelope_integrity_reason(state.book.bids, state.book.asks, exc)
+                reason = _snapshot_integrity_reason(event["updates"], exc)
                 state.record_control(event_time, reason, str(exc))
                 return
             state.has_snapshot = True
@@ -1230,6 +1293,7 @@ class CanonicalReplayAccumulator:
                     best_ask=None,
                     best_ask_size=None,
                     book_synced=False,
+                    book_state=OrderBookState.UNINITIALIZED,
                 )
                 results.append(
                     _freeze_boundary_observation(

@@ -13,6 +13,7 @@ from btc_quarter_hour_engine.acquisition.websocket_service import (
     _bbo_state_row,
 )
 from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook, OrderBookState
+from btc_quarter_hour_engine.market_data.replay import replay_recorded_frames
 
 
 class FakeTransport:
@@ -131,6 +132,27 @@ def _service(messages, *, fail_connect_times=0, fail_connect_calls=(), **config_
         config=config, client=client, sleep_fn=lambda *_: None, monotonic_fn=_fake_monotonic()
     )
     return service, transport
+
+
+def _scientific_boundary_fields(observation):
+    return (
+        observation.canonical_target_eligible,
+        observation.eligibility_reason,
+        observation.book_synced,
+        observation.best_bid,
+        observation.best_ask,
+        observation.midpoint,
+    )
+
+
+def _canonical_boundary(messages):
+    return replay_recorded_frames(
+        [(message.encode(), "conn-1", index) for index, message in enumerate(messages)],
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+        session_completed_at_utc=datetime(2024, 1, 1, 0, 16, tzinfo=timezone.utc),
+    )[0]
 
 
 def test_connect_and_subscribe_sends_level2_and_heartbeats_subscriptions():
@@ -409,6 +431,306 @@ def test_multi_update_l2_envelope_is_applied_atomically_and_records_one_bbo():
     assert len(service.bbo_state_rows) - initial_bbo_count == 1
     assert service.bbo_state_rows[-1]["best_bid"] == 102.0
     assert service.bbo_state_rows[-1]["best_ask"] == 103.0
+
+
+def test_live_service_accepts_same_connection_clear_heartbeat_and_refill():
+    service, transport = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:14:50Z"))
+    service.handle_message(_heartbeat(2, "2024-01-01T00:14:55Z"))
+    clear = _l2_message(
+        "update",
+        3,
+        "2024-01-01T00:14:59Z",
+        [
+            {"side": "bid", "price_level": "100.0", "new_quantity": "0"},
+            {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+        ],
+    )
+
+    result = service.handle_message(clear)
+
+    assert result["status"] == "l2_rebuild_in_progress"
+    assert service.order_book.state == OrderBookState.REBUILDING
+    assert not service.order_book.is_synced()
+    assert service.connection.invalidated_at_utc is None
+    assert service.connection.malformed_level2_count == 0
+    assert service.connection.crossed_book_count == 0
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.last_sequence_num == 3
+    assert service.bbo_state_rows[-1]["state"] == "REBUILDING"
+    assert service.bbo_state_rows[-1]["book_synced"] is False
+    assert service.bbo_state_rows[-1]["best_bid"] is None
+    assert service.bbo_state_rows[-1]["best_ask"] is None
+
+    before_heartbeat = dict(service.order_book.bids), dict(service.order_book.asks)
+    service.handle_message(_heartbeat(4, "2024-01-01T00:15:00Z"))
+    assert (service.order_book.bids, service.order_book.asks) == before_heartbeat
+    assert service.order_book.state == OrderBookState.REBUILDING
+    assert service.connection.last_envelope_sequence_num == 4
+
+    result = service.handle_message(_l2_message(
+        "update",
+        5,
+        "2024-01-01T00:15:01Z",
+        [
+            {"side": "bid", "price_level": "99.0", "new_quantity": "2.0"},
+            {"side": "offer", "price_level": "100.0", "new_quantity": "3.0"},
+        ],
+    ))
+
+    assert result["status"] == "l2_rebuild_complete"
+    assert service.order_book.state == OrderBookState.SYNCED
+    assert (service.order_book.best_bid, service.order_book.best_ask) == (99.0, 100.0)
+    assert service.connection.invalidated_at_utc is None
+    assert service.connection.last_sequence_num == 5
+    assert service.connection.last_envelope_sequence_num == 5
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.book_recovery_count == 1
+    assert transport.connect_count == 1
+    assert [event["from_state"] for event in service.diagnostics] == ["SYNCED", "REBUILDING"]
+    assert [event["to_state"] for event in service.diagnostics] == ["REBUILDING", "SYNCED"]
+    assert len(service.level2_update_rows) == 6
+    assert [row["sequence_num"] for row in service.level2_update_rows[-4:]] == [3, 3, 5, 5]
+    assert service.bbo_state_rows[-1]["state"] == "SYNCED"
+    assert service.bbo_state_rows[-1]["sequence_num"] == 5
+
+
+def test_stale_duplicate_during_live_rebuild_is_ignored_without_losing_recovery():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:00:00Z"))
+    service.handle_message(_l2_message("update", 2, "2024-01-01T00:00:01Z", [
+        {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+    ]))
+
+    stale = service.handle_message(_l2_message("update", 2, "2024-01-01T00:00:02Z", [
+        {"side": "offer", "price_level": "101.0", "new_quantity": "1.0"},
+    ]))
+    assert stale["status"] == "stale_sequence_ignored"
+    assert service.order_book.state == OrderBookState.REBUILDING
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.stale_sequence_count == 1
+
+    recovered = service.handle_message(_l2_message("update", 3, "2024-01-01T00:00:03Z", [
+        {"side": "offer", "price_level": "100.5", "new_quantity": "1.0"},
+    ]))
+    assert recovered["status"] == "l2_rebuild_complete"
+    assert service.order_book.is_synced()
+    assert service.connection.book_recovery_count == 1
+
+
+def test_live_service_sequence_gap_during_rebuild_invalidates_the_connection():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:14:50Z"))
+    service.handle_message(_heartbeat(2, "2024-01-01T00:14:55Z"))
+    service.handle_message(_l2_message(
+        "update",
+        3,
+        "2024-01-01T00:14:59Z",
+        [{"side": "offer", "price_level": "101.0", "new_quantity": "0"}],
+    ))
+    service.handle_message(_heartbeat(4, "2024-01-01T00:14:59.500Z"))
+
+    with pytest.raises(ValueError, match="expected 5, received 6"):
+        service.handle_message(_l2_message(
+            "update",
+            6,
+            "2024-01-01T00:15:01Z",
+            [{"side": "offer", "price_level": "100.0", "new_quantity": "1"}],
+        ))
+
+    assert service.order_book.state == OrderBookState.INVALID
+    assert service.connection.invalidated_at_utc is not None
+    assert service.connection.sequence_gap_count == 1
+    assert service.connection.book_rebuild_count == 1
+    assert service.connection.book_recovery_count == 0
+    assert service.order_book.last_sequence_num == 3
+
+
+def test_live_service_defers_exact_boundary_gap_until_source_time_advances():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _l2_message(
+            "update",
+            3,
+            "2024-01-01T00:15:00Z",
+            [
+                {"side": "bid", "price_level": "100.0", "new_quantity": "0"},
+                {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+            ],
+        ),
+        _l2_message(
+            "update",
+            5,
+            "2024-01-01T00:15:00Z",
+            [
+                {"side": "bid", "price_level": "99.0", "new_quantity": "2"},
+                {"side": "offer", "price_level": "100.0", "new_quantity": "3"},
+            ],
+        ),
+        _heartbeat(6, "2024-01-01T00:15:00.001Z"),
+    ]
+    for message in messages[:3]:
+        service.handle_message(message)
+    assert service.observations == []
+
+    with pytest.raises(ValueError, match="expected 4, received 5"):
+        service.handle_message(messages[3])
+
+    assert service.observations == []
+    assert service.order_book.state == OrderBookState.INVALID
+    service.handle_message(messages[4])
+
+    assert len(service.observations) == 1
+    observation = service.observations[0]
+    assert observation.eligibility_reason == "sequence_gap"
+    assert not observation.canonical_target_eligible
+    assert not observation.book_synced
+    assert (observation.best_bid, observation.best_ask, observation.midpoint) == (None, None, None)
+    canonical = replay_recorded_frames(
+        [(message.encode(), "conn-1", index) for index, message in enumerate(messages)],
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+        session_completed_at_utc=datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc),
+    )[0]
+    assert (
+        observation.canonical_target_eligible,
+        observation.eligibility_reason,
+        observation.book_synced,
+        observation.best_bid,
+        observation.best_ask,
+        observation.midpoint,
+    ) == (
+        canonical.canonical_target_eligible,
+        canonical.eligibility_reason,
+        canonical.book_synced,
+        canonical.best_bid,
+        canonical.best_ask,
+        canonical.midpoint,
+    )
+
+
+def test_live_heartbeat_at_boundary_defers_clear_and_same_time_refill():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _l2_message("update", 2, "2024-01-01T00:15:00Z", [
+            {"side": "bid", "price_level": "100.0", "new_quantity": "0"},
+            {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+        ]),
+        _heartbeat(3, "2024-01-01T00:15:00Z"),
+        _l2_message("update", 4, "2024-01-01T00:15:00Z", [
+            {"side": "bid", "price_level": "99.0", "new_quantity": "2"},
+            {"side": "offer", "price_level": "100.0", "new_quantity": "3"},
+        ]),
+        _heartbeat(5, "2024-01-01T00:15:00.001Z"),
+    ]
+
+    for message in messages[:4]:
+        service.handle_message(message)
+        assert service.observations == []
+    assert service.last_heartbeat_at == datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc)
+    assert service.heartbeat_is_healthy()
+    assert service.order_book.state == OrderBookState.SYNCED
+
+    service.handle_message(messages[4])
+
+    assert len(service.observations) == 1
+    assert _scientific_boundary_fields(service.observations[0]) == _scientific_boundary_fields(
+        _canonical_boundary(messages)
+    )
+    assert service.observations[0].canonical_target_eligible
+    assert (service.observations[0].best_bid, service.observations[0].best_ask) == (99.0, 100.0)
+
+
+def test_live_heartbeat_at_boundary_defers_same_time_snapshot():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:15:00Z"),
+        _snapshot(3, "2024-01-01T00:15:00Z", bid=98.0, ask=99.0),
+        _update(4, "2024-01-01T00:15:00.001Z", "bid", 98.5, 2.0),
+    ]
+
+    for message in messages[:3]:
+        service.handle_message(message)
+        assert service.observations == []
+    assert service.last_heartbeat_at == datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc)
+
+    service.handle_message(messages[3])
+
+    assert len(service.observations) == 1
+    assert _scientific_boundary_fields(service.observations[0]) == _scientific_boundary_fields(
+        _canonical_boundary(messages)
+    )
+    assert service.observations[0].canonical_target_eligible
+    assert (service.observations[0].best_bid, service.observations[0].best_ask) == (98.0, 99.0)
+
+
+def test_live_heartbeat_at_boundary_does_not_include_refill_after_boundary():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _l2_message("update", 2, "2024-01-01T00:15:00Z", [
+            {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+        ]),
+        _heartbeat(3, "2024-01-01T00:15:00Z"),
+        _l2_message("update", 4, "2024-01-01T00:15:00.001Z", [
+            {"side": "offer", "price_level": "100.0", "new_quantity": "1"},
+        ]),
+    ]
+
+    for message in messages[:3]:
+        service.handle_message(message)
+        assert service.observations == []
+    assert service.order_book.state == OrderBookState.REBUILDING
+    service.handle_message(messages[3])
+
+    assert len(service.observations) == 1
+    assert _scientific_boundary_fields(service.observations[0]) == _scientific_boundary_fields(
+        _canonical_boundary(messages)
+    )
+    assert service.observations[0].eligibility_reason == "book_rebuilding"
+    assert (service.observations[0].best_bid, service.observations[0].best_ask) == (None, None)
+    assert service.order_book.state == OrderBookState.SYNCED
+
+
+def test_live_exact_boundary_heartbeat_updates_health_but_waits_for_later_source_time():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:14:50Z"))
+
+    service.handle_message(_heartbeat(2, "2024-01-01T00:15:00Z"))
+
+    assert service.last_heartbeat_at == datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc)
+    assert service.heartbeat_is_healthy()
+    assert service.observations == []
+
+    service.handle_message(_update(3, "2024-01-01T00:15:00.001Z", "bid", 100.5, 2.0))
+
+    assert len(service.observations) == 1
+    assert service.observations[0].canonical_target_eligible
+    assert service.observations[0].best_bid == 100.0
+
+
+def test_live_heartbeat_strictly_after_boundary_advances_boundary_as_stale():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    service.handle_message(_snapshot(1, "2024-01-01T00:14:50Z"))
+
+    service.handle_message(_heartbeat(2, "2024-01-01T00:15:00.001Z"))
+
+    assert len(service.observations) == 1
+    assert service.observations[0].eligibility_reason == "heartbeat_stale"
 
 
 def test_level2_update_rows_and_bbo_state_rows_not_recorded_for_stale_or_gap():
