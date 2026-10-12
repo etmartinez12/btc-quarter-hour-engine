@@ -13,6 +13,7 @@ from btc_quarter_hour_engine.acquisition.websocket_service import (
     _bbo_state_row,
 )
 from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook, OrderBookState
+from btc_quarter_hour_engine.market_data.replay import replay_recorded_frames
 
 
 class FakeTransport:
@@ -525,6 +526,73 @@ def test_live_service_sequence_gap_during_rebuild_invalidates_the_connection():
     assert service.connection.book_rebuild_count == 1
     assert service.connection.book_recovery_count == 0
     assert service.order_book.last_sequence_num == 3
+
+
+def test_live_service_defers_exact_boundary_gap_until_source_time_advances():
+    service, _ = _service([])
+    service.connect_and_subscribe()
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _l2_message(
+            "update",
+            3,
+            "2024-01-01T00:15:00Z",
+            [
+                {"side": "bid", "price_level": "100.0", "new_quantity": "0"},
+                {"side": "offer", "price_level": "101.0", "new_quantity": "0"},
+            ],
+        ),
+        _l2_message(
+            "update",
+            5,
+            "2024-01-01T00:15:00Z",
+            [
+                {"side": "bid", "price_level": "99.0", "new_quantity": "2"},
+                {"side": "offer", "price_level": "100.0", "new_quantity": "3"},
+            ],
+        ),
+        _heartbeat(6, "2024-01-01T00:15:00.001Z"),
+    ]
+    for message in messages[:3]:
+        service.handle_message(message)
+    assert service.observations == []
+
+    with pytest.raises(ValueError, match="expected 4, received 5"):
+        service.handle_message(messages[3])
+
+    assert service.observations == []
+    assert service.order_book.state == OrderBookState.INVALID
+    service.handle_message(messages[4])
+
+    assert len(service.observations) == 1
+    observation = service.observations[0]
+    assert observation.eligibility_reason == "sequence_gap"
+    assert not observation.canonical_target_eligible
+    assert not observation.book_synced
+    assert (observation.best_bid, observation.best_ask, observation.midpoint) == (None, None, None)
+    canonical = replay_recorded_frames(
+        [(message.encode(), "conn-1", index) for index, message in enumerate(messages)],
+        product_id="BTC-USD",
+        session_id="session-1",
+        heartbeat_timeout_seconds=30,
+        session_completed_at_utc=datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc),
+    )[0]
+    assert (
+        observation.canonical_target_eligible,
+        observation.eligibility_reason,
+        observation.book_synced,
+        observation.best_bid,
+        observation.best_ask,
+        observation.midpoint,
+    ) == (
+        canonical.canonical_target_eligible,
+        canonical.eligibility_reason,
+        canonical.book_synced,
+        canonical.best_bid,
+        canonical.best_ask,
+        canonical.midpoint,
+    )
 
 
 def test_level2_update_rows_and_bbo_state_rows_not_recorded_for_stale_or_gap():

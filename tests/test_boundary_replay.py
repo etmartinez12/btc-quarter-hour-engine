@@ -142,6 +142,12 @@ def test_provisional_path_includes_refill_effective_exactly_at_boundary():
         book=book,
         processor=processor,
     )
+    assert observations == []
+    observations = process_parsed_event(
+        event=_heartbeat_event(_utc("2024-01-01T13:15:00.001Z")),
+        book=book,
+        processor=processor,
+    )
 
     assert len(observations) == 1
     assert observations[0].canonical_target_eligible
@@ -162,6 +168,7 @@ def test_exact_boundary_heartbeat_defers_observation_until_refill_and_matches_re
             ("bid", 99.0, 2),
             ("offer", 100.0, 3),
         ]),
+        _heartbeat("2024-01-01T13:15:00.001Z", sequence=6),
     ]
     provisional_book = Level2OrderBook(product_id="BTC-USD")
     provisional_processor = BoundaryEventProcessor(
@@ -389,9 +396,14 @@ def test_replay_events_treats_stale_duplicate_sequence_as_non_fatal():
         _heartbeat_event(datetime(2024, 1, 1, 0, 15, 1, tzinfo=timezone.utc)),
     ]
     replayed = replay_events(events, product_id="BTC-USD", heartbeat_timeout_seconds=3600)
-    assert len(replayed) == 1
-    assert replayed[0].eligible is True
-    assert replayed[0].best_bid == 100.5
+    assert [row.boundary_time_utc for row in replayed] == [
+        datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+        datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc),
+    ]
+    assert replayed[0].eligibility_reason == "heartbeat_stale"
+    assert replayed[0].best_bid == 100.0
+    assert replayed[1].eligible
+    assert replayed[1].best_bid == 100.5
 
 
 def _at(second: str) -> datetime:
@@ -1145,6 +1157,140 @@ def _assert_streaming_matches_offline(raw_frames, *, completed_at):
     )
     assert streamed == offline
     return streamed
+
+
+def _provisional_observations(raw_frames):
+    book = Level2OrderBook(product_id="BTC-USD")
+    processor = BoundaryEventProcessor(
+        product_id="BTC-USD",
+        heartbeat_timeout_seconds=30,
+    )
+    observations = []
+    for raw in raw_frames:
+        event = parse_coinbase_ws_message(raw)
+        observations.extend(process_parsed_event(event=event, book=book, processor=processor))
+    return observations
+
+
+def _scientific_boundary_fields(observation):
+    return (
+        observation.boundary_time_utc,
+        observation.canonical_target_eligible,
+        observation.eligibility_reason,
+        observation.book_synced,
+        observation.best_bid,
+        observation.best_ask,
+        observation.midpoint,
+    )
+
+
+def test_clear_and_refill_at_same_exact_boundary_match_both_canonical_replays():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:15:00Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _rebuild_update(4, "2024-01-01T13:15:00Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+        _heartbeat("2024-01-01T13:15:00.001Z", sequence=5),
+    ]
+
+    provisional = next(
+        row for row in _provisional_observations(frames)
+        if row.boundary_time_utc == _at("15:00")
+    )
+    canonical = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))[0]
+
+    assert provisional.canonical_target_eligible
+    assert provisional.eligibility_reason == "eligible"
+    assert provisional.book_synced
+    assert (provisional.best_bid, provisional.best_ask) == (99.0, 100.0)
+    assert canonical.source_sequence_num == 4
+    assert _scientific_boundary_fields(provisional) == _scientific_boundary_fields(canonical)
+
+
+def test_multiple_same_time_refills_and_stale_duplicate_accumulate_before_boundary():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:15:00Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _rebuild_update(4, "2024-01-01T13:15:00Z", [
+            ("bid", 99.0, 2),
+        ]),
+        _rebuild_update(5, "2024-01-01T13:15:00Z", [
+            ("offer", 100.0, 3),
+        ]),
+        _rebuild_update(5, "2024-01-01T13:15:00Z", [
+            ("bid", 999.0, 1),
+            ("offer", 100.0, 0),
+        ]),
+        _heartbeat("2024-01-01T13:15:00.001Z", sequence=6),
+    ]
+
+    provisional = next(
+        row for row in _provisional_observations(frames)
+        if row.boundary_time_utc == _at("15:00")
+    )
+    canonical = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))[0]
+
+    assert provisional.canonical_target_eligible
+    assert provisional.eligibility_reason == "eligible"
+    assert (provisional.best_bid, provisional.best_ask) == (99.0, 100.0)
+    assert canonical.source_sequence_num == 5
+    assert _scientific_boundary_fields(provisional) == _scientific_boundary_fields(canonical)
+
+
+def test_snapshot_at_exact_boundary_replaces_prior_state_before_finalization():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _frame("l2_data", "2024-01-01T13:15:00Z", 3, event_type="snapshot", updates=[
+            ("bid", "1970-01-01T00:00:00Z", 98.0, 4),
+            ("offer", "1970-01-01T00:00:00Z", 102.0, 5),
+        ]),
+        _heartbeat("2024-01-01T13:15:00.001Z", sequence=4),
+    ]
+
+    provisional = next(
+        row for row in _provisional_observations(frames)
+        if row.boundary_time_utc == _at("15:00")
+    )
+    canonical = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))[0]
+
+    assert provisional.canonical_target_eligible
+    assert (provisional.best_bid, provisional.best_ask) == (98.0, 102.0)
+    assert canonical.source_sequence_num == 3
+    assert _scientific_boundary_fields(provisional) == _scientific_boundary_fields(canonical)
+
+
+def test_sequence_gap_at_exact_boundary_stays_fatal_in_canonical_replays():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:15:00Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _rebuild_update(5, "2024-01-01T13:15:00Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+        _heartbeat("2024-01-01T13:15:00.001Z", sequence=6),
+    ]
+
+    canonical = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))[0]
+
+    assert not canonical.canonical_target_eligible
+    assert canonical.eligibility_reason == "sequence_gap"
+    assert not canonical.book_synced
+    assert (canonical.best_bid, canonical.best_ask, canonical.midpoint) == (None, None, None)
 
 
 def test_canonical_rebuild_spanning_boundary_is_ineligible_then_recovers():

@@ -50,24 +50,38 @@ class BoundaryEventProcessor:
     def note_synced(self) -> None:
         self.gap_since_sync = False
 
-    def observe(self, *, book: Level2OrderBook, event_time_utc: datetime | None) -> list[QuarterHourObservation]:
+    def observe(
+        self,
+        *,
+        book: Level2OrderBook,
+        event_time_utc: datetime | None,
+        defer_exact_boundary: bool = False,
+    ) -> list[QuarterHourObservation]:
         """Emit observations for every quarter-hour boundary newly crossed as of ``event_time_utc``."""
         if event_time_utc is None:
             return []
         event_time_utc = require_utc(event_time_utc)
         floor = floor_to_quarter_hour(event_time_utc)
+        defer_exact = defer_exact_boundary and is_exact_quarter_hour_boundary(event_time_utc)
         if self._last_boundary_checked is None:
             # Bootstrap: allow the very first quarter-hour containing this event to be
             # eligible for emission without walking arbitrarily far into the past.
             self._last_boundary_checked = floor - timedelta(minutes=15)
         boundaries: list[datetime] = []
         cursor = self._last_boundary_checked + timedelta(minutes=15)
-        while cursor <= floor:
+        while (cursor < floor if defer_exact else cursor <= floor):
             boundaries.append(cursor)
             cursor += timedelta(minutes=15)
         observations: list[QuarterHourObservation] = []
         for boundary in boundaries:
-            if book.is_synced() or book.state == OrderBookState.REBUILDING:
+            if (
+                book.is_synced()
+                or book.state == OrderBookState.REBUILDING
+                or (
+                    book.state == OrderBookState.INVALID
+                    and book.last_sequence_num is not None
+                )
+            ):
                 observations.append(
                     derive_quarter_hour_observation(
                         book=book, timestamp_utc=boundary, product_id=self.product_id,
@@ -89,23 +103,14 @@ def process_parsed_event(
     """Apply a parsed event for provisional live processing or legacy replay."""
     event_type = event.get("type")
     event_time_utc = _event_time(event)
-    inclusive_l2_boundary = (
-        event_type == "l2_data"
-        and event_time_utc is not None
-        and is_exact_quarter_hour_boundary(event_time_utc)
-    )
-    defer_exact_heartbeat_boundary = (
-        event_type == "heartbeat"
-        and event_time_utc is not None
+    unresolved_exact_boundary = (
+        event_time_utc is not None
         and is_exact_quarter_hour_boundary(event_time_utc)
     )
     observations = processor.observe(
         book=book,
-        event_time_utc=(
-            event_time_utc - timedelta(microseconds=1)
-            if inclusive_l2_boundary or defer_exact_heartbeat_boundary
-            else event_time_utc
-        ),
+        event_time_utc=event_time_utc,
+        defer_exact_boundary=unresolved_exact_boundary,
     )
     if event_type == "heartbeat":
         time_utc = event.get("time_utc")
@@ -118,8 +123,6 @@ def process_parsed_event(
         # A redelivered/duplicate message for this connection epoch: its
         # effect is already reflected in the book, so it is safely dropped
         # without invalidating the book or marking a gap.
-        if inclusive_l2_boundary:
-            observations.extend(processor.observe(book=book, event_time_utc=event_time_utc))
         return observations
     try:
         if event_type == "snapshot":
@@ -135,14 +138,10 @@ def process_parsed_event(
             book.apply_updates(event.get("updates", []))
     except ValueError:
         processor.note_gap()
-        if inclusive_l2_boundary:
-            observations.extend(processor.observe(book=book, event_time_utc=event_time_utc))
         return observations
     if sequence_num is not None:
         book.last_sequence_num = sequence_num
     processor.note_synced()
-    if inclusive_l2_boundary:
-        observations.extend(processor.observe(book=book, event_time_utc=event_time_utc))
     return observations
 
 
