@@ -373,6 +373,25 @@ The unit tests cover:
 
 All WebSocket/collector tests are network-independent: the transport tests use a `websockets` server bound to `127.0.0.1:0`, and all other tests use an in-memory fake transport.
 
+## L2 Replay Performance Benchmarks
+
+The standalone benchmark harness compares the production order book with an
+independent copy-on-write reference and measures canonical replay consume and
+finalize separately. Workloads are generated before timing; benchmark runs are
+manual and are not timing assertions in CI.
+
+```bash
+python benchmarks/benchmark_l2_replay.py order-book --workload small-updates
+python benchmarks/benchmark_l2_replay.py order-book --workload top-churn
+python benchmarks/benchmark_l2_replay.py order-book --workload deep-churn
+python benchmarks/benchmark_l2_replay.py order-book --workload rebuild
+python benchmarks/benchmark_l2_replay.py canonical-replay --implementation both
+```
+
+Each command accepts depth, frame/envelope count, repeat count, and seed
+options. Results report medians, throughput, semantic parity, and final heap
+sizes. `--json-output path.json` writes the same report to a file.
+
 ## Design notes
 
 - Phase 2 expands the feature space while keeping every feature computable from information available at or before boundary `t`.

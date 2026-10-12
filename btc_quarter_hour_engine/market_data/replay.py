@@ -992,11 +992,21 @@ def _freeze_boundary_observation(
             },
         )
     elif state.book_state == OrderBookState.REBUILDING:
-        if state.best_bid is not None and state.best_bid_size is not None:
-            book.bids = {state.best_bid: state.best_bid_size}
-        if state.best_ask is not None and state.best_ask_size is not None:
-            book.asks = {state.best_ask: state.best_ask_size}
-        book.state = OrderBookState.REBUILDING
+        bids = (
+            {state.best_bid: state.best_bid_size}
+            if state.best_bid is not None and state.best_bid_size is not None
+            else {}
+        )
+        asks = (
+            {state.best_ask: state.best_ask_size}
+            if state.best_ask is not None and state.best_ask_size is not None
+            else {}
+        )
+        book._replace_levels_for_state(
+            bids=bids,
+            asks=asks,
+            state=OrderBookState.REBUILDING,
+        )
     integrity_reason = None
     if control is not None and control[0] <= boundary:
         integrity_reason = control[2]

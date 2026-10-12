@@ -11,7 +11,7 @@ from btc_quarter_hour_engine.market_data.boundary_observations import (
     derive_quarter_hour_observation,
     is_exact_quarter_hour_boundary,
 )
-from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook
+from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook, OrderBookState
 from btc_quarter_hour_engine.market_data.replay import (
     BoundaryEventProcessor,
     CanonicalReplayAccumulator,
@@ -20,6 +20,8 @@ from btc_quarter_hour_engine.market_data.replay import (
     replay_recorded_frames,
     replay_events,
 )
+from btc_quarter_hour_engine.market_data import replay as replay_module
+from btc_quarter_hour_engine.market_data.replay import _CompactBoundaryState
 
 
 def test_floor_to_quarter_hour():
@@ -1526,3 +1528,50 @@ def test_new_connection_during_rebuild_requires_a_fresh_snapshot():
     assert streamed[-1].eligibility_reason == "no_synced_snapshot"
     assert not streamed[-1].book_synced
     assert (streamed[-1].best_bid, streamed[-1].best_ask) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("bid", "bid_size", "ask", "ask_size"),
+    [(100.0, 1.0, None, None), (None, None, 101.0, 2.0)],
+)
+def test_compact_rebuilding_boundary_state_rebuilds_matching_heap_indexes(
+    monkeypatch, bid, bid_size, ask, ask_size,
+):
+    observed_books = []
+    derive = replay_module.derive_quarter_hour_observation
+
+    def inspect_book(**kwargs):
+        observed_books.append(kwargs["book"])
+        return derive(**kwargs)
+
+    monkeypatch.setattr(replay_module, "derive_quarter_hour_observation", inspect_book)
+    observation = replay_module._freeze_boundary_observation(
+        connection_id="conn-1",
+        boundary=_at("15:00"),
+        state=_CompactBoundaryState(
+            connection_id="conn-1",
+            source_state_time_utc=_at("14:59"),
+            source_sequence_num=3,
+            best_bid=bid,
+            best_bid_size=bid_size,
+            best_ask=ask,
+            best_ask_size=ask_size,
+            book_synced=False,
+            book_state=OrderBookState.REBUILDING,
+        ),
+        heartbeat=None,
+        control=None,
+        product_id="BTC-USD",
+        session_id="session-1",
+        derived_at=_at("15:00"),
+        heartbeat_timeout_seconds=30,
+    )
+
+    assert len(observed_books) == 1
+    book = observed_books[0]
+    assert book.state == OrderBookState.REBUILDING
+    assert book._peek_best_bid() == bid
+    assert book._peek_best_ask() == ask
+    assert observation.eligibility_reason == "book_rebuilding"
+    assert not observation.canonical_target_eligible
+    assert (observation.best_bid, observation.best_ask) == (None, None)
