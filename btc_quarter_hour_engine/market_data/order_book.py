@@ -201,15 +201,6 @@ class Level2OrderBook:
     def _validate_book_integrity(self) -> None:
         self._validate_candidate_book(self.bids, self.asks)
 
-    def _apply_level(self, *, side: str, price: float, quantity: float) -> None:
-        if quantity == 0:
-            self.bids.pop(price, None) if side == "bid" else self.asks.pop(price, None)
-            return
-        if side == "bid":
-            self.bids[price] = quantity
-        else:
-            self.asks[price] = quantity
-
     @staticmethod
     def _apply_level_to(
         bids: dict[float, float],

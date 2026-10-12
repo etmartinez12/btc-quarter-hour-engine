@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
+import os
 import random
 import statistics
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -22,9 +25,30 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tests.reference_order_book import CopyOnWriteReferenceBook
+
+RUNTIME_ROOT = Path(os.environ.get("BTC_QH_RUNTIME_ROOT", ROOT)).resolve()
+if str(RUNTIME_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNTIME_ROOT))
+
 from btc_quarter_hour_engine.market_data.order_book import Level2OrderBook
 from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
-from tests.reference_order_book import CopyOnWriteReferenceBook
+from btc_quarter_hour_engine.market_data import replay as replay_module
+
+
+def _runtime_metadata() -> dict[str, str]:
+    git_sha = subprocess.run(
+        ["git", "-C", str(RUNTIME_ROOT), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return {
+        "runtime_root": str(RUNTIME_ROOT),
+        "runtime_git_sha": git_sha,
+        "order_book_module": str(Path(inspect.getfile(Level2OrderBook)).resolve()),
+        "replay_module": str(Path(inspect.getfile(replay_module)).resolve()),
+    }
 
 
 def _levels(depth: int) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
@@ -211,29 +235,30 @@ def _wire_frame(channel: str, timestamp: datetime, sequence: int, *,
     }, separators=(",", ":")).encode("utf-8")
 
 
-def _canonical_result(*, depth: int, frame_count: int, repeats: int,
-                      implementation: str) -> dict[str, Any]:
-    from btc_quarter_hour_engine.market_data import boundary_observations, replay
-
-    original_replay_book = replay.Level2OrderBook
-    original_observation_book = boundary_observations.Level2OrderBook
-    if implementation == "copy-on-write-reference":
-        replay.Level2OrderBook = CopyOnWriteReferenceBook
-        boundary_observations.Level2OrderBook = CopyOnWriteReferenceBook
-    else:
-        replay.Level2OrderBook = Level2OrderBook
-        boundary_observations.Level2OrderBook = Level2OrderBook
+def _canonical_frames(*, depth: int, frame_count: int) -> tuple[list[bytes], int, int]:
     base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     snapshot_bids, snapshot_asks = _levels(depth)
     frames = [_wire_frame("l2_data", base, 1, updates=[
         *({"side": "bid", "price": row["price"], "quantity": row["quantity"]} for row in snapshot_bids),
         *({"side": "offer", "price": row["price"], "quantity": row["quantity"]} for row in snapshot_asks),
     ], event_type="snapshot")]
+    clear_frame_index = max(1, int(frame_count * 0.4))
+    refill_frame_index = clear_frame_index + 1
     sequence = 1
     for index in range(1, frame_count):
         sequence += 1
         timestamp = base + timedelta(microseconds=index * 1000)
-        if index % 10 == 0:
+        if index == clear_frame_index:
+            updates = [
+                {"side": "bid", "price": row["price"], "quantity": 0.0}
+                for row in snapshot_bids
+            ]
+            frames.append(_wire_frame("l2_data", timestamp, sequence, updates=updates))
+        elif index == refill_frame_index:
+            frames.append(_wire_frame("l2_data", timestamp, sequence, updates=[
+                {"side": "bid", "price": 49_999.0, "quantity": 1.0},
+            ]))
+        elif index % 10 == 0:
             frames.append(_wire_frame("heartbeats", timestamp, sequence))
         else:
             side = "bid" if index % 2 else "offer"
@@ -241,6 +266,49 @@ def _canonical_result(*, depth: int, frame_count: int, repeats: int,
             frames.append(_wire_frame("l2_data", timestamp, sequence, updates=[
                 {"side": side, "price": price, "quantity": 1.0 + (index % 7) / 10.0},
             ]))
+    return frames, clear_frame_index, refill_frame_index
+
+
+def _canonical_result(
+    *,
+    depth: int,
+    frame_count: int,
+    repeats: int,
+    implementation: str,
+    frames_file: Path | None = None,
+    frames_output: Path | None = None,
+) -> dict[str, Any]:
+    from btc_quarter_hour_engine.market_data import boundary_observations, replay
+
+    original_replay_book = replay.Level2OrderBook
+    original_observation_book = boundary_observations.Level2OrderBook
+    if implementation == "copy-on-write-reference":
+        book_type = CopyOnWriteReferenceBook
+    else:
+        book_type = Level2OrderBook
+    rebuild_transitions: list[tuple[str, str]] = []
+
+    class TrackingBook(book_type):
+        def apply_updates(self, updates: Any) -> None:
+            previous_state = self.state.value
+            super().apply_updates(updates)
+            current_state = self.state.value
+            if previous_state != current_state:
+                rebuild_transitions.append((previous_state, current_state))
+
+    replay.Level2OrderBook = TrackingBook
+    boundary_observations.Level2OrderBook = TrackingBook
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    frames, clear_frame_index, refill_frame_index = (
+        ([line for line in frames_file.read_bytes().splitlines() if line], max(1, int(frame_count * 0.4)),
+         max(1, int(frame_count * 0.4)) + 1)
+        if frames_file is not None
+        else _canonical_frames(depth=depth, frame_count=frame_count)
+    )
+    if len(frames) != frame_count:
+        raise ValueError(f"Expected {frame_count} frames in workload, found {len(frames)}")
+    if frames_output is not None:
+        frames_output.write_bytes(b"\n".join(frames) + b"\n")
 
     try:
         consume_results: list[float] = []
@@ -267,12 +335,21 @@ def _canonical_result(*, depth: int, frame_count: int, repeats: int,
         replay.Level2OrderBook = original_replay_book
         boundary_observations.Level2OrderBook = original_observation_book
 
+    expected_transitions = [("SYNCED", "REBUILDING"), ("REBUILDING", "SYNCED")]
+    if not all(transition in rebuild_transitions for transition in expected_transitions):
+        raise RuntimeError(f"Canonical replay did not complete the rebuild episode: {rebuild_transitions!r}")
     consume_median = statistics.median(consume_results)
     finalize_median = statistics.median(finalize_results)
     return {
         "implementation": implementation,
+        **_runtime_metadata(),
         "frame_count": len(frames),
         "depth_per_side": depth,
+        "clear_frame_index": clear_frame_index,
+        "refill_frame_index": refill_frame_index,
+        "clear_update_count": depth,
+        "refill_update_count": 1,
+        "rebuild_transitions": rebuild_transitions,
         "repeats": repeats,
         "consume_seconds": consume_results,
         "consume_median_seconds": consume_median,
@@ -307,6 +384,8 @@ def main() -> None:
     canonical.add_argument("--implementation",
                            choices=("optimized", "copy-on-write-reference", "both"),
                            default="optimized")
+    canonical.add_argument("--frames-file", type=Path)
+    canonical.add_argument("--frames-output", type=Path)
     canonical.add_argument("--json-output", type=Path)
     args = parser.parse_args()
     if args.mode == "order-book":
@@ -323,6 +402,8 @@ def main() -> None:
             _canonical_result(
                 depth=args.depth_per_side, frame_count=args.frames, repeats=args.repeats,
                 implementation=implementation,
+                frames_file=args.frames_file,
+                frames_output=args.frames_output,
             )
             for implementation in implementations
         ]
