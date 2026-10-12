@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import heapq
 import math
 from collections.abc import Iterable, Mapping
 from enum import Enum
 from typing import Any
+
+HEAP_COMPACTION_FACTOR = 2
+HEAP_COMPACTION_SLACK = 1024
+_MISSING = object()
 
 
 class OrderBookState(str, Enum):
@@ -25,41 +30,89 @@ class Level2OrderBook:
         self.product_id = product_id
         self.bids: dict[float, float] = {}
         self.asks: dict[float, float] = {}
+        self._bid_heap: list[float] = []
+        self._ask_heap: list[float] = []
         self.state = OrderBookState.UNINITIALIZED
         self.last_sequence_num: int | None = None
         self.last_error: str | None = None
 
+    def _rebuild_heaps(self) -> None:
+        self._bid_heap = [-price for price in self.bids]
+        self._ask_heap = list(self.asks)
+        heapq.heapify(self._bid_heap)
+        heapq.heapify(self._ask_heap)
+
+    def _replace_levels_for_state(
+        self,
+        *,
+        bids: Mapping[float, float],
+        asks: Mapping[float, float],
+        state: OrderBookState,
+    ) -> None:
+        """Reconstruct a trusted compact replay state and its runtime indexes."""
+        self.bids = dict(bids)
+        self.asks = dict(asks)
+        self._rebuild_heaps()
+        self.state = state
+        self.last_error = None
+
+    def _peek_best_bid(self) -> float | None:
+        while self._bid_heap:
+            price = -self._bid_heap[0]
+            if price in self.bids:
+                return price
+            heapq.heappop(self._bid_heap)
+        return None
+
+    def _peek_best_ask(self) -> float | None:
+        while self._ask_heap:
+            price = self._ask_heap[0]
+            if price in self.asks:
+                return price
+            heapq.heappop(self._ask_heap)
+        return None
+
+    def _compact_heaps_if_needed(self) -> None:
+        if len(self._bid_heap) > HEAP_COMPACTION_FACTOR * len(self.bids) + HEAP_COMPACTION_SLACK:
+            self._bid_heap = [-price for price in self.bids]
+            heapq.heapify(self._bid_heap)
+        if len(self._ask_heap) > HEAP_COMPACTION_FACTOR * len(self.asks) + HEAP_COMPACTION_SLACK:
+            self._ask_heap = list(self.asks)
+            heapq.heapify(self._ask_heap)
+
     @property
     def best_bid(self) -> float | None:
-        return max(self.bids.items(), key=lambda item: item[0])[0] if self.bids else None
+        return self._peek_best_bid()
 
     @property
     def best_ask(self) -> float | None:
-        return min(self.asks.items(), key=lambda item: item[0])[0] if self.asks else None
+        return self._peek_best_ask()
 
     @property
     def best_bid_size(self) -> float | None:
-        if not self.bids:
-            return None
-        return self.bids[self.best_bid]
+        bid = self._peek_best_bid()
+        return self.bids[bid] if bid is not None else None
 
     @property
     def best_ask_size(self) -> float | None:
-        if not self.asks:
-            return None
-        return self.asks[self.best_ask]
+        ask = self._peek_best_ask()
+        return self.asks[ask] if ask is not None else None
 
     @property
     def spread(self) -> float | None:
-        if self.best_bid is None or self.best_ask is None:
+        bid = self._peek_best_bid()
+        ask = self._peek_best_ask()
+        if bid is None or ask is None:
             return None
-        return self.best_ask - self.best_bid
+        return ask - bid
 
     @property
     def midpoint(self) -> float | None:
-        if self.best_bid is None or self.best_ask is None:
+        bid = self._peek_best_bid()
+        ask = self._peek_best_ask()
+        if bid is None or ask is None:
             return None
-        return (self.best_bid + self.best_ask) / 2.0
+        return (bid + ask) / 2.0
 
     def invalidate(self, reason: str | None = None) -> None:
         self.last_error = reason
@@ -68,6 +121,8 @@ class Level2OrderBook:
     def reset(self) -> None:
         self.bids.clear()
         self.asks.clear()
+        self._bid_heap.clear()
+        self._ask_heap.clear()
         self.state = OrderBookState.UNINITIALIZED
         self.last_error = None
 
@@ -120,6 +175,25 @@ class Level2OrderBook:
         if best_bid <= 0 or best_ask <= 0:
             raise ValueError("Best bid and ask prices must be positive")
         if best_bid > best_ask:
+            raise ValueError("Crossed book: best_bid exceeds best_ask")
+        if bid_size < 0 or ask_size < 0:
+            raise ValueError("Best bid/ask sizes cannot be negative")
+
+    def _validate_live_candidate(self) -> None:
+        bid = self._peek_best_bid()
+        ask = self._peek_best_ask()
+        if bid is None or ask is None:
+            raise ValueError("Order book requires both bid and ask sides")
+        bid_size = self.bids[bid]
+        ask_size = self.asks[ask]
+        values = [bid, ask, bid_size, ask_size]
+        if any(value is None for value in values):
+            raise ValueError("Best bid/ask values are incomplete")
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError("Best bid/ask values must be finite")
+        if bid <= 0 or ask <= 0:
+            raise ValueError("Best bid and ask prices must be positive")
+        if bid > ask:
             raise ValueError("Crossed book: best_bid exceeds best_ask")
         if bid_size < 0 or ask_size < 0:
             raise ValueError("Best bid/ask sizes cannot be negative")
@@ -181,6 +255,7 @@ class Level2OrderBook:
             raise ValueError(str(exc)) from exc
         self.bids = staged_bids
         self.asks = staged_asks
+        self._rebuild_heaps()
         self.state = OrderBookState.SYNCED
         self.last_error = None
 
@@ -204,29 +279,46 @@ class Level2OrderBook:
             self.invalidate(str(exc))
             raise ValueError(str(exc)) from exc
 
-        staged_bids = dict(self.bids)
-        staged_asks = dict(self.asks)
+        journal: dict[tuple[str, float], object] = {}
         for side, price, quantity in normalized_updates:
-            self._apply_level_to(staged_bids, staged_asks, side=side, price=price, quantity=quantity)
-        if not staged_bids or not staged_asks:
+            levels = self.bids if side == "bid" else self.asks
+            key = (side, price)
+            if key not in journal:
+                journal[key] = levels.get(price, _MISSING)
+            if quantity == 0:
+                levels.pop(price, None)
+            else:
+                was_absent = price not in levels
+                levels[price] = quantity
+                if was_absent:
+                    heap = self._bid_heap if side == "bid" else self._ask_heap
+                    heapq.heappush(heap, -price if side == "bid" else price)
+        if not self.bids or not self.asks:
             # Coinbase can clear a complete book in-band and refill it in
             # later sequence-contiguous envelopes. Commit each full envelope,
             # but never present this intermediate state as a canonical BBO.
-            self.bids = staged_bids
-            self.asks = staged_asks
             self.state = OrderBookState.REBUILDING
             self.last_error = None
+            self._compact_heaps_if_needed()
             return
         try:
-            self._validate_candidate_book(staged_bids, staged_asks)
+            self._validate_live_candidate()
         except ValueError as exc:
+            for (side, price), original_quantity in journal.items():
+                levels = self.bids if side == "bid" else self.asks
+                if original_quantity is _MISSING:
+                    levels.pop(price, None)
+                else:
+                    levels[price] = original_quantity
+                    heap = self._bid_heap if side == "bid" else self._ask_heap
+                    heapq.heappush(heap, -price if side == "bid" else price)
             self.invalidate(str(exc))
+            self._compact_heaps_if_needed()
             raise
 
-        self.bids = staged_bids
-        self.asks = staged_asks
         self.state = OrderBookState.SYNCED
         self.last_error = None
+        self._compact_heaps_if_needed()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -243,9 +335,9 @@ class Level2OrderBook:
         }
 
     def top_of_book(self) -> dict[str, Any]:
-        best_bid = max(self.bids) if self.bids else None
+        best_bid = self._peek_best_bid()
         best_bid_size = self.bids[best_bid] if best_bid is not None else None
-        best_ask = min(self.asks) if self.asks else None
+        best_ask = self._peek_best_ask()
         best_ask_size = self.asks[best_ask] if best_ask is not None else None
         spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
         midpoint = (best_bid + best_ask) / 2.0 if best_bid is not None and best_ask is not None else None
