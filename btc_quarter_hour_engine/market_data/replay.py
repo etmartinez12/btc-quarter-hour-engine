@@ -94,11 +94,17 @@ def process_parsed_event(
         and event_time_utc is not None
         and is_exact_quarter_hour_boundary(event_time_utc)
     )
+    defer_exact_heartbeat_boundary = (
+        event_type == "heartbeat"
+        and event_time_utc is not None
+        and is_exact_quarter_hour_boundary(event_time_utc)
+    )
     observations = processor.observe(
         book=book,
         event_time_utc=(
             event_time_utc - timedelta(microseconds=1)
-            if inclusive_l2_boundary else event_time_utc
+            if inclusive_l2_boundary or defer_exact_heartbeat_boundary
+            else event_time_utc
         ),
     )
     if event_type == "heartbeat":
@@ -117,7 +123,6 @@ def process_parsed_event(
         return observations
     try:
         if event_type == "snapshot":
-            book.reset()
             updates = event.get("updates", [])
             book.apply_snapshot(
                 product_id=book.product_id,
@@ -155,6 +160,17 @@ def _envelope_integrity_reason(
     if not bids:
         return "missing_bid"
     if not asks:
+        return "missing_ask"
+    return "malformed_source_state"
+
+
+def _snapshot_integrity_reason(updates: list[Mapping[str, Any]], error: Exception) -> str:
+    if "crossed" in str(error).lower():
+        return "crossed_book"
+    sides = {update.get("side") for update in updates if isinstance(update, Mapping)}
+    if "bid" not in sides:
+        return "missing_bid"
+    if "ask" not in sides:
         return "missing_ask"
     return "malformed_source_state"
 
@@ -307,7 +323,7 @@ def replay_recorded_frames(
                     )
                 except (ValueError, KeyError, TypeError) as exc:
                     invalid = True
-                    failure_reason = _envelope_integrity_reason(wire_book.bids, wire_book.asks, exc)
+                    failure_reason = _snapshot_integrity_reason(updates, exc)
                     connection_controls.append((
                         event_time, arrival, "envelope_invalid", (failure_reason, str(exc)), current,
                     ))
@@ -411,7 +427,11 @@ def replay_recorded_frames(
                         state_times[active] = envelope_action.effective_time_utc
                         state_sequences[active] = envelope_action.sequence_num
                 except (ValueError, KeyError, TypeError) as exc:
-                    reasons[active] = _envelope_integrity_reason(book.bids, book.asks, exc)
+                    reasons[active] = (
+                        _snapshot_integrity_reason(envelope_action.updates, exc)
+                        if envelope_action.kind == "snapshot"
+                        else _envelope_integrity_reason(book.bids, book.asks, exc)
+                    )
                     book.invalidate(str(exc))
 
             connection_controls = controls[active]
@@ -630,7 +650,7 @@ def _replay_connection_at_boundary(
                     },
                 )
             except (ValueError, KeyError, TypeError) as exc:
-                envelope_invalid = (_envelope_integrity_reason(wire_book.bids, wire_book.asks, exc), str(exc))
+                envelope_invalid = (_snapshot_integrity_reason(updates, exc), str(exc))
         elif wire_book.state in {OrderBookState.SYNCED, OrderBookState.REBUILDING}:
             try:
                 wire_book.apply_updates(updates)
@@ -664,7 +684,7 @@ def _replay_connection_at_boundary(
                         state_time = event_time
                         state_sequence = current
                 except (ValueError, KeyError, TypeError) as exc:
-                    canonical_reason = _envelope_integrity_reason(book.bids, book.asks, exc)
+                    canonical_reason = _snapshot_integrity_reason(updates, exc)
                     canonical_message = str(exc)
                     book.invalidate(str(exc))
 
@@ -1147,7 +1167,7 @@ class CanonicalReplayAccumulator:
                     },
                 )
             except (ValueError, KeyError, TypeError) as exc:
-                reason = _envelope_integrity_reason(state.book.bids, state.book.asks, exc)
+                reason = _snapshot_integrity_reason(event["updates"], exc)
                 state.record_control(event_time, reason, str(exc))
                 return
             state.has_snapshot = True

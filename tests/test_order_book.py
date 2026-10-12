@@ -319,18 +319,50 @@ def test_snapshot_requires_two_sided_book():
 @pytest.mark.parametrize(
     "levels",
     [
-        {"bid": [None], "ask": [{"price": 101.0, "quantity": 1.0}]},
-        {"bid": [{"price": 100.0, "quantity": -1.0}], "ask": [{"price": 101.0, "quantity": 1.0}]},
+        {
+            "bid": [{"price": 99.0, "quantity": 2.0}, None],
+            "ask": [{"price": 102.0, "quantity": 3.0}],
+        },
+        {
+            "bid": [{"price": 99.0, "quantity": 2.0}, {"price": 98.0, "quantity": -1.0}],
+            "ask": [{"price": 102.0, "quantity": 3.0}],
+        },
     ],
 )
-def test_malformed_snapshot_is_fatal(levels):
+def test_rejected_snapshot_is_atomic_and_fatal(levels):
     book = _synced_book()
+    before_bids = dict(book.bids)
+    before_asks = dict(book.asks)
 
     with pytest.raises(ValueError):
         book.apply_snapshot(product_id="BTC-USD", levels=levels)
 
     assert book.state == OrderBookState.INVALID
     assert not book.is_synced()
+    assert book.bids == before_bids
+    assert book.asks == before_asks
+    assert book.last_error
+
+
+def test_crossed_snapshot_is_atomic_and_fatal():
+    book = _synced_book()
+    before_bids = dict(book.bids)
+    before_asks = dict(book.asks)
+
+    with pytest.raises(ValueError, match="Crossed book"):
+        book.apply_snapshot(
+            product_id="BTC-USD",
+            levels={
+                "bid": [{"price": 103.0, "quantity": 2.0}],
+                "ask": [{"price": 102.0, "quantity": 3.0}],
+            },
+        )
+
+    assert book.state == OrderBookState.INVALID
+    assert not book.is_synced()
+    assert book.bids == before_bids
+    assert book.asks == before_asks
+    assert "Crossed book" in book.last_error
 
 
 def test_reset_clears_book_but_retains_l2_sequence_provenance():

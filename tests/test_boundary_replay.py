@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
 from btc_quarter_hour_engine.market_data.boundary_observations import (
     derive_quarter_hour_observation,
     is_exact_quarter_hour_boundary,
@@ -146,6 +147,118 @@ def test_provisional_path_includes_refill_effective_exactly_at_boundary():
     assert observations[0].canonical_target_eligible
     assert observations[0].eligibility_reason == "eligible"
     assert (observations[0].best_bid, observations[0].best_ask) == (99.0, 100.0)
+
+
+def test_exact_boundary_heartbeat_defers_observation_until_refill_and_matches_replay():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _heartbeat("2024-01-01T13:15:00Z", sequence=4),
+        _rebuild_update(5, "2024-01-01T13:15:00Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+    ]
+    provisional_book = Level2OrderBook(product_id="BTC-USD")
+    provisional_processor = BoundaryEventProcessor(
+        product_id="BTC-USD",
+        heartbeat_timeout_seconds=30,
+    )
+    provisional_observations = []
+    for raw in frames:
+        event = parse_coinbase_ws_message(raw)
+        provisional_observations.extend(
+            process_parsed_event(
+                event=event,
+                book=provisional_book,
+                processor=provisional_processor,
+            )
+        )
+
+    canonical = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))
+    provisional = next(
+        observation
+        for observation in provisional_observations
+        if observation.boundary_time_utc == _at("15:00")
+    )
+
+    assert provisional.canonical_target_eligible
+    assert provisional.eligibility_reason == "eligible"
+    assert provisional.book_synced
+    assert (provisional.best_bid, provisional.best_ask) == (99.0, 100.0)
+    assert (
+        provisional.canonical_target_eligible,
+        provisional.eligibility_reason,
+        provisional.book_synced,
+        provisional.best_bid,
+        provisional.best_ask,
+    ) == (
+        canonical[0].canonical_target_eligible,
+        canonical[0].eligibility_reason,
+        canonical[0].book_synced,
+        canonical[0].best_bid,
+        canonical[0].best_ask,
+    )
+
+
+def test_exact_boundary_heartbeat_does_not_make_later_refill_eligible():
+    frames = [
+        _snapshot(),
+        _heartbeat("2024-01-01T13:14:55Z", sequence=2),
+        _rebuild_update(3, "2024-01-01T13:14:59.900Z", [
+            ("bid", 100.0, 0),
+            ("offer", 101.0, 0),
+        ]),
+        _heartbeat("2024-01-01T13:15:00Z", sequence=4),
+        _rebuild_update(5, "2024-01-01T13:15:00.000001Z", [
+            ("bid", 99.0, 2),
+            ("offer", 100.0, 3),
+        ]),
+    ]
+    provisional_book = Level2OrderBook(product_id="BTC-USD")
+    provisional_processor = BoundaryEventProcessor(
+        product_id="BTC-USD",
+        heartbeat_timeout_seconds=30,
+    )
+    provisional_observations = []
+    for raw in frames:
+        event = parse_coinbase_ws_message(raw)
+        provisional_observations.extend(
+            process_parsed_event(
+                event=event,
+                book=provisional_book,
+                processor=provisional_processor,
+            )
+        )
+
+    canonical = _assert_streaming_matches_offline(frames, completed_at=_at("15:00"))
+    provisional = next(
+        observation
+        for observation in provisional_observations
+        if observation.boundary_time_utc == _at("15:00")
+    )
+
+    assert not provisional.canonical_target_eligible
+    assert provisional.eligibility_reason == "book_rebuilding"
+    assert not provisional.book_synced
+    assert (
+        provisional.canonical_target_eligible,
+        provisional.eligibility_reason,
+        provisional.book_synced,
+        provisional.best_bid,
+        provisional.best_ask,
+    ) == (
+        canonical[0].canonical_target_eligible,
+        canonical[0].eligibility_reason,
+        canonical[0].book_synced,
+        canonical[0].best_bid,
+        canonical[0].best_ask,
+    )
+    assert canonical[0].eligibility_reason == "book_rebuilding"
 
 
 def test_l2_mutation_path_does_not_infer_gaps_from_l2_only_sequences():

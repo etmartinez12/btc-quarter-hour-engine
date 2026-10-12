@@ -174,13 +174,9 @@ class Level2OrderBook:
                     )
             self._validate_candidate_book(staged_bids, staged_asks)
         except ValueError as exc:
-            self.bids = staged_bids
-            self.asks = staged_asks
             self.invalidate(str(exc))
             raise
         except TypeError as exc:
-            self.bids = staged_bids
-            self.asks = staged_asks
             self.invalidate(str(exc))
             raise ValueError(str(exc)) from exc
         self.bids = staged_bids
