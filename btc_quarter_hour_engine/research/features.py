@@ -25,6 +25,66 @@ from btc_quarter_hour_engine.research.forward_dataset import (
 
 WINDOWS_MINUTES = (15, 30, 60, 240)
 
+PREDICTOR_CONTRACT_VERSION = "bbo-causal-v1"
+
+BASE_PREDICTOR_COLUMNS = (
+    "asof_book_synced",
+    "asof_midpoint",
+    "asof_spread_bps",
+    "asof_best_bid_size",
+    "asof_best_ask_size",
+    "asof_top_book_imbalance",
+)
+
+WINDOW_PREDICTOR_BASES = (
+    "bbo_bucket_coverage",
+    "bbo_state_count",
+    "bbo_valid_fraction",
+    "bbo_synced_fraction",
+    "bbo_spread_mean_bps",
+    "bbo_spread_std_bps",
+    "bbo_spread_max_bps",
+    "bbo_imbalance_mean",
+    "bbo_imbalance_std",
+    "bbo_midpoint_min",
+    "bbo_midpoint_max",
+    "distance_from_high",
+    "distance_from_low",
+    "midpoint_change_count",
+    "l2_envelope_count",
+    "l2_incremental_envelope_count",
+    "l2_update_count",
+    "l2_bid_update_count",
+    "l2_ask_update_count",
+    "l2_update_imbalance",
+    "l2_delete_count",
+    "l2_bid_delete_count",
+    "l2_ask_delete_count",
+    "l2_delete_imbalance",
+    "snapshot_envelope_count",
+)
+
+CALENDAR_PREDICTOR_COLUMNS = (
+    "hour_utc",
+    "quarter_hour_slot",
+    "day_of_week",
+    "is_weekend",
+)
+
+PREDICTOR_COLUMNS = (
+    BASE_PREDICTOR_COLUMNS
+    + tuple(
+        f"momentum_log_return_{minutes}m"
+        for minutes in WINDOWS_MINUTES
+    )
+    + tuple(
+        f"{base}_{minutes}m"
+        for minutes in WINDOWS_MINUTES
+        for base in WINDOW_PREDICTOR_BASES
+    )
+    + CALENDAR_PREDICTOR_COLUMNS
+)
+
 
 def _ceil_quarter_hour(timestamp: datetime) -> datetime:
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
@@ -859,3 +919,96 @@ def build_raw_research_feature_frame(
     )
 
     return features, diagnostics
+
+
+def research_predictor_columns(
+    features: pd.DataFrame,
+) -> tuple[str, ...]:
+    """Return the exact approved causal predictor contract."""
+
+    missing = [
+        column
+        for column in PREDICTOR_COLUMNS
+        if column not in features.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Feature frame is missing required predictor columns: "
+            f"{missing}"
+        )
+
+    non_numeric = [
+        column
+        for column in PREDICTOR_COLUMNS
+        if not (
+            pd.api.types.is_numeric_dtype(features[column])
+            or pd.api.types.is_bool_dtype(features[column])
+        )
+    ]
+
+    if non_numeric:
+        raise ValueError(
+            "Predictor contract found non-numeric columns: "
+            f"{non_numeric}"
+        )
+
+    return PREDICTOR_COLUMNS
+
+
+def research_model_matrix(
+    features: pd.DataFrame,
+    *,
+    trainable_only: bool = True,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Return leakage-safe X/y under the versioned predictor contract."""
+
+    required = {"target", "trainable"}
+
+    missing = required.difference(features.columns)
+    if missing:
+        raise ValueError(
+            f"Feature frame missing required columns: {sorted(missing)}"
+        )
+
+    frame = (
+        features.loc[features["trainable"]].copy()
+        if trainable_only
+        else features.copy()
+    )
+
+    if frame.empty:
+        raise ValueError("Model matrix contains zero rows")
+
+    columns = research_predictor_columns(frame)
+
+    X = frame.loc[:, columns].copy()
+    y = frame["target"].copy()
+
+    if X.isna().any().any():
+        bad = X.columns[X.isna().any()].tolist()
+        raise ValueError(
+            "Predictor matrix contains missing values in columns: "
+            f"{bad}"
+        )
+
+    values = X.to_numpy(dtype=float)
+
+    if not np.isfinite(values).all():
+        raise ValueError(
+            "Predictor matrix contains non-finite numeric values"
+        )
+
+    if y.isna().any():
+        raise ValueError("Target contains missing values")
+
+    target_values = set(
+        y.astype(int).unique().tolist()
+    )
+
+    if not target_values.issubset({0, 1}):
+        raise ValueError(
+            "Target must contain only binary labels 0 and 1"
+        )
+
+    return X, y

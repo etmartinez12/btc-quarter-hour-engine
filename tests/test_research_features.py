@@ -440,3 +440,128 @@ def test_assembled_features_use_causal_asof_not_canonical(tmp_path):
     # Training eligibility still requires a valid target.
     assert bool(final["target_eligible"]) is False
     assert bool(final["trainable"]) is False
+
+
+def _contract_frame(rows=3):
+    from btc_quarter_hour_engine.research.features import (
+        PREDICTOR_COLUMNS,
+    )
+
+    frame = pd.DataFrame(
+        {
+            column: [1.0] * rows
+            for column in PREDICTOR_COLUMNS
+        }
+    )
+
+    frame["target"] = [0, 1, 0][:rows]
+    frame["trainable"] = [True, False, True][:rows]
+
+    # Deliberate leakage / metadata columns.
+    frame["timestamp"] = pd.date_range(
+        "2026-01-01T00:00:00Z",
+        periods=rows,
+        freq="15min",
+    )
+    frame["canonical_midpoint"] = 999999.0
+    frame["canonical_spread_bps"] = 999999.0
+    frame["canonical_target_eligible"] = True
+    frame["target_time"] = frame["timestamp"]
+    frame["label_available_time"] = frame["timestamp"]
+    frame["target_eligible"] = True
+    frame["price_change"] = 999999.0
+    frame["target_log_return_15m"] = 999999.0
+
+    # This simulates a future numeric field accidentally added to the
+    # research table. An allow-list must not admit it automatically.
+    frame["future_midpoint"] = 999999.0
+
+    return frame
+
+
+def test_predictor_contract_is_explicit_allowlist():
+    from btc_quarter_hour_engine.research.features import (
+        PREDICTOR_COLUMNS,
+        research_predictor_columns,
+    )
+
+    frame = _contract_frame()
+
+    columns = research_predictor_columns(frame)
+
+    assert columns == PREDICTOR_COLUMNS
+    assert len(columns) == 114
+
+    assert "timestamp" not in columns
+    assert "canonical_midpoint" not in columns
+    assert "target" not in columns
+    assert "target_time" not in columns
+    assert "label_available_time" not in columns
+    assert "price_change" not in columns
+    assert "target_log_return_15m" not in columns
+    assert "trainable" not in columns
+    assert "future_midpoint" not in columns
+
+
+def test_model_matrix_uses_only_trainable_rows():
+    from btc_quarter_hour_engine.research.features import (
+        PREDICTOR_COLUMNS,
+        research_model_matrix,
+    )
+
+    frame = _contract_frame()
+
+    X, y = research_model_matrix(frame)
+
+    assert tuple(X.columns) == PREDICTOR_COLUMNS
+    assert len(X) == 2
+    assert len(y) == 2
+    assert X.index.tolist() == [0, 2]
+    assert y.index.tolist() == [0, 2]
+    assert y.tolist() == [0, 0]
+
+    assert "future_midpoint" not in X.columns
+    assert "canonical_midpoint" not in X.columns
+    assert "target" not in X.columns
+
+
+def test_predictor_contract_rejects_missing_required_predictor():
+    from btc_quarter_hour_engine.research.features import (
+        PREDICTOR_COLUMNS,
+        research_predictor_columns,
+    )
+
+    frame = _contract_frame()
+    missing = PREDICTOR_COLUMNS[0]
+
+    frame = frame.drop(columns=[missing])
+
+    try:
+        research_predictor_columns(frame)
+    except ValueError as exc:
+        assert missing in str(exc)
+    else:
+        raise AssertionError(
+            "Missing predictor did not fail the contract"
+        )
+
+
+def test_model_matrix_rejects_nan_predictor():
+    from btc_quarter_hour_engine.research.features import (
+        PREDICTOR_COLUMNS,
+        research_model_matrix,
+    )
+
+    frame = _contract_frame()
+    column = PREDICTOR_COLUMNS[1]
+
+    frame.loc[0, column] = float("nan")
+
+    try:
+        research_model_matrix(frame)
+    except ValueError as exc:
+        assert "missing values" in str(exc)
+    else:
+        raise AssertionError(
+            "NaN predictor did not fail the model matrix"
+        )
