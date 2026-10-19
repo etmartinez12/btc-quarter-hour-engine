@@ -283,3 +283,160 @@ def test_future_frames_do_not_mutate_previous_asof_bucket():
         after,
         check_names=False,
     )
+
+
+def test_assembled_features_use_causal_asof_not_canonical(tmp_path):
+    import math
+
+    from btc_quarter_hour_engine.research.features import (
+        assemble_research_feature_frame,
+    )
+
+    times = pd.date_range(
+        "2026-01-01T00:15:00Z",
+        periods=17,
+        freq="15min",
+    )
+
+    # Canonical prices intentionally follow a radically different path
+    # from the as-received predictor prices below.
+    boundaries = pd.DataFrame(
+        {
+            "boundary_time_utc": times,
+            "midpoint": [
+                1000.0 + (100.0 * i)
+                for i in range(len(times))
+            ],
+            "spread": [2.0] * len(times),
+            "best_bid_size": [1.0] * len(times),
+            "best_ask_size": [1.0] * len(times),
+            "canonical_target_eligible": (
+                [True] * 16 + [False]
+            ),
+            "eligibility_reason": (
+                ["eligible"] * 16
+                + ["connection_unhealthy"]
+            ),
+        }
+    )
+
+    targets = pd.DataFrame(
+        {
+            "timestamp": times,
+            "target": [1] * len(times),
+            "target_time": times + pd.Timedelta(minutes=15),
+            "label_available_time": (
+                times + pd.Timedelta(minutes=15)
+            ),
+            "target_eligible": [True] * 16 + [False],
+            "target_eligibility_reason": (
+                ["eligible"] * 16
+                + ["current_boundary_ineligible"]
+            ),
+            "price_change": [1.0] * len(times),
+            "log_return_15m": [0.001] * len(times),
+        }
+    )
+
+    boundaries.to_parquet(
+        tmp_path / "canonical_boundaries.parquet",
+        index=False,
+    )
+    targets.to_parquet(
+        tmp_path / "direction_targets.parquet",
+        index=False,
+    )
+
+    manifest = {
+        "dataset_id": "causal-assembly-test",
+        "product_id": "BTC-USD",
+        "source": "coinbase_advanced",
+        "source_segments": [],
+        "artifacts": [
+            {
+                "data_kind": "canonical_boundaries",
+                "path": "canonical_boundaries.parquet",
+            },
+            {
+                "data_kind": "direction_targets",
+                "path": "direction_targets.parquet",
+            },
+        ],
+    }
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    bucket_rows = []
+
+    for i, timestamp in enumerate(times):
+        bucket = _BucketStats()
+
+        # These are the only prices available to the model.
+        bucket.asof_book_synced = 1
+        bucket.asof_midpoint = 100.0 + i
+        bucket.asof_spread_bps = 10.0
+        bucket.asof_best_bid_size = 1.0
+        bucket.asof_best_ask_size = 1.0
+        bucket.asof_top_book_imbalance = 0.0
+
+        bucket_rows.append(
+            {
+                "bucket_end": timestamp,
+                **{
+                    name: getattr(bucket, name)
+                    for name in _BucketStats.__dataclass_fields__
+                },
+            }
+        )
+
+    buckets = (
+        pd.DataFrame(bucket_rows)
+        .set_index("bucket_end")
+        .sort_index()
+    )
+
+    features = assemble_research_feature_frame(
+        manifest_path,
+        buckets,
+    )
+
+    final = features.iloc[-1]
+
+    # Predictor state must come from causal as-received buckets.
+    assert final["asof_midpoint"] == 116.0
+
+    # Canonical source-time state is retained only for auditing.
+    assert final["canonical_midpoint"] == 2600.0
+
+    # Old canonical predictor names must not survive assembly.
+    assert "midpoint" not in features.columns
+    assert "spread_bps" not in features.columns
+    assert "best_bid_size" not in features.columns
+    assert "best_ask_size" not in features.columns
+    assert "top_book_imbalance" not in features.columns
+
+    # 240-minute momentum must use causal as-of prices:
+    # 116 / 100, not canonical 2600 / 1000.
+    causal_return = math.log(116.0 / 100.0)
+    canonical_return = math.log(2600.0 / 1000.0)
+
+    assert abs(
+        final["momentum_log_return_240m"]
+        - causal_return
+    ) < 1e-12
+
+    assert abs(
+        final["momentum_log_return_240m"]
+        - canonical_return
+    ) > 0.1
+
+    assert final["bbo_bucket_coverage_240m"] == 16
+
+    # Predictor readiness is independent of target/canonical eligibility.
+    assert bool(final["feature_ready"]) is True
+    assert bool(final["canonical_target_eligible"]) is False
+
+    # Training eligibility still requires a valid target.
+    assert bool(final["target_eligible"]) is False
+    assert bool(final["trainable"]) is False

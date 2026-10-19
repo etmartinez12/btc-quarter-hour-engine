@@ -493,7 +493,7 @@ def _window_features(
     expected = pd.date_range(end=timestamp, periods=bucket_count, freq="15min", tz="UTC")
     window = buckets.reindex(expected)
 
-    observed_buckets = int(window["bbo_state_count"].fillna(0).gt(0).sum())
+    observed_buckets = int(window["asof_book_synced"].notna().sum())
     state_count = float(window["bbo_state_count"].sum(min_count=1))
     valid_count = float(window["bbo_valid_count"].sum(min_count=1))
     synced_count = float(window["bbo_synced_count"].sum(min_count=1))
@@ -589,12 +589,15 @@ def _window_features(
     }
 
 
-def build_raw_research_feature_frame(
+def assemble_research_feature_frame(
     manifest_path: str | Path,
-    input_root: str | Path,
-    *,
-    progress_every_frames: int = 1_000_000,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+    buckets: pd.DataFrame,
+) -> pd.DataFrame:
+    """Assemble causal predictors with canonical targets.
+
+    Predictor state comes only from information received by timestamp t.
+    Canonical source-time values are retained only as audit/target provenance.
+    """
     manifest_path = Path(manifest_path)
     manifest = _load_manifest(manifest_path)
 
@@ -612,51 +615,119 @@ def build_raw_research_feature_frame(
         targets["timestamp"], utc=True, errors="raise"
     )
 
-    boundaries = boundaries.sort_values("boundary_time_utc").reset_index(drop=True)
-    targets = targets.sort_values("timestamp").reset_index(drop=True)
+    boundaries = boundaries.sort_values(
+        "boundary_time_utc"
+    ).reset_index(drop=True)
 
-    buckets, diagnostics = replay_raw_feature_buckets(
-        manifest_path,
-        input_root,
-        progress_every_frames=progress_every_frames,
-    )
+    targets = targets.sort_values(
+        "timestamp"
+    ).reset_index(drop=True)
 
-    by_time = boundaries.set_index("boundary_time_utc")
+    if boundaries["boundary_time_utc"].duplicated().any():
+        raise ValueError("Canonical boundary timestamps are not unique")
+
+    if targets["timestamp"].duplicated().any():
+        raise ValueError("Target timestamps are not unique")
+
+    buckets = buckets.copy()
+
+    if "bucket_end" in buckets.columns:
+        buckets["bucket_end"] = pd.to_datetime(
+            buckets["bucket_end"], utc=True, errors="raise"
+        )
+        buckets = buckets.set_index("bucket_end")
+
+    if not isinstance(buckets.index, pd.DatetimeIndex):
+        raise ValueError("Feature buckets require a DatetimeIndex")
+
+    if buckets.index.tz is None:
+        buckets.index = buckets.index.tz_localize("UTC")
+    else:
+        buckets.index = buckets.index.tz_convert("UTC")
+
+    buckets = buckets.sort_index()
+
     first_boundary = boundaries["boundary_time_utc"].min()
     full_history_start = first_boundary + pd.Timedelta(minutes=240)
+
     rows: list[dict[str, Any]] = []
 
     for boundary in boundaries.itertuples(index=False):
         timestamp = boundary.boundary_time_utc
-        midpoint = float(boundary.midpoint) if pd.notna(boundary.midpoint) else np.nan
-        spread = float(boundary.spread) if pd.notna(boundary.spread) else np.nan
-        bid_size = (
-            float(boundary.best_bid_size)
-            if pd.notna(boundary.best_bid_size)
-            else np.nan
-        )
-        ask_size = (
-            float(boundary.best_ask_size)
-            if pd.notna(boundary.best_ask_size)
+
+        canonical_midpoint = (
+            float(boundary.midpoint)
+            if pd.notna(boundary.midpoint)
             else np.nan
         )
 
+        canonical_spread = (
+            float(boundary.spread)
+            if pd.notna(boundary.spread)
+            else np.nan
+        )
+
+        if timestamp in buckets.index:
+            causal = buckets.loc[timestamp]
+
+            asof_book_synced = bool(causal["asof_book_synced"])
+
+            asof_midpoint = (
+                float(causal["asof_midpoint"])
+                if pd.notna(causal["asof_midpoint"])
+                else np.nan
+            )
+
+            asof_spread_bps = (
+                float(causal["asof_spread_bps"])
+                if pd.notna(causal["asof_spread_bps"])
+                else np.nan
+            )
+
+            asof_bid_size = (
+                float(causal["asof_best_bid_size"])
+                if pd.notna(causal["asof_best_bid_size"])
+                else np.nan
+            )
+
+            asof_ask_size = (
+                float(causal["asof_best_ask_size"])
+                if pd.notna(causal["asof_best_ask_size"])
+                else np.nan
+            )
+
+            asof_imbalance = (
+                float(causal["asof_top_book_imbalance"])
+                if pd.notna(causal["asof_top_book_imbalance"])
+                else np.nan
+            )
+        else:
+            asof_book_synced = False
+            asof_midpoint = np.nan
+            asof_spread_bps = np.nan
+            asof_bid_size = np.nan
+            asof_ask_size = np.nan
+            asof_imbalance = np.nan
+
         row: dict[str, Any] = {
             "timestamp": timestamp,
-            "midpoint": midpoint,
-            "spread_bps": (
-                spread / midpoint * 10_000.0
-                if np.isfinite(spread) and np.isfinite(midpoint) and midpoint > 0
+            "asof_book_synced": asof_book_synced,
+            "asof_midpoint": asof_midpoint,
+            "asof_spread_bps": asof_spread_bps,
+            "asof_best_bid_size": asof_bid_size,
+            "asof_best_ask_size": asof_ask_size,
+            "asof_top_book_imbalance": asof_imbalance,
+            "canonical_midpoint": canonical_midpoint,
+            "canonical_spread_bps": (
+                canonical_spread / canonical_midpoint * 10_000.0
+                if np.isfinite(canonical_spread)
+                and np.isfinite(canonical_midpoint)
+                and canonical_midpoint > 0
                 else np.nan
             ),
-            "best_bid_size": bid_size,
-            "best_ask_size": ask_size,
-            "top_book_imbalance": (
-                _safe_ratio(bid_size - ask_size, bid_size + ask_size)
-                if np.isfinite(bid_size) and np.isfinite(ask_size)
-                else np.nan
+            "canonical_target_eligible": bool(
+                boundary.canonical_target_eligible
             ),
-            "canonical_target_eligible": bool(boundary.canonical_target_eligible),
             "canonical_eligibility_reason": boundary.eligibility_reason,
         }
 
@@ -664,19 +735,16 @@ def build_raw_research_feature_frame(
             lag_time = timestamp - pd.Timedelta(minutes=minutes)
             lag_midpoint = np.nan
 
-            if lag_time in by_time.index:
-                lag = by_time.loc[lag_time]
-                if (
-                    bool(lag["canonical_target_eligible"])
-                    and pd.notna(lag["midpoint"])
-                    and float(lag["midpoint"]) > 0
-                ):
-                    lag_midpoint = float(lag["midpoint"])
+            if lag_time in buckets.index:
+                value = buckets.at[lag_time, "asof_midpoint"]
+
+                if pd.notna(value) and float(value) > 0:
+                    lag_midpoint = float(value)
 
             row[f"momentum_log_return_{minutes}m"] = (
-                float(np.log(midpoint / lag_midpoint))
-                if np.isfinite(midpoint)
-                and midpoint > 0
+                float(np.log(asof_midpoint / lag_midpoint))
+                if np.isfinite(asof_midpoint)
+                and asof_midpoint > 0
                 and np.isfinite(lag_midpoint)
                 and lag_midpoint > 0
                 else np.nan
@@ -687,7 +755,7 @@ def build_raw_research_feature_frame(
                     buckets,
                     timestamp=timestamp,
                     window_minutes=minutes,
-                    current_midpoint=midpoint,
+                    current_midpoint=asof_midpoint,
                 )
             )
 
@@ -698,10 +766,12 @@ def build_raw_research_feature_frame(
 
         row["feature_ready"] = bool(
             timestamp >= full_history_start
-            and row["canonical_target_eligible"]
+            and row["asof_book_synced"]
             and row["bbo_bucket_coverage_240m"] == 16
+            and np.isfinite(row["asof_midpoint"])
             and np.isfinite(row["momentum_log_return_240m"])
         )
+
         rows.append(row)
 
     features = pd.DataFrame(rows)
@@ -716,6 +786,7 @@ def build_raw_research_feature_frame(
         "price_change",
         "log_return_15m",
     ]
+
     target_subset = targets[target_columns].rename(
         columns={"log_return_15m": "target_log_return_15m"}
     )
@@ -726,15 +797,60 @@ def build_raw_research_feature_frame(
         how="left",
         validate="one_to_one",
     )
-    features["trainable"] = features["feature_ready"] & features["target_eligible"]
+
+    features["trainable"] = (
+        features["feature_ready"]
+        & features["target_eligible"]
+    )
+
+    return features.sort_values("timestamp").reset_index(drop=True)
+
+
+def build_raw_research_feature_frame(
+    manifest_path: str | Path,
+    input_root: str | Path,
+    *,
+    progress_every_frames: int = 1_000_000,
+    bucket_output_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    buckets, diagnostics = replay_raw_feature_buckets(
+        manifest_path,
+        input_root,
+        progress_every_frames=progress_every_frames,
+    )
+
+    if bucket_output_path is not None:
+        bucket_output_path = Path(bucket_output_path)
+        bucket_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        buckets.reset_index().to_parquet(
+            bucket_output_path,
+            index=False,
+        )
+
+        diagnostics["bucket_artifact_path"] = str(
+            bucket_output_path
+        )
+
+    features = assemble_research_feature_frame(
+        manifest_path,
+        buckets,
+    )
 
     diagnostics.update(
         {
             "feature_row_count": int(len(features)),
-            "feature_ready_count": int(features["feature_ready"].sum()),
-            "trainable_count": int(features["trainable"].sum()),
+            "feature_ready_count": int(
+                features["feature_ready"].sum()
+            ),
+            "trainable_count": int(
+                features["trainable"].sum()
+            ),
             "first_feature_timestamp": (
-                features.loc[features["feature_ready"], "timestamp"].min()
+                features.loc[
+                    features["feature_ready"],
+                    "timestamp",
+                ].min()
                 if features["feature_ready"].any()
                 else None
             ),
@@ -742,4 +858,4 @@ def build_raw_research_feature_frame(
         }
     )
 
-    return features.sort_values("timestamp").reset_index(drop=True), diagnostics
+    return features, diagnostics
