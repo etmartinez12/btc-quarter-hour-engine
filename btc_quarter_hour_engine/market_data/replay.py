@@ -1410,6 +1410,8 @@ class CanonicalReplayAccumulator:
                 raise ValueError("Checkpoint connection source time range is reversed")
             if (state.source_state_time_utc is None) != (state.source_sequence_num is None):
                 raise ValueError("Checkpoint connection source time and sequence must be paired")
+            if state.has_snapshot != (state.source_state_time_utc is not None):
+                raise ValueError("Checkpoint has_snapshot does not match source provenance")
             if (
                 book is not None
                 and not state.has_snapshot
@@ -1431,6 +1433,8 @@ class CanonicalReplayAccumulator:
             raise ValueError("Checkpoint delivery counts do not match frame_count")
         if data["has_frames"] != (frame_count > 0):
             raise ValueError("Checkpoint has_frames does not match frame_count")
+        if data["_has_active_connection"] != (frame_count > 0):
+            raise ValueError("Checkpoint active connection does not match frame_count")
         result._active_connection_id = active_id
         result._has_active_connection = data["_has_active_connection"]
         return result

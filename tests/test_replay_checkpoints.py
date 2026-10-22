@@ -459,6 +459,35 @@ def test_checkpoint_rejects_inconsistent_connection_and_counter_state():
         CanonicalReplayAccumulator.from_checkpoint(two)
 
 
+def test_checkpoint_rejects_active_connection_frame_count_mismatch():
+    checkpoint = _canonical_checkpoint()
+    checkpoint["_has_active_connection"] = False
+    with pytest.raises(ValueError, match="active connection"):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+    checkpoint = _canonical_replay([], []).to_checkpoint()
+    assert checkpoint["frame_count"] == 0
+    CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+    checkpoint["_has_active_connection"] = True
+    with pytest.raises(ValueError):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+
+def test_checkpoint_rejects_snapshot_provenance_mismatch():
+    checkpoint = _canonical_checkpoint()
+    entry = checkpoint["connections"][0]
+    assert entry["has_snapshot"]
+    entry["source_state_time_utc"] = None
+    entry["source_sequence_num"] = None
+    with pytest.raises(ValueError, match="has_snapshot"):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+    checkpoint = _canonical_checkpoint()
+    checkpoint["connections"][0]["has_snapshot"] = False
+    with pytest.raises(ValueError):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+
 def test_order_book_checkpoint_preserves_invalid_error_and_rejects_product_mismatch():
     book = Level2OrderBook(product_id="BTC-USD")
     book.invalidate("wire error")
