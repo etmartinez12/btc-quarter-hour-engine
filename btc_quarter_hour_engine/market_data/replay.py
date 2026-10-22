@@ -1023,6 +1023,14 @@ def _compact_state_from_checkpoint(value: Any) -> _CompactBoundaryState:
         raise ValueError("Compact checkpoint synchronization flag does not match book state")
     if value["book_synced"] and any(floats[name] is None for name in floats):
         raise ValueError("Synchronized compact checkpoint requires complete top of book")
+    if (floats["best_bid"] is None) != (floats["best_bid_size"] is None):
+        raise ValueError("Compact checkpoint bid price and size must be paired")
+    if (floats["best_ask"] is None) != (floats["best_ask_size"] is None):
+        raise ValueError("Compact checkpoint ask price and size must be paired")
+    if (source_time is None) != (sequence is None):
+        raise ValueError("Compact checkpoint source time and sequence must be paired")
+    if value["book_synced"] and source_time is None:
+        raise ValueError("Synchronized compact checkpoint requires source provenance")
     if (
         floats["best_bid"] is not None
         and floats["best_ask"] is not None
@@ -1125,12 +1133,14 @@ class CanonicalReplayAccumulator:
     _has_active_connection: bool = field(default=False, init=False)
 
     def to_checkpoint(self) -> dict[str, Any]:
-        """Export full continuation state; heap indexes are rebuilt from book levels."""
+        """Export full continuation state; heap indexes are rebuilt from book levels.
+
+        ``connections`` is serialized in original discovery order and restored
+        in that same order.
+        """
         connections = []
-        for connection_id, state in sorted(
-            self._connections.items(),
-            key=lambda item: (item[0] is not None, item[0] or ""),
-        ):
+        # Insertion order is semantic: finalize() uses it as a tie-breaker.
+        for connection_id, state in self._connections.items():
             earliest = state.earliest_control
             connections.append({
                 "connection_id": connection_id,
@@ -1365,7 +1375,10 @@ class CanonicalReplayAccumulator:
                 if previous_bucket is not None and bucket <= previous_bucket:
                     raise ValueError("Heartbeat buckets must be strictly ordered")
                 previous_bucket = bucket
-                if bucket != floor_to_quarter_hour(heartbeat) and bucket != floor_to_quarter_hour(heartbeat) + timedelta(minutes=15):
+                expected_bucket = floor_to_quarter_hour(heartbeat)
+                if expected_bucket < heartbeat:
+                    expected_bucket += timedelta(minutes=15)
+                if bucket != expected_bucket:
                     raise ValueError("Heartbeat time does not match its bucket")
                 heartbeats[bucket] = heartbeat
 
@@ -1395,6 +1408,18 @@ class CanonicalReplayAccumulator:
                 and state.first_source_time_utc > state.last_source_time_utc
             ):
                 raise ValueError("Checkpoint connection source time range is reversed")
+            if (state.source_state_time_utc is None) != (state.source_sequence_num is None):
+                raise ValueError("Checkpoint connection source time and sequence must be paired")
+            if (
+                book is not None
+                and not state.has_snapshot
+                and book.state not in {OrderBookState.UNINITIALIZED, OrderBookState.INVALID}
+            ):
+                raise ValueError("Checkpoint live book is post-snapshot but has_snapshot is false")
+            if book is not None and (
+                not data["_has_active_connection"] or connection_id != active_id
+            ):
+                raise ValueError("Only the active checkpoint connection may hold a live order book")
             result._connections[connection_id] = state
         if data["_has_active_connection"] and active_id not in connection_keys:
             raise ValueError("Checkpoint active connection is missing")
@@ -1402,6 +1427,10 @@ class CanonicalReplayAccumulator:
             active_state = result._connections[active_id]
             if active_state.book is None:
                 raise ValueError("Checkpoint active connection has no live order book")
+        if sum(state.delivery_count for state in result._connections.values()) != frame_count:
+            raise ValueError("Checkpoint delivery counts do not match frame_count")
+        if data["has_frames"] != (frame_count > 0):
+            raise ValueError("Checkpoint has_frames does not match frame_count")
         result._active_connection_id = active_id
         result._has_active_connection = data["_has_active_connection"]
         return result

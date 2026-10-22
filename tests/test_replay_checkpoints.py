@@ -336,6 +336,129 @@ def test_canonical_checkpoint_rejects_malformed_nested_state():
         CanonicalReplayAccumulator.from_checkpoint(checkpoint)
 
 
+def _consume_range(replay, frames, connection_ids, start):
+    for index, (raw, connection_id) in enumerate(zip(frames, connection_ids), start=start):
+        event = parse_coinbase_ws_message(raw)
+        replay.consume(raw, connection_id, index, event.get("time_utc") or event["event_time_utc"])
+
+
+def _finalize(replay):
+    return replay.finalize(
+        session_started_at_utc=_utc("2026-01-01T00:00:00Z"),
+        session_completed_at_utc=_utc("2026-01-01T01:00:00Z"),
+        derived_at_utc=_utc("2026-01-01T02:00:00Z"),
+    )
+
+
+def test_checkpoint_preserves_non_lexicographic_connection_order():
+    frames = [
+        _snapshot("2026-01-01T00:14:50Z", 1),
+        _snapshot("2026-01-01T00:14:50Z", 1),
+        _update(2, "2026-01-01T00:14:58Z", "bid", 100.0, 1.5),
+        _frame("heartbeats", "2026-01-01T00:15:00Z", 3),
+        _update(4, "2026-01-01T00:15:05Z", "offer", 101.0, 2.5),
+    ]
+    ids = ["conn-z", "conn-a", "conn-a", "conn-a", "conn-a"]
+    uninterrupted = _canonical_replay(frames, ids)
+    interrupted = _canonical_replay(frames[:2], ids[:2])
+    restored = CanonicalReplayAccumulator.from_checkpoint(
+        json.loads(json.dumps(interrupted.to_checkpoint(), allow_nan=False))
+    )
+    assert list(restored._connections) == ["conn-z", "conn-a"]
+    _consume_range(restored, frames[2:], ids[2:], 2)
+    assert list(restored._connections) == list(uninterrupted._connections)
+    assert _finalize(restored) == _finalize(uninterrupted)
+
+
+def _canonical_checkpoint(count=None):
+    frames = _stream()[:count]
+    return _canonical_replay(frames, ["conn-1"] * len(frames)).to_checkpoint()
+
+
+@pytest.mark.parametrize(
+    ("heartbeat", "bucket", "valid"),
+    [
+        ("2026-01-01T00:15:00Z", "2026-01-01T00:15:00Z", True),
+        ("2026-01-01T00:14:59Z", "2026-01-01T00:15:00Z", True),
+        ("2026-01-01T00:14:59Z", "2026-01-01T00:00:00Z", False),
+        ("2026-01-01T00:15:00Z", "2026-01-01T00:30:00Z", False),
+    ],
+)
+def test_checkpoint_heartbeat_bucket_must_be_exact(heartbeat, bucket, valid):
+    checkpoint = _canonical_checkpoint(2)
+    buckets = checkpoint["connections"][0]["heartbeat_buckets"]
+    assert buckets
+    buckets[0] = {**buckets[0]}
+    keys = list(buckets[0])
+    bucket_key = next(k for k in keys if "bucket" in k)
+    time_key = next(k for k in keys if k != bucket_key)
+    buckets[0][time_key] = heartbeat
+    buckets[0][bucket_key] = bucket
+    if valid:
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+    else:
+        with pytest.raises(ValueError):
+            CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+
+def _first_candidate_state(checkpoint):
+    for connection in checkpoint["connections"]:
+        for candidate in connection["boundary_candidates"]:
+            if candidate["state"]["book_synced"]:
+                return candidate["state"]
+    raise AssertionError("no synced boundary candidate")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"best_bid_size": None},
+        {"best_ask": None},
+        {"source_state_time_utc": None},
+        {"source_sequence_num": None},
+        {"best_bid": 200.0},
+        {"book_synced": False},
+    ],
+)
+def test_checkpoint_rejects_inconsistent_compact_state(mutation):
+    checkpoint = _canonical_checkpoint()
+    state = _first_candidate_state(checkpoint)
+    assert state["book_synced"] is True
+    state.update(mutation)
+    with pytest.raises(ValueError):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+
+def test_checkpoint_rejects_inconsistent_connection_and_counter_state():
+    checkpoint = _canonical_checkpoint()
+    checkpoint["frame_count"] += 1
+    with pytest.raises(ValueError, match="delivery counts"):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+    checkpoint = _canonical_checkpoint()
+    checkpoint["has_frames"] = False
+    with pytest.raises(ValueError):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+    checkpoint = _canonical_checkpoint()
+    checkpoint["connections"][0]["has_snapshot"] = False
+    with pytest.raises(ValueError, match="has_snapshot"):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+    checkpoint = _canonical_checkpoint()
+    checkpoint["connections"][0]["source_sequence_num"] = None
+    with pytest.raises(ValueError, match="paired"):
+        CanonicalReplayAccumulator.from_checkpoint(checkpoint)
+
+    frames = _stream()[:2]
+    two = _canonical_replay(frames, ["conn-1", "conn-2"]).to_checkpoint()
+    inactive = next(c for c in two["connections"] if c["connection_id"] == "conn-1")
+    active = next(c for c in two["connections"] if c["connection_id"] == "conn-2")
+    inactive["book"] = deepcopy(active["book"]) if active["book"] else None
+    with pytest.raises(ValueError):
+        CanonicalReplayAccumulator.from_checkpoint(two)
+
+
 def test_order_book_checkpoint_preserves_invalid_error_and_rejects_product_mismatch():
     book = Level2OrderBook(product_id="BTC-USD")
     book.invalidate("wire error")
