@@ -31,6 +31,7 @@ def main() -> None:
     print(f"status={diagnostics['status']}")
     print(f"checkpoint_path={diagnostics['checkpoint_path']}")
     print(f"checkpoint_sha256={diagnostics['checkpoint_sha256']}")
+    print(f"heartbeat_timeout_seconds={diagnostics['heartbeat_timeout_seconds']}")
     print(f"discovered_sealed_segments={diagnostics['discovered_sealed_segments']}")
     print(f"previously_processed_segments={diagnostics['previously_processed_segments']}")
     print(f"new_segments_processed={diagnostics['new_segments_processed_this_run']}")

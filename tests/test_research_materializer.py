@@ -102,13 +102,15 @@ def _write_input(root: Path, *, future_frame: bool = False):
     return writer, frames
 
 
-def _materialize(input_root: Path, output_root: Path, **kwargs):
+def _materialize(
+    input_root: Path, output_root: Path, *, heartbeat_timeout_seconds=5.0, **kwargs
+):
     return materializer.materialize_research(
         input_root=input_root,
         output_root=output_root,
         websocket_config=CoinbaseWebSocketConfig(
             product_id="BTC-USD",
-            heartbeat_timeout_seconds=5.0,
+            heartbeat_timeout_seconds=heartbeat_timeout_seconds,
         ),
         **kwargs,
     )
@@ -210,6 +212,77 @@ def test_noop_does_not_replay_processed_prefix_and_preserves_checkpoint(tmp_path
     result = _materialize(input_root, output_root)
 
     assert result.diagnostics["new_segments_processed_this_run"] == 0
+    assert result.diagnostics["new_frames_processed_this_run"] == 0
+    assert (output_root / "checkpoint.json").read_bytes() == checkpoint_before
+    checkpoint = json.loads(checkpoint_before)
+    assert checkpoint["version"] == 1
+    assert checkpoint["heartbeat_timeout_seconds"] == 5.0
+    assert checkpoint["canonical_replay"]["heartbeat_timeout_seconds"] == 5.0
+    assert result.diagnostics["heartbeat_timeout_seconds"] == 5.0
+    metadata = json.loads(result.materialization_path.read_text())
+    assert metadata["heartbeat_timeout_seconds"] == 5.0
+
+
+def test_resume_rejects_changed_heartbeat_timeout_before_suffix_replay(tmp_path, monkeypatch):
+    input_root = tmp_path / "raw"
+    _write_input(input_root)
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root, max_new_segments=2)
+    checkpoint_before = (output_root / "checkpoint.json").read_bytes()
+
+    def unexpected_replay(*args, **kwargs):
+        raise AssertionError("configuration validation must precede suffix replay")
+
+    monkeypatch.setattr(materializer, "_iter_segment_frames", unexpected_replay)
+    with pytest.raises(ValueError, match="heartbeat timeout does not match requested configuration"):
+        _materialize(input_root, output_root, heartbeat_timeout_seconds=30.0)
+    assert (output_root / "checkpoint.json").read_bytes() == checkpoint_before
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested-canonical"])
+def test_restore_rejects_inconsistent_checkpoint_heartbeat_timeout(tmp_path, monkeypatch, nested):
+    input_root = tmp_path / "raw"
+    _write_input(input_root)
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root, max_new_segments=2)
+    checkpoint_path = output_root / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    target = checkpoint["canonical_replay"] if nested else checkpoint
+    target["heartbeat_timeout_seconds"] = 30.0
+    checkpoint_path.write_text(json.dumps(checkpoint, allow_nan=False))
+
+    def unexpected_replay(*args, **kwargs):
+        raise AssertionError("checkpoint validation must precede suffix replay")
+
+    monkeypatch.setattr(materializer, "_iter_segment_frames", unexpected_replay)
+    with pytest.raises(ValueError, match="heartbeat timeout does not match"):
+        _materialize(input_root, output_root)
+
+
+@pytest.mark.parametrize("timeout", [True, None, "5.0", -1, float("nan"), float("inf")])
+def test_checkpoint_rejects_invalid_top_level_heartbeat_timeout(tmp_path, timeout):
+    input_root = tmp_path / "raw"
+    _write_input(input_root)
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root, max_new_segments=2)
+    checkpoint_path = output_root / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["heartbeat_timeout_seconds"] = timeout
+    checkpoint_path.write_text(json.dumps(checkpoint))
+
+    with pytest.raises(ValueError):
+        _materialize(input_root, output_root)
+
+
+def test_resume_accepts_equivalent_integer_heartbeat_timeout(tmp_path):
+    input_root = tmp_path / "raw"
+    _write_input(input_root)
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root)
+    checkpoint_before = (output_root / "checkpoint.json").read_bytes()
+
+    result = _materialize(input_root, output_root, heartbeat_timeout_seconds=5)
+
     assert result.diagnostics["new_frames_processed_this_run"] == 0
     assert (output_root / "checkpoint.json").read_bytes() == checkpoint_before
 

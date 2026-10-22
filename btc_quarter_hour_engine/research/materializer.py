@@ -53,6 +53,7 @@ _CHECKPOINT_FIELDS = {
     "source",
     "product_id",
     "predictor_contract_version",
+    "heartbeat_timeout_seconds",
     "session_id",
     "expected_next_frame_index",
     "first_ingest_time_utc",
@@ -69,6 +70,20 @@ class MaterializationResult:
     checkpoint_sha256: str
     materialization_path: Path
     diagnostics: dict[str, Any]
+
+
+def _heartbeat_timeout(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Materializer heartbeat timeout must be a finite nonnegative number")
+    try:
+        timeout = float(value)
+    except OverflowError as exc:
+        raise ValueError(
+            "Materializer heartbeat timeout must be a finite nonnegative number"
+        ) from exc
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("Materializer heartbeat timeout must be a finite nonnegative number")
+    return timeout
 
 
 def _iso_utc(value: datetime | None) -> str | None:
@@ -171,6 +186,7 @@ def _checkpoint_payload(
         "source": source,
         "product_id": product_id,
         "predictor_contract_version": PREDICTOR_CONTRACT_VERSION,
+        "heartbeat_timeout_seconds": canonical_replay.heartbeat_timeout_seconds,
         "session_id": session_id,
         "expected_next_frame_index": expected_next_frame_index,
         "first_ingest_time_utc": _iso_utc(first_ingest_time_utc),
@@ -186,6 +202,7 @@ def _checkpoint_state(
     *,
     source: str,
     product_id: str,
+    heartbeat_timeout_seconds: float,
 ) -> tuple[
     str,
     int,
@@ -210,6 +227,11 @@ def _checkpoint_state(
         raise ValueError("Materializer checkpoint product_id does not match requested product")
     if checkpoint["predictor_contract_version"] != PREDICTOR_CONTRACT_VERSION:
         raise ValueError("Materializer checkpoint predictor contract does not match")
+    timeout = _heartbeat_timeout(checkpoint["heartbeat_timeout_seconds"])
+    if timeout != _heartbeat_timeout(heartbeat_timeout_seconds):
+        raise ValueError(
+            "Materializer checkpoint heartbeat timeout does not match requested configuration"
+        )
     session_id = checkpoint["session_id"]
     if not isinstance(session_id, str) or not session_id.strip():
         raise ValueError("Invalid materializer checkpoint session_id")
@@ -236,6 +258,10 @@ def _checkpoint_state(
 
     feature = _IngestFeatureReplay.from_checkpoint(checkpoint["feature_replay"])
     canonical = CanonicalReplayAccumulator.from_checkpoint(checkpoint["canonical_replay"])
+    if timeout != float(canonical.heartbeat_timeout_seconds):
+        raise ValueError(
+            "Materializer checkpoint heartbeat timeout does not match nested canonical replay"
+        )
     if feature.product_id != product_id or canonical.product_id != product_id:
         raise ValueError("Nested replay checkpoint product_id does not match")
     if canonical.session_id != session_id:
@@ -323,7 +349,9 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_checkpoint(path: Path, *, source: str, product_id: str):
+def _read_checkpoint(
+    path: Path, *, source: str, product_id: str, heartbeat_timeout_seconds: float
+):
     try:
         checkpoint = json.loads(
             path.read_text(encoding="utf-8"),
@@ -333,7 +361,12 @@ def _read_checkpoint(path: Path, *, source: str, product_id: str):
         raise ValueError(f"Cannot read valid materializer checkpoint: {path}") from exc
     if not isinstance(checkpoint, dict):
         raise ValueError("Materializer checkpoint must be a JSON object")
-    return _checkpoint_state(checkpoint, source=source, product_id=product_id)
+    return _checkpoint_state(
+        checkpoint,
+        source=source,
+        product_id=product_id,
+        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+    )
 
 
 def _reject_json_constant(value: str):
@@ -371,9 +404,7 @@ def materialize_research(
     config = websocket_config or CoinbaseWebSocketConfig(product_id=product_id)
     if config.product_id != product_id:
         raise ValueError("WebSocket configuration product_id does not match requested product")
-    timeout = config.heartbeat_timeout_seconds
-    if not math.isfinite(timeout) or timeout < 0:
-        raise ValueError("Canonical heartbeat timeout must be finite and nonnegative")
+    timeout = _heartbeat_timeout(config.heartbeat_timeout_seconds)
 
     # This is the sole discovery call; all processing below uses this fixed snapshot.
     discovered = discover_sealed_segments(input_path, product_id=product_id, source=source)
@@ -404,7 +435,12 @@ def materialize_research(
             processed_segments,
             feature_replay,
             canonical_replay,
-        ) = _read_checkpoint(checkpoint_path, source=source, product_id=product_id)
+        ) = _read_checkpoint(
+            checkpoint_path,
+            source=source,
+            product_id=product_id,
+            heartbeat_timeout_seconds=timeout,
+        )
         if previous_session != session_id:
             raise ValueError("Materializer checkpoint source session does not match discovery")
         current_records = [_segment_record(segment) for segment in segments]
@@ -536,6 +572,7 @@ def materialize_research(
         "source": source,
         "product_id": product_id,
         "predictor_contract_version": PREDICTOR_CONTRACT_VERSION,
+        "heartbeat_timeout_seconds": canonical_replay.heartbeat_timeout_seconds,
         "session_id": session_id,
         "processed_segment_count": len(processed_segments),
         "total_processed_frame_count": expected_frame_index,
