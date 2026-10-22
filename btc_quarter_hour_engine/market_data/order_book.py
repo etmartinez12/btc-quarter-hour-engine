@@ -6,8 +6,16 @@ from collections.abc import Iterable, Mapping
 from enum import Enum
 from typing import Any
 
+from ._checkpoint import (
+    _float_from_checkpoint,
+    _float_to_checkpoint,
+    _require_checkpoint,
+    _require_nonnegative_int,
+)
+
 HEAP_COMPACTION_FACTOR = 2
 HEAP_COMPACTION_SLACK = 1024
+ORDER_BOOK_CHECKPOINT_VERSION = 1
 _MISSING = object()
 
 
@@ -347,5 +355,96 @@ class Level2OrderBook:
     def is_synced(self) -> bool:
         return self.state == OrderBookState.SYNCED and bool(self.bids) and bool(self.asks)
 
+    def to_checkpoint(self) -> dict[str, Any]:
+        """Export durable book state; heap indexes are reconstructed on restore."""
+        return {
+            "version": ORDER_BOOK_CHECKPOINT_VERSION,
+            "product_id": self.product_id,
+            "bids": [
+                {"price": _float_to_checkpoint(price), "quantity": _float_to_checkpoint(quantity)}
+                for price, quantity in sorted(self.bids.items())
+            ],
+            "asks": [
+                {"price": _float_to_checkpoint(price), "quantity": _float_to_checkpoint(quantity)}
+                for price, quantity in sorted(self.asks.items())
+            ],
+            "state": self.state.value,
+            "last_sequence_num": self.last_sequence_num,
+            "last_error": self.last_error,
+        }
 
-__all__ = ["Level2OrderBook", "OrderBookState"]
+    @classmethod
+    def from_checkpoint(cls, checkpoint: Mapping[str, Any]) -> Level2OrderBook:
+        """Restore validated levels and deterministically rebuild transient heaps."""
+        data = _require_checkpoint(
+            checkpoint,
+            version_key="version",
+            version=ORDER_BOOK_CHECKPOINT_VERSION,
+            required={
+                "version", "product_id", "bids", "asks", "state",
+                "last_sequence_num", "last_error",
+            },
+        )
+        product_id = data["product_id"]
+        if product_id is not None and (not isinstance(product_id, str) or not product_id):
+            raise ValueError("Checkpoint product_id must be a nonempty string or null")
+        try:
+            state = OrderBookState(data["state"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid checkpoint order-book state: {data['state']!r}") from exc
+        sequence = data["last_sequence_num"]
+        if sequence is not None:
+            _require_nonnegative_int(sequence, field="last_sequence_num")
+        last_error = data["last_error"]
+        if last_error is not None and not isinstance(last_error, str):
+            raise ValueError("Checkpoint last_error must be a string or null")
+
+        def read_levels(records: Any, side: str) -> dict[float, float]:
+            if not isinstance(records, list):
+                raise ValueError(f"Checkpoint {side} must be a list")
+            levels: dict[float, float] = {}
+            for record in records:
+                if not isinstance(record, dict) or set(record) != {"price", "quantity"}:
+                    raise ValueError(f"Malformed checkpoint {side} level")
+                price = _float_from_checkpoint(record["price"])
+                quantity = _float_from_checkpoint(record["quantity"])
+                assert price is not None and quantity is not None
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError(f"Invalid checkpoint {side} price")
+                if not math.isfinite(quantity) or quantity < 0:
+                    raise ValueError(f"Invalid checkpoint {side} quantity")
+                if price in levels:
+                    raise ValueError(f"Duplicate checkpoint {side} price")
+                levels[price] = quantity
+            return levels
+
+        bids = read_levels(data["bids"], "bid")
+        asks = read_levels(data["asks"], "ask")
+        if state == OrderBookState.SYNCED:
+            try:
+                cls(product_id=product_id)._validate_candidate_book(bids, asks)
+            except ValueError as exc:
+                raise ValueError("Invalid synchronized checkpoint book") from exc
+        else:
+            if state == OrderBookState.UNINITIALIZED and (bids or asks):
+                raise ValueError("Uninitialized checkpoint book cannot contain levels")
+            if state == OrderBookState.REBUILDING and bids and asks:
+                raise ValueError("Rebuilding checkpoint book must have an empty side")
+            if bids and asks and max(bids) > min(asks):
+                raise ValueError("Invalid crossed checkpoint book")
+
+        book = cls(product_id=product_id)
+        book.bids = bids
+        book.asks = asks
+        book._rebuild_heaps()
+        book.state = state
+        book.last_sequence_num = sequence
+        book.last_error = last_error
+        return book
+
+
+__all__ = [
+    "Level2OrderBook",
+    "OrderBookState",
+    "ORDER_BOOK_CHECKPOINT_VERSION",
+]

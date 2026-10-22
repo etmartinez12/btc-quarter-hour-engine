@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,14 @@ from btc_quarter_hour_engine.market_data.order_book import (
     Level2OrderBook,
     OrderBookState,
 )
+from btc_quarter_hour_engine.market_data._checkpoint import (
+    _float_from_checkpoint,
+    _float_to_checkpoint,
+    _require_checkpoint,
+    _require_nonnegative_int,
+    _utc_from_checkpoint,
+    _utc_to_checkpoint,
+)
 from btc_quarter_hour_engine.research.forward_dataset import (
     _iter_segment_frames,
     _segment_from_metadata,
@@ -26,6 +35,7 @@ from btc_quarter_hour_engine.research.forward_dataset import (
 WINDOWS_MINUTES = (15, 30, 60, 240)
 
 PREDICTOR_CONTRACT_VERSION = "bbo-causal-v1"
+FEATURE_REPLAY_CHECKPOINT_VERSION = 1
 
 BASE_PREDICTOR_COLUMNS = (
     "asof_book_synced",
@@ -152,6 +162,122 @@ class _IngestFeatureReplay:
         self.stale_frames = 0
         self.sequence_gaps = 0
         self.applied_l2_envelopes = 0
+
+    def to_checkpoint(self) -> dict[str, Any]:
+        """Export all causal replay and bucket state using JSON-safe values."""
+        buckets = []
+        for bucket_time, stats in sorted(self.buckets.items()):
+            serialized_stats = {}
+            for name in _BucketStats.__dataclass_fields__:
+                value = getattr(stats, name)
+                serialized_stats[name] = (
+                    _float_to_checkpoint(value) if isinstance(value, float) else value
+                )
+            buckets.append({
+                "bucket_time_utc": _utc_to_checkpoint(bucket_time),
+                "stats": serialized_stats,
+            })
+        return {
+            "version": FEATURE_REPLAY_CHECKPOINT_VERSION,
+            "product_id": self.product_id,
+            "connection_id": self.connection_id,
+            "last_envelope_sequence_num": self.last_envelope_sequence_num,
+            "previous_midpoint": (
+                _float_to_checkpoint(self.previous_midpoint)
+                if self.previous_midpoint is not None else None
+            ),
+            "book": self.book.to_checkpoint(),
+            "buckets": buckets,
+            "frames_seen": self.frames_seen,
+            "parsed_frames": self.parsed_frames,
+            "malformed_frames": self.malformed_frames,
+            "stale_frames": self.stale_frames,
+            "sequence_gaps": self.sequence_gaps,
+            "applied_l2_envelopes": self.applied_l2_envelopes,
+        }
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: Mapping[str, Any]) -> _IngestFeatureReplay:
+        """Restore exact accumulated feature state; only order-book heaps are rebuilt."""
+        data = _require_checkpoint(
+            checkpoint,
+            version_key="version",
+            version=FEATURE_REPLAY_CHECKPOINT_VERSION,
+            required={
+                "version", "product_id", "connection_id",
+                "last_envelope_sequence_num", "previous_midpoint", "book",
+                "buckets", "frames_seen", "parsed_frames", "malformed_frames",
+                "stale_frames", "sequence_gaps", "applied_l2_envelopes",
+            },
+        )
+        product_id = data["product_id"]
+        if not isinstance(product_id, str) or not product_id:
+            raise ValueError("Checkpoint product_id must be a nonempty string")
+        connection_id = data["connection_id"]
+        if connection_id is not None and not isinstance(connection_id, str):
+            raise ValueError("Checkpoint connection_id must be a string or null")
+        sequence = data["last_envelope_sequence_num"]
+        if sequence is not None:
+            _require_nonnegative_int(sequence, field="last_envelope_sequence_num")
+        previous_midpoint = _float_from_checkpoint(data["previous_midpoint"], nullable=True)
+        if previous_midpoint is not None and (
+            not math.isfinite(previous_midpoint) or previous_midpoint <= 0
+        ):
+            raise ValueError("Checkpoint previous_midpoint must be finite and positive")
+
+        book = Level2OrderBook.from_checkpoint(data["book"])
+        if book.product_id != product_id:
+            raise ValueError("Checkpoint order-book product_id does not match replay")
+
+        counter_names = (
+            "frames_seen", "parsed_frames", "malformed_frames", "stale_frames",
+            "sequence_gaps", "applied_l2_envelopes",
+        )
+        counters = {
+            name: _require_nonnegative_int(data[name], field=name)
+            for name in counter_names
+        }
+        if not isinstance(data["buckets"], list):
+            raise ValueError("Checkpoint buckets must be a list")
+        stats_names = set(_BucketStats.__dataclass_fields__)
+        buckets: dict[datetime, _BucketStats] = {}
+        previous_bucket_time: datetime | None = None
+        for record in data["buckets"]:
+            if not isinstance(record, dict) or set(record) != {"bucket_time_utc", "stats"}:
+                raise ValueError("Malformed feature checkpoint bucket")
+            bucket_time = _utc_from_checkpoint(record["bucket_time_utc"])
+            assert bucket_time is not None
+            if bucket_time.minute not in {0, 15,  30, 45} or bucket_time.second or bucket_time.microsecond:
+                raise ValueError("Feature checkpoint bucket is not quarter-hour aligned")
+            if previous_bucket_time is not None and bucket_time <= previous_bucket_time:
+                raise ValueError("Feature checkpoint buckets must be strictly ordered")
+            previous_bucket_time = bucket_time
+            values = record["stats"]
+            if not isinstance(values, dict) or set(values) != stats_names:
+                raise ValueError("Malformed feature checkpoint bucket statistics")
+            restored = _BucketStats()
+            for name, field_info in _BucketStats.__dataclass_fields__.items():
+                value = values[name]
+                if type(field_info.default) is int:
+                    numeric = _require_nonnegative_int(value, field=f"bucket.{name}")
+                    if name == "asof_book_synced" and numeric not in {0, 1}:
+                        raise ValueError("Checkpoint asof_book_synced must be zero or one")
+                    setattr(restored, name, numeric)
+                else:
+                    numeric = _float_from_checkpoint(value)
+                    assert numeric is not None
+                    setattr(restored, name, numeric)
+            buckets[bucket_time] = restored
+
+        replay = cls(product_id)
+        replay.connection_id = connection_id
+        replay.last_envelope_sequence_num = sequence
+        replay.previous_midpoint = previous_midpoint
+        replay.book = book
+        replay.buckets = buckets
+        for name, value in counters.items():
+            setattr(replay, name, value)
+        return replay
 
     def _bucket(self, ingest_time_utc: datetime) -> _BucketStats:
         key = _ceil_quarter_hour(ingest_time_utc)

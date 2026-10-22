@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -13,6 +14,17 @@ from .boundary_observations import (
     require_utc,
 )
 from .order_book import Level2OrderBook, OrderBookState
+from ._checkpoint import (
+    _float_from_checkpoint,
+    _float_to_checkpoint,
+    _require_checkpoint,
+    _require_nonnegative_int,
+    _utc_from_checkpoint,
+    _utc_to_checkpoint,
+)
+
+
+CANONICAL_REPLAY_CHECKPOINT_VERSION = 1
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -961,6 +973,75 @@ class _StreamingConnectionState:
         return self.compact_book()
 
 
+def _compact_state_to_checkpoint(state: _CompactBoundaryState) -> dict[str, Any]:
+    return {
+        "connection_id": state.connection_id,
+        "source_state_time_utc": _utc_to_checkpoint(state.source_state_time_utc),
+        "source_sequence_num": state.source_sequence_num,
+        "best_bid": _float_to_checkpoint(state.best_bid) if state.best_bid is not None else None,
+        "best_bid_size": _float_to_checkpoint(state.best_bid_size) if state.best_bid_size is not None else None,
+        "best_ask": _float_to_checkpoint(state.best_ask) if state.best_ask is not None else None,
+        "best_ask_size": _float_to_checkpoint(state.best_ask_size) if state.best_ask_size is not None else None,
+        "book_synced": state.book_synced,
+        "book_state": state.book_state.value,
+    }
+
+
+def _compact_state_from_checkpoint(value: Any) -> _CompactBoundaryState:
+    required = {
+        "connection_id", "source_state_time_utc", "source_sequence_num",
+        "best_bid", "best_bid_size", "best_ask", "best_ask_size",
+        "book_synced", "book_state",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("Malformed compact boundary checkpoint")
+    connection_id = value["connection_id"]
+    if connection_id is not None and not isinstance(connection_id, str):
+        raise ValueError("Compact checkpoint connection_id must be a string or null")
+    source_time = _utc_from_checkpoint(value["source_state_time_utc"], nullable=True)
+    sequence = value["source_sequence_num"]
+    if sequence is not None:
+        _require_nonnegative_int(sequence, field="source_sequence_num")
+    floats = {}
+    for name in ("best_bid", "best_bid_size", "best_ask", "best_ask_size"):
+        floats[name] = _float_from_checkpoint(value[name], nullable=True)
+        if floats[name] is not None and not math.isfinite(floats[name]):
+            raise ValueError(f"Compact checkpoint {name} must be finite")
+    for name in ("best_bid", "best_ask"):
+        if floats[name] is not None and floats[name] <= 0:
+            raise ValueError(f"Compact checkpoint {name} must be positive")
+    for name in ("best_bid_size", "best_ask_size"):
+        if floats[name] is not None and floats[name] < 0:
+            raise ValueError(f"Compact checkpoint {name} cannot be negative")
+    if type(value["book_synced"]) is not bool:
+        raise ValueError("Compact checkpoint book_synced must be boolean")
+    try:
+        state = OrderBookState(value["book_state"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid compact checkpoint book_state: {value['book_state']!r}") from exc
+    if value["book_synced"] != (state == OrderBookState.SYNCED):
+        raise ValueError("Compact checkpoint synchronization flag does not match book state")
+    if value["book_synced"] and any(floats[name] is None for name in floats):
+        raise ValueError("Synchronized compact checkpoint requires complete top of book")
+    if (
+        floats["best_bid"] is not None
+        and floats["best_ask"] is not None
+        and floats["best_bid"] > floats["best_ask"]
+    ):
+        raise ValueError("Compact checkpoint contains crossed prices")
+    return _CompactBoundaryState(
+        connection_id=connection_id,
+        source_state_time_utc=source_time,
+        source_sequence_num=sequence,
+        best_bid=floats["best_bid"],
+        best_bid_size=floats["best_bid_size"],
+        best_ask=floats["best_ask"],
+        best_ask_size=floats["best_ask_size"],
+        book_synced=value["book_synced"],
+        book_state=state,
+    )
+
+
 def _source_event_time(event: Mapping[str, Any]) -> datetime:
     kind = event.get("type")
     if kind == "heartbeat":
@@ -1042,6 +1123,288 @@ class CanonicalReplayAccumulator:
     _connections: dict[str | None, _StreamingConnectionState] = field(default_factory=dict, init=False)
     _active_connection_id: str | None = field(default=None, init=False)
     _has_active_connection: bool = field(default=False, init=False)
+
+    def to_checkpoint(self) -> dict[str, Any]:
+        """Export full continuation state; heap indexes are rebuilt from book levels."""
+        connections = []
+        for connection_id, state in sorted(
+            self._connections.items(),
+            key=lambda item: (item[0] is not None, item[0] or ""),
+        ):
+            earliest = state.earliest_control
+            connections.append({
+                "connection_id": connection_id,
+                "last_envelope_sequence_num": state.last_envelope_sequence_num,
+                "source_invalid": state.source_invalid,
+                "book": state.book.to_checkpoint() if state.book is not None else None,
+                "terminal_state": (
+                    _compact_state_to_checkpoint(state.terminal_state)
+                    if state.terminal_state is not None else None
+                ),
+                "has_snapshot": state.has_snapshot,
+                "source_state_time_utc": _utc_to_checkpoint(state.source_state_time_utc),
+                "source_sequence_num": state.source_sequence_num,
+                "first_source_time_utc": _utc_to_checkpoint(state.first_source_time_utc),
+                "last_source_time_utc": _utc_to_checkpoint(state.last_source_time_utc),
+                "malformed_control_time_utc": _utc_to_checkpoint(state.malformed_control_time_utc),
+                "earliest_control": (
+                    {
+                        "time_utc": _utc_to_checkpoint(earliest[0]),
+                        "delivery_count": earliest[1],
+                        "reason": earliest[2],
+                        "message": earliest[3],
+                    }
+                    if earliest is not None else None
+                ),
+                "first_l2_effective_time_utc": _utc_to_checkpoint(state.first_l2_effective_time_utc),
+                "candidate_cursor_utc": _utc_to_checkpoint(state.candidate_cursor_utc),
+                "boundary_candidates": [
+                    {
+                        "boundary_time_utc": _utc_to_checkpoint(timestamp),
+                        "state": _compact_state_to_checkpoint(candidate),
+                    }
+                    for timestamp, candidate in sorted(state.boundary_candidates.items())
+                ],
+                "heartbeat_buckets": [
+                    {
+                        "bucket_time_utc": _utc_to_checkpoint(bucket),
+                        "heartbeat_time_utc": _utc_to_checkpoint(heartbeat),
+                    }
+                    for bucket, heartbeat in sorted(state.heartbeat_buckets.items())
+                ],
+                "delivery_count": state.delivery_count,
+            })
+        return {
+            "version": CANONICAL_REPLAY_CHECKPOINT_VERSION,
+            "product_id": self.product_id,
+            "session_id": self.session_id,
+            "heartbeat_timeout_seconds": _float_to_checkpoint(self.heartbeat_timeout_seconds),
+            "frame_count": self.frame_count,
+            "first_source_sample": (
+                [_utc_to_checkpoint(value) for value in self.first_source_sample]
+                if self.first_source_sample is not None else None
+            ),
+            "last_source_sample": (
+                [_utc_to_checkpoint(value) for value in self.last_source_sample]
+                if self.last_source_sample is not None else None
+            ),
+            "observed_min": _utc_to_checkpoint(self.observed_min),
+            "observed_max": _utc_to_checkpoint(self.observed_max),
+            "has_frames": self.has_frames,
+            "_active_connection_id": self._active_connection_id,
+            "_has_active_connection": self._has_active_connection,
+            "connections": connections,
+        }
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: Mapping[str, Any]) -> CanonicalReplayAccumulator:
+        """Restore all replay indexes and candidates without recomputing boundaries."""
+        data = _require_checkpoint(
+            checkpoint,
+            version_key="version",
+            version=CANONICAL_REPLAY_CHECKPOINT_VERSION,
+            required={
+                "version", "product_id", "session_id", "heartbeat_timeout_seconds",
+                "frame_count", "first_source_sample", "last_source_sample",
+                "observed_min", "observed_max", "has_frames",
+                "_active_connection_id", "_has_active_connection", "connections",
+            },
+        )
+        product_id = data["product_id"]
+        session_id = data["session_id"]
+        if not isinstance(product_id, str) or not product_id:
+            raise ValueError("Checkpoint product_id must be a nonempty string")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Checkpoint session_id must be a nonempty string")
+        timeout = _float_from_checkpoint(data["heartbeat_timeout_seconds"])
+        assert timeout is not None
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("Checkpoint heartbeat timeout must be nonnegative")
+        frame_count = _require_nonnegative_int(data["frame_count"], field="frame_count")
+        for name in ("has_frames", "_has_active_connection"):
+            if type(data[name]) is not bool:
+                raise ValueError(f"Checkpoint {name} must be boolean")
+
+        def sample_from_checkpoint(value: Any, name: str) -> tuple[datetime, datetime] | None:
+            if value is None:
+                return None
+            if not isinstance(value, list) or len(value) != 2:
+                raise ValueError(f"Malformed checkpoint {name}")
+            first = _utc_from_checkpoint(value[0])
+            second = _utc_from_checkpoint(value[1])
+            assert first is not None and second is not None
+            return first, second
+
+        first_sample = sample_from_checkpoint(data["first_source_sample"], "first_source_sample")
+        last_sample = sample_from_checkpoint(data["last_source_sample"], "last_source_sample")
+        observed_min = _utc_from_checkpoint(data["observed_min"], nullable=True)
+        observed_max = _utc_from_checkpoint(data["observed_max"], nullable=True)
+        if observed_min is not None and observed_max is not None and observed_min > observed_max:
+            raise ValueError("Checkpoint observed time range is reversed")
+        active_id = data["_active_connection_id"]
+        if active_id is not None and not isinstance(active_id, str):
+            raise ValueError("Checkpoint active connection id must be a string or null")
+        if not data["_has_active_connection"] and active_id is not None:
+            raise ValueError("Inactive checkpoint cannot name an active connection")
+        if not isinstance(data["connections"], list):
+            raise ValueError("Checkpoint connections must be a list")
+
+        result = cls(
+            product_id=product_id,
+            session_id=session_id,
+            heartbeat_timeout_seconds=timeout,
+            frame_count=frame_count,
+            first_source_sample=first_sample,
+            last_source_sample=last_sample,
+            observed_min=observed_min,
+            observed_max=observed_max,
+            has_frames=data["has_frames"],
+        )
+        connection_keys: set[str | None] = set()
+        connection_fields = {
+            "connection_id", "last_envelope_sequence_num", "source_invalid",
+            "book", "terminal_state", "has_snapshot", "source_state_time_utc",
+            "source_sequence_num", "first_source_time_utc", "last_source_time_utc",
+            "malformed_control_time_utc", "earliest_control",
+            "first_l2_effective_time_utc", "candidate_cursor_utc",
+            "boundary_candidates", "heartbeat_buckets", "delivery_count",
+        }
+        for entry in data["connections"]:
+            if not isinstance(entry, dict) or set(entry) != connection_fields:
+                raise ValueError("Malformed canonical connection checkpoint")
+            connection_id = entry["connection_id"]
+            if connection_id is not None and not isinstance(connection_id, str):
+                raise ValueError("Checkpoint connection_id must be a string or null")
+            if connection_id in connection_keys:
+                raise ValueError("Duplicate checkpoint connection id")
+            connection_keys.add(connection_id)
+
+            def optional_time(field_name: str) -> datetime | None:
+                return _utc_from_checkpoint(entry[field_name], nullable=True)
+
+            candidate_cursor = optional_time("candidate_cursor_utc")
+            if (
+                candidate_cursor is not None
+                and candidate_cursor != floor_to_quarter_hour(candidate_cursor)
+            ):
+                raise ValueError("Candidate cursor must use a quarter-hour timestamp")
+            sequence = entry["last_envelope_sequence_num"]
+            if sequence is not None:
+                _require_nonnegative_int(sequence, field="last_envelope_sequence_num")
+            source_sequence = entry["source_sequence_num"]
+            if source_sequence is not None:
+                _require_nonnegative_int(source_sequence, field="source_sequence_num")
+            for name in ("source_invalid", "has_snapshot"):
+                if type(entry[name]) is not bool:
+                    raise ValueError(f"Checkpoint {name} must be boolean")
+            book_checkpoint = entry["book"]
+            if book_checkpoint is None:
+                book = None
+            else:
+                book = Level2OrderBook.from_checkpoint(book_checkpoint)
+                if book.product_id != product_id:
+                    raise ValueError("Checkpoint connection book product_id mismatch")
+            terminal_checkpoint = entry["terminal_state"]
+            terminal = (
+                _compact_state_from_checkpoint(terminal_checkpoint)
+                if terminal_checkpoint is not None else None
+            )
+            if terminal is not None and terminal.connection_id != connection_id:
+                raise ValueError("Terminal compact state connection_id mismatch")
+            earliest_checkpoint = entry["earliest_control"]
+            if earliest_checkpoint is None:
+                earliest = None
+            else:
+                if not isinstance(earliest_checkpoint, dict) or set(earliest_checkpoint) != {
+                    "time_utc", "delivery_count", "reason", "message",
+                }:
+                    raise ValueError("Malformed earliest control checkpoint")
+                control_time = _utc_from_checkpoint(earliest_checkpoint["time_utc"])
+                delivery = _require_nonnegative_int(
+                    earliest_checkpoint["delivery_count"], field="earliest_control.delivery_count",
+                )
+                reason, message = earliest_checkpoint["reason"], earliest_checkpoint["message"]
+                if not isinstance(reason, str) or not isinstance(message, str):
+                    raise ValueError("Checkpoint control reason and message must be strings")
+                assert control_time is not None
+                earliest = (control_time, delivery, reason, message)
+
+            candidates: dict[datetime, _CompactBoundaryState] = {}
+            records = entry["boundary_candidates"]
+            if not isinstance(records, list):
+                raise ValueError("Checkpoint boundary_candidates must be a list")
+            previous_boundary: datetime | None = None
+            for record in records:
+                if not isinstance(record, dict) or set(record) != {"boundary_time_utc", "state"}:
+                    raise ValueError("Malformed boundary candidate checkpoint")
+                boundary_time = _utc_from_checkpoint(record["boundary_time_utc"])
+                assert boundary_time is not None
+                if previous_boundary is not None and boundary_time <= previous_boundary:
+                    raise ValueError("Boundary candidate times must be strictly ordered")
+                previous_boundary = boundary_time
+                if boundary_time != floor_to_quarter_hour(boundary_time):
+                    raise ValueError("Boundary candidate must use a quarter-hour timestamp")
+                candidate = _compact_state_from_checkpoint(record["state"])
+                if candidate.connection_id != connection_id:
+                    raise ValueError("Boundary candidate connection_id mismatch")
+                candidates[boundary_time] = candidate
+
+            heartbeats: dict[datetime, datetime] = {}
+            records = entry["heartbeat_buckets"]
+            if not isinstance(records, list):
+                raise ValueError("Checkpoint heartbeat_buckets must be a list")
+            previous_bucket: datetime | None = None
+            for record in records:
+                if not isinstance(record, dict) or set(record) != {
+                    "bucket_time_utc", "heartbeat_time_utc",
+                }:
+                    raise ValueError("Malformed heartbeat bucket checkpoint")
+                bucket = _utc_from_checkpoint(record["bucket_time_utc"])
+                heartbeat = _utc_from_checkpoint(record["heartbeat_time_utc"])
+                assert bucket is not None and heartbeat is not None
+                if previous_bucket is not None and bucket <= previous_bucket:
+                    raise ValueError("Heartbeat buckets must be strictly ordered")
+                previous_bucket = bucket
+                if bucket != floor_to_quarter_hour(heartbeat) and bucket != floor_to_quarter_hour(heartbeat) + timedelta(minutes=15):
+                    raise ValueError("Heartbeat time does not match its bucket")
+                heartbeats[bucket] = heartbeat
+
+            delivery_count = _require_nonnegative_int(entry["delivery_count"], field="delivery_count")
+            state = _StreamingConnectionState(
+                connection_id=connection_id,
+                last_envelope_sequence_num=sequence,
+                source_invalid=entry["source_invalid"],
+                book=book,
+                terminal_state=terminal,
+                has_snapshot=entry["has_snapshot"],
+                source_state_time_utc=optional_time("source_state_time_utc"),
+                source_sequence_num=source_sequence,
+                first_source_time_utc=optional_time("first_source_time_utc"),
+                last_source_time_utc=optional_time("last_source_time_utc"),
+                malformed_control_time_utc=optional_time("malformed_control_time_utc"),
+                earliest_control=earliest,
+                first_l2_effective_time_utc=optional_time("first_l2_effective_time_utc"),
+                candidate_cursor_utc=candidate_cursor,
+                boundary_candidates=candidates,
+                heartbeat_buckets=heartbeats,
+                delivery_count=delivery_count,
+            )
+            if (
+                state.first_source_time_utc is not None
+                and state.last_source_time_utc is not None
+                and state.first_source_time_utc > state.last_source_time_utc
+            ):
+                raise ValueError("Checkpoint connection source time range is reversed")
+            result._connections[connection_id] = state
+        if data["_has_active_connection"] and active_id not in connection_keys:
+            raise ValueError("Checkpoint active connection is missing")
+        if data["_has_active_connection"]:
+            active_state = result._connections[active_id]
+            if active_state.book is None:
+                raise ValueError("Checkpoint active connection has no live order book")
+        result._active_connection_id = active_id
+        result._has_active_connection = data["_has_active_connection"]
+        return result
 
     def _new_connection_state(self, connection_id: str | None) -> _StreamingConnectionState:
         return _StreamingConnectionState(
@@ -1385,5 +1748,6 @@ __all__ = [
     "replay_recorded_frames",
     "replay_recorded_frames_bounded",
     "CanonicalReplayAccumulator",
+    "CANONICAL_REPLAY_CHECKPOINT_VERSION",
     "replay_events",
 ]
