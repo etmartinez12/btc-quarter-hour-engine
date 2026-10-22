@@ -27,6 +27,7 @@ from btc_quarter_hour_engine.market_data._checkpoint import (
     _utc_to_checkpoint,
 )
 from btc_quarter_hour_engine.research.forward_dataset import (
+    _filesystem_path,
     _iter_segment_frames,
     _segment_from_metadata,
 )
@@ -544,7 +545,7 @@ def _artifact_path(
 ) -> Path:
     for artifact in manifest["artifacts"]:
         if artifact.get("data_kind") == data_kind:
-            return manifest_path.parent / artifact["path"]
+            return Path(_filesystem_path(manifest_path.parent / artifact["path"]))
     raise ValueError(f"Research manifest has no {data_kind!r} artifact")
 
 
@@ -636,22 +637,10 @@ def replay_raw_feature_buckets(
                     flush=True,
                 )
 
-    rows = []
-    for bucket_end, bucket in sorted(replay.buckets.items()):
-        rows.append(
-            {
-                "bucket_end": pd.Timestamp(bucket_end),
-                **{
-                    field: getattr(bucket, field)
-                    for field in _BucketStats.__dataclass_fields__
-                },
-            }
-        )
-
-    bucket_frame = pd.DataFrame(rows)
-    if not bucket_frame.empty:
-        bucket_frame["bucket_end"] = pd.to_datetime(bucket_frame["bucket_end"], utc=True)
-        bucket_frame = bucket_frame.sort_values("bucket_end").set_index("bucket_end")
+    bucket_frame = _feature_buckets_frame(
+        replay,
+        latest_boundary=None if pd.isna(last_boundary) else last_boundary,
+    )
 
     diagnostics = {
         "research_dataset_id": manifest["dataset_id"],
@@ -666,6 +655,38 @@ def replay_raw_feature_buckets(
         "expected_next_frame_index": expected_frame_index,
     }
     return bucket_frame, diagnostics
+
+
+def _feature_buckets_frame(
+    replay: _IngestFeatureReplay,
+    *,
+    latest_boundary: datetime | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if latest_boundary is None:
+        return pd.DataFrame(
+            columns=[
+                "bucket_end",
+                *tuple(_BucketStats.__dataclass_fields__),
+            ]
+        ).set_index("bucket_end")
+    rows = []
+    for bucket_end, bucket in sorted(replay.buckets.items()):
+        if latest_boundary is not None and bucket_end > latest_boundary:
+            continue
+        rows.append(
+            {
+                "bucket_end": pd.Timestamp(bucket_end),
+                **{
+                    field: getattr(bucket, field)
+                    for field in _BucketStats.__dataclass_fields__
+                },
+            }
+        )
+    bucket_frame = pd.DataFrame(rows)
+    if not bucket_frame.empty:
+        bucket_frame["bucket_end"] = pd.to_datetime(bucket_frame["bucket_end"], utc=True)
+        bucket_frame = bucket_frame.sort_values("bucket_end").set_index("bucket_end")
+    return bucket_frame
 
 
 def _window_features(
@@ -779,20 +800,33 @@ def assemble_research_feature_frame(
     manifest_path: str | Path,
     buckets: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Assemble causal predictors with canonical targets.
-
-    Predictor state comes only from information received by timestamp t.
-    Canonical source-time values are retained only as audit/target provenance.
-    """
     manifest_path = Path(manifest_path)
     manifest = _load_manifest(manifest_path)
-
     boundaries = pd.read_parquet(
         _artifact_path(manifest_path, manifest, "canonical_boundaries")
     )
     targets = pd.read_parquet(
         _artifact_path(manifest_path, manifest, "direction_targets")
     )
+    return assemble_research_feature_frame_from_frames(
+        boundaries,
+        targets,
+        buckets,
+    )
+
+
+def assemble_research_feature_frame_from_frames(
+    boundaries: pd.DataFrame,
+    targets: pd.DataFrame,
+    buckets: pd.DataFrame,
+) -> pd.DataFrame:
+    """Assemble causal predictors with canonical targets.
+
+    Predictor state comes only from information received by timestamp t.
+    Canonical source-time values are retained only as audit/target provenance.
+    """
+    boundaries = boundaries.copy()
+    targets = targets.copy()
 
     boundaries["boundary_time_utc"] = pd.to_datetime(
         boundaries["boundary_time_utc"], utc=True, errors="raise"
@@ -808,6 +842,27 @@ def assemble_research_feature_frame(
     targets = targets.sort_values(
         "timestamp"
     ).reset_index(drop=True)
+
+    if boundaries.empty:
+        return pd.DataFrame(
+            columns=[
+                "timestamp",
+                *PREDICTOR_COLUMNS,
+                "canonical_midpoint",
+                "canonical_spread_bps",
+                "canonical_target_eligible",
+                "canonical_eligibility_reason",
+                "feature_ready",
+                "target",
+                "target_time",
+                "label_available_time",
+                "target_eligible",
+                "target_eligibility_reason",
+                "price_change",
+                "target_log_return_15m",
+                "trainable",
+            ]
+        )
 
     if boundaries["boundary_time_utc"].duplicated().any():
         raise ValueError("Canonical boundary timestamps are not unique")

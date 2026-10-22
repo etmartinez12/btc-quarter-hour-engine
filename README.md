@@ -205,6 +205,20 @@ The production source is read-only. Discovery snapshots sealed segment metadata 
 
 Canonical labels use only exact `t` and `t+15m` boundary rows, and require both boundaries to be eligible with finite positive midpoint prices. Missing boundaries are not bridged, flat moves remain unlabeled, and no candles, interpolation, nearest-time matching, or forward filling are used.
 
+### Incremental research materialization
+
+For resumable research construction over a single collector session, run the one-shot materializer:
+
+```bash
+btc-qh-materialize-research \
+  --input-root /var/lib/btc-qh/data_lake_prod \
+  --output-root /var/lib/btc-qh/research_incremental \
+  --product BTC-USD \
+  --max-new-segments 100
+```
+
+Each invocation snapshots sealed segments once, verifies that the checkpointed segment ledger remains an exact immutable prefix, and processes only the newly sealed suffix. `checkpoint.json` is the authoritative continuation state; Parquet files and `materialization.json` are replaceable derived caches. Checkpoint and artifact writes use same-directory temporary files and atomic replacement. The materializer consumes complete segments to preserve continuation state, but exports feature buckets only through the latest currently finalized canonical boundary. Active `.partial` files are ignored. Version 1 intentionally rejects inputs containing more than one collector session; it is a one-shot command, not a daemon or collector integration.
+
 Normalized output lives under `data_lake/normalized/coinbase_advanced/BTC-USD/<data_kind>/date=YYYY-MM-DD/part-<sha256>.parquet` for three `data_kind` values:
 
 - `quarter_hour_bbo` — final canonical ledger with `boundary_time_utc`, source/product/session/connection, source state time and sequence, derivation time, bid/ask prices and sizes, spread, midpoint, book sync state, eligibility and reason, and boundary schema version.
