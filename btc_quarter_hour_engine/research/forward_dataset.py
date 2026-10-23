@@ -218,14 +218,15 @@ def discover_sealed_segments(
         for candidate in segment_dir.iterdir()
         if candidate.name.endswith(".partial") and candidate.is_file()
     )
+    discovered_snapshot = tuple(
+        _segment_from_metadata(path, source=source, product_id=product_id)
+        for path in metadata_paths
+    )
+    grouped = _order_sessions_by_ingest_time(discovered_snapshot)
     discovered = tuple(
-        sorted(
-            (
-                _segment_from_metadata(path, source=source, product_id=product_id)
-                for path in metadata_paths
-            ),
-            key=lambda segment: (segment.session_id, segment.segment_index),
-        )
+        segment
+        for session_segments in grouped.values()
+        for segment in session_segments
     )
     if not discovered:
         raise ValueError(f"No sealed raw segments found for {source} {product_id} in {segment_dir}")
@@ -371,6 +372,36 @@ def _group_and_validate_segments(
 ) -> dict[str, tuple[DiscoveredRawSegment, ...]]:
     if not segments:
         raise ValueError("No sealed raw segments were discovered")
+    grouped = _order_sessions_by_ingest_time(segments)
+    result: dict[str, tuple[DiscoveredRawSegment, ...]] = {}
+    for session_id, session_segments in grouped.items():
+        ordered = session_segments
+        indexes = [segment.segment_index for segment in ordered]
+        if indexes != list(range(len(indexes))):
+            raise ValueError(
+                f"Noncontiguous sealed segment indexes for session {session_id}: {indexes}"
+            )
+        if any(segment.session_id != session_id for segment in ordered):
+            raise ValueError(f"Session ID mismatch in segment group {session_id}")
+        for previous, current in zip(ordered, ordered[1:]):
+            if current.first_ingest_time_utc < previous.last_ingest_time_utc:
+                raise ValueError(
+                    f"Ingest time regressed within session {session_id} between "
+                    f"segments {previous.segment_index} and {current.segment_index}"
+                )
+        for previous, current in zip(ordered, ordered[1:]):
+            if current.first_ingest_time_utc < previous.last_ingest_time_utc:
+                raise ValueError(
+                    f"Ingest time regressed within session {session_id} between "
+                    f"segments {previous.segment_index} and {current.segment_index}"
+                )
+        result[session_id] = ordered
+    return result
+
+
+def _order_sessions_by_ingest_time(
+    segments: Sequence[DiscoveredRawSegment],
+) -> dict[str, tuple[DiscoveredRawSegment, ...]]:
     grouped: dict[str, list[DiscoveredRawSegment]] = defaultdict(list)
     for segment in segments:
         if segment.source != FORWARD_SOURCE:
@@ -380,18 +411,23 @@ def _group_and_validate_segments(
                 f"Unsupported raw segment schema version: {segment.raw_segment_schema_version}"
             )
         grouped[segment.session_id].append(segment)
-    result: dict[str, tuple[DiscoveredRawSegment, ...]] = {}
-    for session_id, session_segments in grouped.items():
-        ordered = tuple(sorted(session_segments, key=lambda segment: segment.segment_index))
-        indexes = [segment.segment_index for segment in ordered]
-        if indexes != list(range(len(indexes))):
+    ordered_groups = {
+        session_id: tuple(sorted(session_segments, key=lambda item: item.segment_index))
+        for session_id, session_segments in grouped.items()
+    }
+    ranges = [
+        (session_id, ordered[0].first_ingest_time_utc, ordered[-1].last_ingest_time_utc)
+        for session_id, ordered in ordered_groups.items()
+    ]
+    ranges.sort(key=lambda item: (item[1], item[2], item[0]))
+    for previous, current in zip(ranges, ranges[1:]):
+        if current[1] <= previous[2]:
             raise ValueError(
-                f"Noncontiguous sealed segment indexes for session {session_id}: {indexes}"
+                "Collector sessions overlap or cannot be uniquely ordered by ingest time: "
+                f"{previous[0]} ends at {_iso(previous[2])}, "
+                f"{current[0]} starts at {_iso(current[1])}"
             )
-        if any(segment.session_id != session_id for segment in ordered):
-            raise ValueError(f"Session ID mismatch in segment group {session_id}")
-        result[session_id] = ordered
-    return result
+    return {session_id: ordered_groups[session_id] for session_id, _, _ in ranges}
 
 
 def _observation_row(observation: QuarterHourObservation) -> dict[str, Any]:
@@ -617,7 +653,7 @@ def _build_manifest(
     for segment in segments:
         session_groups[segment.session_id].append(segment)
     source_sessions = []
-    for session_id, session_segments in sorted(session_groups.items()):
+    for session_id, session_segments in session_groups.items():
         ordered = sorted(session_segments, key=lambda item: item.segment_index)
         source_sessions.append(
             {
@@ -781,7 +817,7 @@ def build_research_dataset(
 
     all_observations: list[QuarterHourObservation] = []
     total_frames = 0
-    for session_id, session_segments in sorted(grouped.items()):
+    for session_id, session_segments in grouped.items():
         accumulator = CanonicalReplayAccumulator(
             product_id=product_id,
             session_id=session_id,
@@ -825,7 +861,9 @@ def build_research_dataset(
     targets = build_canonical_direction_targets(boundary_frame)
 
     ordered_segments = tuple(
-        sorted(segments, key=lambda segment: (segment.session_id, segment.segment_index))
+        segment
+        for session_segments in grouped.values()
+        for segment in session_segments
     )
     dataset_id, _identity = _dataset_identity(
         source=source,

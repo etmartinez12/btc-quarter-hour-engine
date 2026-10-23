@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -81,14 +81,89 @@ def _stream(*, future_frame: bool = False) -> list[bytes]:
     ]
 
 
-def _write_input(root: Path, *, future_frame: bool = False):
+def _long_stream() -> list[bytes]:
+    start = _time("2026-01-01T00:14:50Z")
+    records = [
+        ("l2_data", start, "snapshot"),
+        ("heartbeats", start + timedelta(seconds=5), ""),
+        ("l2_data", start + timedelta(seconds=9), "update"),
+    ]
+    for quarter in range(1, 21):
+        quarter_start = start + timedelta(minutes=15 * quarter)
+        records.extend([
+            ("heartbeats", quarter_start + timedelta(seconds=1), ""),
+            ("l2_data", quarter_start + timedelta(seconds=5), "update"),
+        ])
+    return [
+        _frame(channel, timestamp.isoformat().replace("+00:00", "Z"), index + 1, kind=kind)
+        for index, (channel, timestamp, kind) in enumerate(records)
+    ]
+
+
+def _shift_stream(frames: list[bytes], offset: timedelta) -> list[bytes]:
+    shifted = []
+    for raw in frames:
+        payload = json.loads(raw)
+
+        def shift_times(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {"timestamp", "event_time", "current_time"} and isinstance(item, str):
+                        value[key] = (
+                            _time(item) + offset
+                        ).isoformat().replace("+00:00", "Z")
+                    else:
+                        shift_times(item)
+            elif isinstance(value, list):
+                for item in value:
+                    shift_times(item)
+
+        shift_times(payload)
+        shifted.append(json.dumps(payload, separators=(",", ":")).encode())
+    return shifted
+
+
+def _shift_prices(frames: list[bytes], offset: float) -> list[bytes]:
+    shifted = []
+    for raw in frames:
+        payload = json.loads(raw)
+
+        def shift_levels(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "price_level":
+                        value[key] = str(float(item) + offset)
+                    else:
+                        shift_levels(item)
+            elif isinstance(value, list):
+                for item in value:
+                    shift_levels(item)
+
+        shift_levels(payload)
+        shifted.append(json.dumps(payload, separators=(",", ":")).encode())
+    return shifted
+
+
+def _write_input(
+    root: Path,
+    *,
+    future_frame: bool = False,
+    session_id: str = "session-materializer",
+    time_offset: timedelta = timedelta(0),
+    price_offset: float = 0.0,
+    long: bool = False,
+):
     writer = RawSegmentWriter(
         root,
         product_id="BTC-USD",
-        session_id="session-materializer",
-        max_frames=2,
+        session_id=session_id,
+        max_frames=7 if long else 2,
     )
-    frames = _stream(future_frame=future_frame)
+    frames = _long_stream() if long else _stream(future_frame=future_frame)
+    if time_offset:
+        frames = _shift_stream(frames, time_offset)
+    if price_offset:
+        frames = _shift_prices(frames, price_offset)
     for raw in frames:
         payload = json.loads(raw)
         timestamp = payload["timestamp"]
@@ -215,9 +290,14 @@ def test_noop_does_not_replay_processed_prefix_and_preserves_checkpoint(tmp_path
     assert result.diagnostics["new_frames_processed_this_run"] == 0
     assert (output_root / "checkpoint.json").read_bytes() == checkpoint_before
     checkpoint = json.loads(checkpoint_before)
-    assert checkpoint["version"] == 1
+    assert checkpoint["version"] == 2
     assert checkpoint["heartbeat_timeout_seconds"] == 5.0
-    assert checkpoint["canonical_replay"]["heartbeat_timeout_seconds"] == 5.0
+    assert (
+        checkpoint["processed_sessions"][-1]["canonical_replay"][
+            "heartbeat_timeout_seconds"
+        ]
+        == 5.0
+    )
     assert result.diagnostics["heartbeat_timeout_seconds"] == 5.0
     metadata = json.loads(result.materialization_path.read_text())
     assert metadata["heartbeat_timeout_seconds"] == 5.0
@@ -247,7 +327,11 @@ def test_restore_rejects_inconsistent_checkpoint_heartbeat_timeout(tmp_path, mon
     _materialize(input_root, output_root, max_new_segments=2)
     checkpoint_path = output_root / "checkpoint.json"
     checkpoint = json.loads(checkpoint_path.read_text())
-    target = checkpoint["canonical_replay"] if nested else checkpoint
+    target = (
+        checkpoint["processed_sessions"][-1]["canonical_replay"]
+        if nested
+        else checkpoint
+    )
     target["heartbeat_timeout_seconds"] = 30.0
     checkpoint_path.write_text(json.dumps(checkpoint, allow_nan=False))
 
@@ -315,7 +399,9 @@ def test_prefix_metadata_mutation_fails_before_processing_any_segment(tmp_path, 
         lambda checkpoint: checkpoint.update(source="wrong-source"),
         lambda checkpoint: checkpoint.update(product_id="ETH-USD"),
         lambda checkpoint: checkpoint.update(predictor_contract_version="changed"),
-        lambda checkpoint: checkpoint["canonical_replay"].update(version=999),
+        lambda checkpoint: checkpoint["processed_sessions"][-1][
+            "canonical_replay"
+        ].update(version=999),
     ],
 )
 def test_corrupt_checkpoint_fails_closed(tmp_path, mutation):
@@ -330,6 +416,37 @@ def test_corrupt_checkpoint_fails_closed(tmp_path, mutation):
 
     with pytest.raises(ValueError):
         _materialize(input_root, output_root)
+
+
+def test_single_session_v1_checkpoint_is_intentionally_migrated_on_resume(tmp_path):
+    input_root = tmp_path / "raw"
+    _write_input(input_root)
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root, max_new_segments=2)
+    checkpoint_path = output_root / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    session = checkpoint["processed_sessions"][0]
+    checkpoint_v1 = {
+        "version": 1,
+        "source": checkpoint["source"],
+        "product_id": checkpoint["product_id"],
+        "predictor_contract_version": checkpoint["predictor_contract_version"],
+        "heartbeat_timeout_seconds": checkpoint["heartbeat_timeout_seconds"],
+        "session_id": session["session_id"],
+        "expected_next_frame_index": session["expected_next_frame_index"],
+        "first_ingest_time_utc": checkpoint["first_ingest_time_utc"],
+        "last_ingest_time_utc": checkpoint["last_ingest_time_utc"],
+        "processed_segments": checkpoint["processed_segments"],
+        "feature_replay": session["feature_replay"],
+        "canonical_replay": session["canonical_replay"],
+    }
+    checkpoint_path.write_text(json.dumps(checkpoint_v1))
+
+    _materialize(input_root, output_root)
+    migrated = json.loads(checkpoint_path.read_text())
+    assert migrated["version"] == 2
+    assert len(migrated["processed_sessions"]) == 1
+    assert migrated["session_id"] == "session-materializer"
 
 
 def test_active_partial_is_ignored_and_counted(tmp_path):
@@ -365,25 +482,237 @@ def test_atomic_checkpoint_failure_before_replace_preserves_previous_file(tmp_pa
     assert list(tmp_path.glob(".checkpoint.*.tmp")) == []
 
 
-def test_multiple_sessions_fail_closed(tmp_path):
+def test_full_and_resumed_materialization_across_session_rollover_are_identical(tmp_path):
     input_root = tmp_path / "raw"
-    _write_input(input_root)
-    other = RawSegmentWriter(
+    _write_input(input_root, session_id="z-session", long=True)
+    resumed_root = tmp_path / "resumed"
+    _materialize(input_root, resumed_root)
+    _write_input(
         input_root,
-        product_id="BTC-USD",
-        session_id="second-session",
-        max_frames=1,
-    )
-    raw = _frame("heartbeats", "2026-01-02T00:00:00Z", 1)
-    other.add_frame(
-        raw=raw,
-        message_type="heartbeat",
-        connection_id="second-connection",
-        ingest_time_utc=_time("2026-01-02T00:00:00Z"),
+        session_id="a-session",
+        time_offset=timedelta(hours=5, seconds=6),
+        long=True,
     )
 
-    with pytest.raises(ValueError, match="exactly one source session"):
+    full_root = tmp_path / "full"
+    _materialize(input_root, full_root)
+    resumed = _materialize(input_root, resumed_root)
+    assert resumed.diagnostics["processed_session_count"] == 2
+    assert resumed.diagnostics["ordered_processed_session_ids"] == [
+        "z-session",
+        "a-session",
+    ]
+    assert resumed.diagnostics["latest_processed_session_id"] == "a-session"
+    assert json.loads((full_root / "checkpoint.json").read_text()) == json.loads(
+        (resumed_root / "checkpoint.json").read_text()
+    )
+    for name, full_frame in _frames(full_root).items():
+        pd.testing.assert_frame_equal(
+            full_frame,
+            _frames(resumed_root)[name],
+            check_exact=True,
+        )
+
+    dataset = build_research_dataset(
+        input_root=input_root,
+        output_root=tmp_path / "oracle",
+        discovered_segments=discover_sealed_segments(input_root),
+    )
+    oracle_buckets, _ = replay_raw_feature_buckets(
+        dataset.manifest_path, input_root
+    )
+    oracle_features, _ = build_raw_research_feature_frame(
+        dataset.manifest_path, input_root
+    )
+    pd.testing.assert_frame_equal(
+        _frames(full_root)["canonical_boundaries.parquet"],
+        pd.read_parquet(dataset.boundary_artifact),
+        check_exact=True,
+    )
+    pd.testing.assert_frame_equal(
+        _frames(full_root)["direction_targets.parquet"],
+        pd.read_parquet(dataset.target_artifact),
+        check_exact=True,
+    )
+    pd.testing.assert_frame_equal(
+        _frames(full_root)["feature_buckets.parquet"],
+        oracle_buckets.reset_index(),
+        check_exact=True,
+    )
+    pd.testing.assert_frame_equal(
+        _frames(full_root)["research_features.parquet"],
+        oracle_features,
+        check_exact=True,
+    )
+
+    boundaries = pd.read_parquet(full_root / "canonical_boundaries.parquet")
+    features = pd.read_parquet(full_root / "research_features.parquet")
+    session_b_boundaries = boundaries.loc[
+        boundaries["session_id"] == "a-session", "boundary_time_utc"
+    ]
+    session_b_features = features.loc[
+        features["timestamp"].between(
+            session_b_boundaries.min(), session_b_boundaries.max()
+        )
+    ]
+    assert session_b_features["feature_ready"].any()
+    first_ready = session_b_features.loc[
+        session_b_features["feature_ready"], "timestamp"
+    ].min()
+    assert first_ready >= session_b_boundaries.min() + pd.Timedelta(minutes=240)
+    buckets = pd.read_parquet(full_root / "feature_buckets.parquet")
+    assert set(buckets["session_id"]) == {"z-session", "a-session"}
+
+    checkpoint_before_noop = (resumed_root / "checkpoint.json").read_bytes()
+    no_op = _materialize(input_root, resumed_root)
+    assert no_op.diagnostics["new_segments_processed_this_run"] == 0
+    assert no_op.diagnostics["new_frames_processed_this_run"] == 0
+    assert (resumed_root / "checkpoint.json").read_bytes() == checkpoint_before_noop
+    for name, frame in _frames(full_root).items():
+        pd.testing.assert_frame_equal(
+            frame, _frames(resumed_root)[name], check_exact=True
+        )
+
+
+def test_overlapping_sessions_fail_closed(tmp_path):
+    input_root = tmp_path / "raw"
+    _write_input(input_root, session_id="session-a")
+    _write_input(
+        input_root,
+        session_id="session-b",
+        time_offset=timedelta(minutes=1),
+    )
+
+    with pytest.raises(ValueError, match="overlap or cannot be uniquely ordered"):
         _materialize(input_root, tmp_path / "research")
+
+
+def test_malformed_first_segment_of_next_session_fails_closed(tmp_path):
+    input_root = tmp_path / "raw"
+    _write_input(input_root, session_id="session-a")
+    writer, _ = _write_input(
+        input_root,
+        session_id="session-b",
+        time_offset=timedelta(hours=2),
+    )
+    first = writer.sealed_segments[0]
+    Path(first["path"]).unlink()
+    Path(first["metadata_path"]).unlink()
+
+    with pytest.raises(ValueError, match="Noncontiguous sealed segment indexes"):
+        _materialize(input_root, tmp_path / "research")
+
+
+def test_interleaved_sessions_and_return_to_an_earlier_session_fail_closed(tmp_path):
+    input_root = tmp_path / "raw"
+    first = RawSegmentWriter(
+        input_root, product_id="BTC-USD", session_id="session-a", max_frames=1
+    )
+    second = RawSegmentWriter(
+        input_root, product_id="BTC-USD", session_id="session-b", max_frames=1
+    )
+    for writer, stamp, sequence in (
+        (first, "2026-01-01T00:00:00Z", 1),
+        (second, "2026-01-01T00:01:00Z", 1),
+    ):
+        writer.add_frame(
+            raw=_frame("heartbeats", stamp, sequence),
+            message_type="heartbeat",
+            connection_id=f"{writer.session_id}-connection",
+            ingest_time_utc=_time(stamp),
+        )
+    first.add_frame(
+        raw=_frame("heartbeats", "2026-01-01T00:02:00Z", 2),
+        message_type="heartbeat",
+        connection_id="session-a-connection",
+        ingest_time_utc=_time("2026-01-01T00:02:00Z"),
+    )
+
+    with pytest.raises(ValueError, match="overlap or cannot be uniquely ordered"):
+        _materialize(input_root, tmp_path / "research")
+
+
+def test_regressing_ingest_times_within_session_fail_closed(tmp_path):
+    input_root = tmp_path / "raw"
+    writer = RawSegmentWriter(
+        input_root, product_id="BTC-USD", session_id="session-a", max_frames=1
+    )
+    for sequence, stamp in enumerate(
+        ("2026-01-01T00:02:00Z", "2026-01-01T00:01:00Z"),
+        start=1,
+    ):
+        writer.add_frame(
+            raw=_frame("heartbeats", stamp, sequence),
+            message_type="heartbeat",
+            connection_id="session-a-connection",
+            ingest_time_utc=_time(stamp),
+        )
+
+    with pytest.raises(ValueError, match="Ingest time regressed within session"):
+        _materialize(input_root, tmp_path / "research")
+
+
+def test_new_session_requires_its_own_order_book_snapshot(tmp_path):
+    input_root = tmp_path / "raw"
+    _write_input(input_root, session_id="session-a")
+    writer = RawSegmentWriter(
+        input_root, product_id="BTC-USD", session_id="session-b", max_frames=1
+    )
+    stamp = "2026-01-01T02:00:00Z"
+    writer.add_frame(
+        raw=_frame("heartbeats", stamp, 1),
+        message_type="heartbeat",
+        connection_id="session-b-connection",
+        ingest_time_utc=_time(stamp),
+    )
+
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root)
+    boundaries = pd.read_parquet(output_root / "canonical_boundaries.parquet")
+    session_b = boundaries.loc[boundaries["session_id"] == "session-b"]
+    assert not session_b.empty
+    assert not session_b["book_synced"].any()
+    assert not session_b["canonical_target_eligible"].any()
+
+
+def test_endpoint_valid_direction_target_is_preserved_across_session_transition(tmp_path):
+    input_root = tmp_path / "raw"
+    _write_input(input_root, session_id="session-a")
+    _write_input(
+        input_root,
+        session_id="session-b",
+        time_offset=timedelta(minutes=45),
+        price_offset=1.0,
+    )
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root)
+    targets = pd.read_parquet(output_root / "direction_targets.parquet")
+
+    crossing = targets.loc[
+        (targets["session_id_t"] == "session-a")
+        & (targets["session_id_t_plus_15m"] == "session-b")
+    ]
+    assert len(crossing) == 1
+    assert bool(crossing.iloc[0]["target_eligible"])
+
+
+def test_corrupted_checkpoint_session_identity_fails_closed(tmp_path):
+    input_root = tmp_path / "raw"
+    _write_input(input_root, session_id="session-a")
+    _write_input(
+        input_root,
+        session_id="session-b",
+        time_offset=timedelta(hours=2),
+    )
+    output_root = tmp_path / "research"
+    _materialize(input_root, output_root)
+    checkpoint_path = output_root / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text())
+    checkpoint["processed_sessions"][0]["canonical_replay"]["session_id"] = "session-b"
+    checkpoint_path.write_text(json.dumps(checkpoint))
+
+    with pytest.raises(ValueError, match="canonical replay checkpoint session_id"):
+        _materialize(input_root, output_root)
 
 
 def test_output_root_inside_raw_input_is_rejected(tmp_path):
@@ -400,7 +729,9 @@ def test_future_partial_bucket_is_checkpointed_then_exported_after_boundary_adva
 
     _materialize(input_root, output_root, max_new_segments=5)
     checkpoint = json.loads((output_root / "checkpoint.json").read_text())
-    restored_features = _IngestFeatureReplay.from_checkpoint(checkpoint["feature_replay"])
+    restored_features = _IngestFeatureReplay.from_checkpoint(
+        checkpoint["processed_sessions"][-1]["feature_replay"]
+    )
     future_bucket = _time("2026-01-01T01:00:00Z")
     assert future_bucket in restored_features.buckets
     first_export = pd.read_parquet(output_root / "feature_buckets.parquet")

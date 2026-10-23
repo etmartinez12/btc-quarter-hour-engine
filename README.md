@@ -207,7 +207,7 @@ Canonical labels use only exact `t` and `t+15m` boundary rows, and require both 
 
 ### Incremental research materialization
 
-For resumable research construction over a single collector session, run the one-shot materializer:
+For resumable research construction across one or more chronologically sequential collector sessions, run the one-shot materializer:
 
 ```bash
 btc-qh-materialize-research \
@@ -217,7 +217,9 @@ btc-qh-materialize-research \
   --max-new-segments 100
 ```
 
-Each invocation snapshots sealed segments once, verifies that the checkpointed segment ledger remains an exact immutable prefix, and processes only the newly sealed suffix. `checkpoint.json` is the authoritative continuation state; Parquet files and `materialization.json` are replaceable derived caches. Checkpoint and artifact writes use same-directory temporary files and atomic replacement. The materializer consumes complete segments to preserve continuation state, but exports feature buckets only through the latest currently finalized canonical boundary. Active `.partial` files are ignored. Version 1 intentionally rejects inputs containing more than one collector session; it is a one-shot command, not a daemon or collector integration.
+Each invocation snapshots sealed segments once, verifies that the checkpointed segment ledger remains an exact immutable prefix, and processes only the newly sealed suffix. Segment indexes must start at zero and remain contiguous within each session. Session order is derived from immutable ingest-time bounds; sessions must not overlap, interleave, or regress. A session transition starts a fresh canonical and causal-feature replay epoch, so book synchronization and rolling feature readiness must be re-established from that session's own observations. Direction targets retain the existing endpoint-based eligibility rules, including valid endpoints on opposite sides of a session transition.
+
+`checkpoint.json` is the authoritative continuation state; Parquet files and `materialization.json` are replaceable derived caches. Checkpoint and artifact writes use same-directory temporary files and atomic replacement. The materializer consumes complete segments to preserve continuation state, but exports feature buckets only through the latest currently finalized canonical boundary. Active `.partial` files are ignored. Checkpoint schema version 2 records the ordered processed sessions and their independent replay states; valid version-1 single-session checkpoints are explicitly migrated when processing a new suffix. Diagnostics expose processed session IDs, segment/frame totals, and the latest session. This remains a one-shot command, not a daemon or collector integration.
 
 The authoritative checkpoint also records `heartbeat_timeout_seconds`: resume requires exact agreement with both the current invocation's configuration and the nested canonical replay checkpoint. A mismatch fails before any new segment is replayed. The timeout is also included in diagnostics and `materialization.json` for auditing.
 

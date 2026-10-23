@@ -312,7 +312,7 @@ def test_duplicate_boundary_across_sessions_fails_loudly(tmp_path):
     _write_session(input_root, session_id="session-a", start=start)
     _write_session(input_root, session_id="session-b", start=start)
 
-    with pytest.raises(ValueError, match="Duplicate global boundary timestamps"):
+    with pytest.raises(ValueError, match="overlap or cannot be uniquely ordered"):
         _build(input_root, tmp_path / "research")
     assert not list((tmp_path / "research").rglob("manifest.json"))
 

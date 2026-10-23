@@ -28,6 +28,7 @@ from btc_quarter_hour_engine.market_data._checkpoint import (
 )
 from btc_quarter_hour_engine.research.forward_dataset import (
     _filesystem_path,
+    _group_and_validate_segments,
     _iter_segment_frames,
     _segment_from_metadata,
 )
@@ -576,8 +577,12 @@ def _manifest_segments(manifest: dict[str, Any], *, input_root: Path) -> list[An
                 )
         segments.append(segment)
 
-    segments.sort(key=lambda item: (item.session_id, item.segment_index))
-    return segments
+    grouped = _group_and_validate_segments(segments)
+    return [
+        segment
+        for session_segments in grouped.values()
+        for segment in session_segments
+    ]
 
 
 def replay_raw_feature_buckets(
@@ -599,16 +604,21 @@ def replay_raw_feature_buckets(
     )
     last_boundary = boundaries["boundary_time_utc"].max()
 
-    replay = _IngestFeatureReplay(product_id=manifest["product_id"])
     segments = _manifest_segments(manifest, input_root=input_root)
     if max_segments is not None:
         segments = segments[:max_segments]
 
-    expected_frame_index = 0
+    replays: dict[str, _IngestFeatureReplay] = {}
+    expected_frame_indexes: dict[str, int] = {}
 
     for segment_number, segment in enumerate(segments, start=1):
         if segment.first_ingest_time_utc > last_boundary.to_pydatetime():
             break
+        replay = replays.get(segment.session_id)
+        if replay is None:
+            replay = _IngestFeatureReplay(product_id=manifest["product_id"])
+            replays[segment.session_id] = replay
+        expected_frame_index = expected_frame_indexes.get(segment.session_id, 0)
 
         for raw, connection_id, frame_index, ingest_time_utc in _iter_segment_frames(
             segment,
@@ -623,38 +633,74 @@ def replay_raw_feature_buckets(
                     frame_index=frame_index,
                     ingest_time_utc=ingest_time_utc,
                 )
+        expected_frame_indexes[segment.session_id] = expected_frame_index
 
-            if (
-                progress_every_frames > 0
-                and replay.frames_seen > 0
-                and replay.frames_seen % progress_every_frames == 0
-            ):
-                print(
-                    "feature_replay_progress "
-                    f"frames={replay.frames_seen} "
-                    f"segments={segment_number} "
-                    f"buckets={len(replay.buckets)}",
-                    flush=True,
-                )
+        total_frames_seen = sum(state.frames_seen for state in replays.values())
+        if (
+            progress_every_frames > 0
+            and total_frames_seen > 0
+            and total_frames_seen % progress_every_frames == 0
+        ):
+            print(
+                "feature_replay_progress "
+                f"frames={total_frames_seen} "
+                f"segments={segment_number} "
+                f"buckets={sum(len(state.buckets) for state in replays.values())}",
+                flush=True,
+            )
 
-    bucket_frame = _feature_buckets_frame(
-        replay,
-        latest_boundary=None if pd.isna(last_boundary) else last_boundary,
-    )
+    session_boundaries = {
+        session_id: frame
+        for session_id, frame in boundaries.groupby("session_id", sort=False)
+    } if not boundaries.empty else {}
+    bucket_frames = []
+    for session_id, replay in replays.items():
+        boundary_frame = session_boundaries.get(session_id)
+        session_last_boundary = (
+            boundary_frame["boundary_time_utc"].max()
+            if boundary_frame is not None and not boundary_frame.empty
+            else None
+        )
+        session_buckets = _feature_buckets_frame(
+            replay,
+            latest_boundary=session_last_boundary,
+        ).reset_index()
+        if len(replays) > 1:
+            session_buckets["session_id"] = session_id
+        bucket_frames.append(session_buckets)
+    if bucket_frames:
+        bucket_output = pd.concat(bucket_frames, ignore_index=True)
+    else:
+        bucket_output = _feature_buckets_frame(
+            _IngestFeatureReplay(product_id=manifest["product_id"])
+        ).reset_index()
+    if len(replays) > 1:
+        bucket_output = bucket_output.set_index("bucket_end")
+    elif "bucket_end" in bucket_output.columns:
+        bucket_output = bucket_output.set_index("bucket_end").sort_index()
+    frames_seen = sum(replay.frames_seen for replay in replays.values())
+    parsed_frames = sum(replay.parsed_frames for replay in replays.values())
+    malformed_frames = sum(replay.malformed_frames for replay in replays.values())
+    stale_frames = sum(replay.stale_frames for replay in replays.values())
+    sequence_gaps = sum(replay.sequence_gaps for replay in replays.values())
+    applied_l2_envelopes = sum(replay.applied_l2_envelopes for replay in replays.values())
+    bucket_count = sum(len(replay.buckets) for replay in replays.values())
 
     diagnostics = {
         "research_dataset_id": manifest["dataset_id"],
         "product_id": manifest["product_id"],
-        "frames_seen": replay.frames_seen,
-        "parsed_frames": replay.parsed_frames,
-        "malformed_frames": replay.malformed_frames,
-        "stale_frames": replay.stale_frames,
-        "sequence_gaps": replay.sequence_gaps,
-        "applied_l2_envelopes": replay.applied_l2_envelopes,
-        "bucket_count": len(replay.buckets),
-        "expected_next_frame_index": expected_frame_index,
+        "processed_session_count": len(replays),
+        "ordered_processed_session_ids": list(replays),
+        "frames_seen": frames_seen,
+        "parsed_frames": parsed_frames,
+        "malformed_frames": malformed_frames,
+        "stale_frames": stale_frames,
+        "sequence_gaps": sequence_gaps,
+        "applied_l2_envelopes": applied_l2_envelopes,
+        "bucket_count": bucket_count,
+        "expected_next_frame_index": sum(expected_frame_indexes.values()),
     }
-    return bucket_frame, diagnostics
+    return bucket_output, diagnostics
 
 
 def _feature_buckets_frame(
@@ -842,6 +888,30 @@ def assemble_research_feature_frame_from_frames(
     targets = targets.sort_values(
         "timestamp"
     ).reset_index(drop=True)
+
+    if "session_id" in buckets.columns and not boundaries.empty:
+        session_features = []
+        for session_id, session_boundaries in boundaries.groupby(
+            "session_id", sort=False
+        ):
+            session_buckets = buckets.loc[
+                buckets["session_id"] == session_id
+            ].drop(columns="session_id")
+            session_targets = targets.loc[
+                targets["timestamp"].isin(session_boundaries["boundary_time_utc"])
+            ]
+            session_features.append(
+                assemble_research_feature_frame_from_frames(
+                    session_boundaries,
+                    session_targets,
+                    session_buckets,
+                )
+            )
+        return (
+            pd.concat(session_features, ignore_index=True)
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
 
     if boundaries.empty:
         return pd.DataFrame(

@@ -35,7 +35,7 @@ from btc_quarter_hour_engine.storage.forward_schema import FORWARD_SOURCE
 from btc_quarter_hour_engine.targets import build_canonical_direction_targets
 
 
-RESEARCH_MATERIALIZER_CHECKPOINT_VERSION = 1
+RESEARCH_MATERIALIZER_CHECKPOINT_VERSION = 2
 
 _SEGMENT_FIELDS = {
     "session_id",
@@ -48,7 +48,7 @@ _SEGMENT_FIELDS = {
     "first_ingest_time_utc",
     "last_ingest_time_utc",
 }
-_CHECKPOINT_FIELDS = {
+_CHECKPOINT_FIELDS_V1 = {
     "version",
     "source",
     "product_id",
@@ -62,6 +62,38 @@ _CHECKPOINT_FIELDS = {
     "feature_replay",
     "canonical_replay",
 }
+_CHECKPOINT_FIELDS = {
+    "version",
+    "source",
+    "product_id",
+    "predictor_contract_version",
+    "heartbeat_timeout_seconds",
+    "session_id",
+    "expected_next_frame_index",
+    "total_processed_frame_count",
+    "first_ingest_time_utc",
+    "last_ingest_time_utc",
+    "processed_segments",
+    "processed_sessions",
+}
+_SESSION_CHECKPOINT_FIELDS = {
+    "session_id",
+    "expected_next_frame_index",
+    "first_ingest_time_utc",
+    "last_ingest_time_utc",
+    "feature_replay",
+    "canonical_replay",
+}
+
+
+@dataclass(slots=True)
+class _SessionReplayState:
+    session_id: str
+    expected_next_frame_index: int
+    first_ingest_time_utc: datetime
+    last_ingest_time_utc: datetime
+    feature_replay: _IngestFeatureReplay
+    canonical_replay: CanonicalReplayAccumulator
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,24 +159,45 @@ def _segment_record(segment: DiscoveredRawSegment) -> dict[str, Any]:
     }
 
 
-def _validate_ledger(ledger: Any, *, session_id: str) -> tuple[int, datetime | None, datetime | None]:
+def _validate_ledger(
+    ledger: Any,
+) -> tuple[dict[str, tuple[int, datetime, datetime]], int, datetime, datetime]:
     if not isinstance(ledger, list):
         raise ValueError("Materializer checkpoint processed_segments must be a list")
     total_frames = 0
     first_time: datetime | None = None
     last_time: datetime | None = None
+    session_counts: dict[str, int] = {}
+    session_bounds: dict[str, tuple[datetime, datetime]] = {}
+    closed_sessions: set[str] = set()
+    previous_session: str | None = None
+    previous_segment_index = -1
     for index, record in enumerate(ledger):
         if not isinstance(record, dict) or set(record) != _SEGMENT_FIELDS:
             raise ValueError("Malformed materializer checkpoint processed segment")
-        if record["session_id"] != session_id:
-            raise ValueError("Materializer checkpoint contains a changed source session")
+        session_id = record["session_id"]
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("Invalid materializer checkpoint segment session_id")
         segment_index = record["segment_index"]
-        if (
-            isinstance(segment_index, bool)
-            or not isinstance(segment_index, int)
-            or segment_index != index
-        ):
+        if isinstance(segment_index, bool) or not isinstance(segment_index, int):
+            raise ValueError("Materializer checkpoint segment indexes are malformed")
+        new_session = session_id != previous_session
+        if new_session:
+            if session_id in closed_sessions or segment_index != 0:
+                raise ValueError("Materializer checkpoint session segment indexes are noncontiguous")
+            if previous_session is not None:
+                closed_sessions.add(previous_session)
+                previous_bounds = session_bounds[previous_session]
+                next_first = _parse_checkpoint_time(
+                    record["first_ingest_time_utc"], field="first_ingest_time_utc"
+                )
+                if next_first is None or next_first <= previous_bounds[1]:
+                    raise ValueError("Materializer checkpoint sessions are not strictly chronological")
+            previous_session = session_id
+            previous_segment_index = -1
+        if segment_index != previous_segment_index + 1:
             raise ValueError("Materializer checkpoint segment indexes are noncontiguous")
+        previous_segment_index = segment_index
         for key in ("sha256", "metadata_sha256", "provenance_sha256"):
             digest = record[key]
             if (
@@ -164,36 +217,62 @@ def _validate_ledger(ledger: Any, *, session_id: str) -> tuple[int, datetime | N
             raise ValueError("Invalid materializer checkpoint ingest-time bounds")
         if index == 0:
             first_time = first
+        if session_id not in session_bounds:
+            session_bounds[session_id] = (first, last)
+        else:
+            session_first, session_last = session_bounds[session_id]
+            if first < session_last:
+                raise ValueError("Materializer checkpoint session ingest times regress")
+            session_bounds[session_id] = (session_first, last)
+        session_counts[session_id] = session_counts.get(session_id, 0) + frame_count
         last_time = last
         total_frames += frame_count
-    return total_frames, first_time, last_time
+    if first_time is None or last_time is None:
+        raise ValueError("Materializer checkpoint must contain a nonempty processed prefix")
+    sessions = {
+        session_id: (session_counts[session_id], *session_bounds[session_id])
+        for session_id in session_counts
+    }
+    return sessions, total_frames, first_time, last_time
 
 
 def _checkpoint_payload(
     *,
     source: str,
     product_id: str,
-    session_id: str,
-    expected_next_frame_index: int,
+    sessions: list[_SessionReplayState],
     first_ingest_time_utc: datetime,
     last_ingest_time_utc: datetime,
     processed_segments: list[dict[str, Any]],
-    feature_replay: _IngestFeatureReplay,
-    canonical_replay: CanonicalReplayAccumulator,
 ) -> dict[str, Any]:
+    if not sessions:
+        raise ValueError("Materializer checkpoint requires at least one processed session")
+    latest = sessions[-1]
     return {
         "version": RESEARCH_MATERIALIZER_CHECKPOINT_VERSION,
         "source": source,
         "product_id": product_id,
         "predictor_contract_version": PREDICTOR_CONTRACT_VERSION,
-        "heartbeat_timeout_seconds": canonical_replay.heartbeat_timeout_seconds,
-        "session_id": session_id,
-        "expected_next_frame_index": expected_next_frame_index,
+        "heartbeat_timeout_seconds": latest.canonical_replay.heartbeat_timeout_seconds,
+        "session_id": latest.session_id,
+        "expected_next_frame_index": latest.expected_next_frame_index,
+        "total_processed_frame_count": sum(
+            session.expected_next_frame_index for session in sessions
+        ),
         "first_ingest_time_utc": _iso_utc(first_ingest_time_utc),
         "last_ingest_time_utc": _iso_utc(last_ingest_time_utc),
         "processed_segments": processed_segments,
-        "feature_replay": feature_replay.to_checkpoint(),
-        "canonical_replay": canonical_replay.to_checkpoint(),
+        "processed_sessions": [
+            {
+                "session_id": session.session_id,
+                "expected_next_frame_index": session.expected_next_frame_index,
+                "first_ingest_time_utc": _iso_utc(session.first_ingest_time_utc),
+                "last_ingest_time_utc": _iso_utc(session.last_ingest_time_utc),
+                "feature_replay": session.feature_replay.to_checkpoint(),
+                "canonical_replay": session.canonical_replay.to_checkpoint(),
+            }
+            for session in sessions
+        ],
     }
 
 
@@ -203,24 +282,40 @@ def _checkpoint_state(
     source: str,
     product_id: str,
     heartbeat_timeout_seconds: float,
-) -> tuple[
-    str,
-    int,
-    datetime | None,
-    datetime | None,
-    list[dict[str, Any]],
-    _IngestFeatureReplay,
-    CanonicalReplayAccumulator,
-]:
-    if set(checkpoint) != _CHECKPOINT_FIELDS:
+) -> tuple[list[_SessionReplayState], datetime, datetime, list[dict[str, Any]]]:
+    if "version" not in checkpoint:
         raise ValueError("Malformed materializer checkpoint keys")
     version = checkpoint["version"]
-    if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version != RESEARCH_MATERIALIZER_CHECKPOINT_VERSION
-    ):
+    if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError("Unsupported materializer checkpoint schema version")
+    if version == 1:
+        if set(checkpoint) != _CHECKPOINT_FIELDS_V1:
+            raise ValueError("Malformed materializer checkpoint keys")
+        checkpoint = {
+            "version": RESEARCH_MATERIALIZER_CHECKPOINT_VERSION,
+            "source": checkpoint["source"],
+            "product_id": checkpoint["product_id"],
+            "predictor_contract_version": checkpoint["predictor_contract_version"],
+            "heartbeat_timeout_seconds": checkpoint["heartbeat_timeout_seconds"],
+            "session_id": checkpoint["session_id"],
+            "expected_next_frame_index": checkpoint["expected_next_frame_index"],
+            "total_processed_frame_count": checkpoint["expected_next_frame_index"],
+            "first_ingest_time_utc": checkpoint["first_ingest_time_utc"],
+            "last_ingest_time_utc": checkpoint["last_ingest_time_utc"],
+            "processed_segments": checkpoint["processed_segments"],
+            "processed_sessions": [{
+                "session_id": checkpoint["session_id"],
+                "expected_next_frame_index": checkpoint["expected_next_frame_index"],
+                "first_ingest_time_utc": checkpoint["first_ingest_time_utc"],
+                "last_ingest_time_utc": checkpoint["last_ingest_time_utc"],
+                "feature_replay": checkpoint["feature_replay"],
+                "canonical_replay": checkpoint["canonical_replay"],
+            }],
+        }
+    elif version != RESEARCH_MATERIALIZER_CHECKPOINT_VERSION:
+        raise ValueError("Unsupported materializer checkpoint schema version")
+    if set(checkpoint) != _CHECKPOINT_FIELDS:
+        raise ValueError("Malformed materializer checkpoint keys")
     if checkpoint["source"] != source:
         raise ValueError("Materializer checkpoint source does not match requested source")
     if checkpoint["product_id"] != product_id:
@@ -232,18 +327,79 @@ def _checkpoint_state(
         raise ValueError(
             "Materializer checkpoint heartbeat timeout does not match requested configuration"
         )
-    session_id = checkpoint["session_id"]
-    if not isinstance(session_id, str) or not session_id.strip():
-        raise ValueError("Invalid materializer checkpoint session_id")
     expected = checkpoint["expected_next_frame_index"]
     if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
         raise ValueError("Invalid materializer checkpoint expected_next_frame_index")
 
     processed = checkpoint["processed_segments"]
-    frame_total, ledger_first, ledger_last = _validate_ledger(processed, session_id=session_id)
-    if expected != frame_total:
+    ledger_sessions, frame_total, ledger_first, ledger_last = _validate_ledger(processed)
+    if (
+        isinstance(checkpoint["total_processed_frame_count"], bool)
+        or not isinstance(checkpoint["total_processed_frame_count"], int)
+        or checkpoint["total_processed_frame_count"] != frame_total
+    ):
+        raise ValueError("Materializer checkpoint total frame count does not match processed segments")
+    sessions_data = checkpoint["processed_sessions"]
+    if not isinstance(sessions_data, list) or not sessions_data:
+        raise ValueError("Materializer checkpoint processed_sessions must be a nonempty list")
+    sessions: list[_SessionReplayState] = []
+    for record in sessions_data:
+        if not isinstance(record, dict) or set(record) != _SESSION_CHECKPOINT_FIELDS:
+            raise ValueError("Malformed materializer checkpoint session state")
+        session_id = record["session_id"]
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("Invalid materializer checkpoint session_id")
+        session_expected = record["expected_next_frame_index"]
+        if (
+            isinstance(session_expected, bool)
+            or not isinstance(session_expected, int)
+            or session_expected < 0
+        ):
+            raise ValueError("Invalid materializer checkpoint expected_next_frame_index")
+        session_first = _parse_checkpoint_time(
+            record["first_ingest_time_utc"], field="first_ingest_time_utc"
+        )
+        session_last = _parse_checkpoint_time(
+            record["last_ingest_time_utc"], field="last_ingest_time_utc"
+        )
+        ledger_state = ledger_sessions.get(session_id)
+        if (
+            ledger_state is None
+            or session_first is None
+            or session_last is None
+            or session_expected != ledger_state[0]
+            or session_first != ledger_state[1]
+            or session_last != ledger_state[2]
+        ):
+            raise ValueError("Materializer checkpoint session state does not match processed ledger")
+        feature = _IngestFeatureReplay.from_checkpoint(record["feature_replay"])
+        canonical = CanonicalReplayAccumulator.from_checkpoint(record["canonical_replay"])
+        if feature.product_id != product_id or canonical.product_id != product_id:
+            raise ValueError("Nested replay checkpoint product_id does not match")
+        if canonical.session_id != session_id:
+            raise ValueError("Nested canonical replay checkpoint session_id does not match")
+        if feature.frames_seen != session_expected or canonical.frame_count != session_expected:
+            raise ValueError("Nested replay checkpoint frame counts do not match materializer")
+        if timeout != float(canonical.heartbeat_timeout_seconds):
+            raise ValueError(
+                "Materializer checkpoint heartbeat timeout does not match nested canonical replay"
+            )
+        sessions.append(_SessionReplayState(
+            session_id=session_id,
+            expected_next_frame_index=session_expected,
+            first_ingest_time_utc=session_first,
+            last_ingest_time_utc=session_last,
+            feature_replay=feature,
+            canonical_replay=canonical,
+        ))
+    if [session.session_id for session in sessions] != list(ledger_sessions):
+        raise ValueError("Materializer checkpoint session order does not match processed ledger")
+    latest_session = sessions[-1]
+    if checkpoint["session_id"] != latest_session.session_id:
+        raise ValueError("Materializer checkpoint latest session does not match processed sessions")
+    if expected != latest_session.expected_next_frame_index:
         raise ValueError(
-            "Materializer checkpoint expected_next_frame_index does not match processed segments"
+            "Materializer checkpoint expected_next_frame_index does not match latest session"
         )
     first = _parse_checkpoint_time(
         checkpoint["first_ingest_time_utc"], field="first_ingest_time_utc"
@@ -253,22 +409,9 @@ def _checkpoint_state(
     )
     if first != ledger_first or last != ledger_last:
         raise ValueError("Materializer checkpoint ingest-time bounds do not match processed segments")
-    if not processed or first is None or last is None:
+    if first is None or last is None:
         raise ValueError("Materializer checkpoint must contain a nonempty processed prefix")
-
-    feature = _IngestFeatureReplay.from_checkpoint(checkpoint["feature_replay"])
-    canonical = CanonicalReplayAccumulator.from_checkpoint(checkpoint["canonical_replay"])
-    if timeout != float(canonical.heartbeat_timeout_seconds):
-        raise ValueError(
-            "Materializer checkpoint heartbeat timeout does not match nested canonical replay"
-        )
-    if feature.product_id != product_id or canonical.product_id != product_id:
-        raise ValueError("Nested replay checkpoint product_id does not match")
-    if canonical.session_id != session_id:
-        raise ValueError("Nested canonical replay checkpoint session_id does not match")
-    if feature.frames_seen != expected or canonical.frame_count != expected:
-        raise ValueError("Nested replay checkpoint frame counts do not match materializer")
-    return session_id, expected, first, last, processed, feature, canonical
+    return sessions, first, last, processed
 
 
 def _fsync_directory(path: Path) -> None:
@@ -411,38 +554,31 @@ def materialize_research(
     if not isinstance(discovered, DiscoveredSegmentSet):
         raise ValueError("Sealed segment discovery returned an invalid snapshot")
     segments = discovered.segments
-    session_ids = {segment.session_id for segment in segments}
-    if len(session_ids) != 1:
-        raise ValueError(
-            "Materializer v1 supports exactly one source session and requires explicit "
-            "session-rollover support"
-        )
-    session_id = next(iter(session_ids))
     _validate_source_paths(input_path, segments)
     if any(segment.source != source for segment in segments):
         raise ValueError("Discovered segment source does not match requested source")
     if any(segment.product_id != product_id for segment in segments):
         raise ValueError("Discovered segment product does not match requested product")
-    _group_and_validate_segments(segments)
+    grouped = _group_and_validate_segments(segments)
+    segments = tuple(
+        segment
+        for session_segments in grouped.values()
+        for segment in session_segments
+    )
 
     checkpoint_path = output_path / "checkpoint.json"
     if checkpoint_path.exists():
         (
-            previous_session,
-            expected_frame_index,
+            session_states,
             first_ingest_time,
             last_ingest_time,
             processed_segments,
-            feature_replay,
-            canonical_replay,
         ) = _read_checkpoint(
             checkpoint_path,
             source=source,
             product_id=product_id,
             heartbeat_timeout_seconds=timeout,
         )
-        if previous_session != session_id:
-            raise ValueError("Materializer checkpoint source session does not match discovery")
         current_records = [_segment_record(segment) for segment in segments]
         if len(processed_segments) > len(current_records):
             raise ValueError("Previously processed sealed segment is missing from discovery")
@@ -451,17 +587,20 @@ def materialize_research(
                 raise ValueError(
                     f"Previously processed segment prefix changed at position {index}"
                 )
+        new_session_ids = {
+            record["session_id"] for record in current_records[len(processed_segments):]
+        }
+        processed_session_ids = {session.session_id for session in session_states}
+        newly_seen_sessions = new_session_ids.difference(processed_session_ids)
+        if len(newly_seen_sessions) > 1:
+            raise ValueError(
+                "A resumed checkpoint may append segments from only one next collector session"
+            )
     else:
+        session_states = []
         processed_segments = []
-        expected_frame_index = 0
         first_ingest_time = None
         last_ingest_time = None
-        feature_replay = _IngestFeatureReplay(product_id)
-        canonical_replay = CanonicalReplayAccumulator(
-            product_id=product_id,
-            session_id=session_id,
-            heartbeat_timeout_seconds=timeout,
-        )
 
     new_segments = list(segments[len(processed_segments):])
     if max_new_segments is not None:
@@ -471,20 +610,53 @@ def materialize_research(
     uncommitted_segment_count = 0
 
     for segment in new_segments:
+        if not session_states or session_states[-1].session_id != segment.session_id:
+            if any(state.session_id == segment.session_id for state in session_states):
+                raise ValueError("Materializer cannot return to an earlier collector session")
+            session_states.append(_SessionReplayState(
+                session_id=segment.session_id,
+                expected_next_frame_index=0,
+                first_ingest_time_utc=segment.first_ingest_time_utc,
+                last_ingest_time_utc=segment.first_ingest_time_utc,
+                feature_replay=_IngestFeatureReplay(product_id),
+                canonical_replay=CanonicalReplayAccumulator(
+                    product_id=product_id,
+                    session_id=segment.session_id,
+                    heartbeat_timeout_seconds=timeout,
+                ),
+            ))
+        session_state = session_states[-1]
+        if segment.segment_index != sum(
+            1
+            for record in processed_segments
+            if record["session_id"] == segment.session_id
+        ):
+            raise ValueError(
+                f"Unexpected segment progression for collector session {segment.session_id}"
+            )
         for raw, connection_id, frame_index, ingest_time in _iter_segment_frames(
             segment,
-            expected_frame_index=expected_frame_index,
+            expected_frame_index=session_state.expected_next_frame_index,
         ):
-            canonical_replay.consume(raw, connection_id, frame_index, ingest_time)
-            feature_replay.consume(
+            if ingest_time < session_state.last_ingest_time_utc:
+                raise ValueError(
+                    f"Ingest time regressed within collector session {segment.session_id}"
+                )
+            if last_ingest_time is not None and ingest_time < last_ingest_time:
+                raise ValueError("Ingest time regressed across the processed session sequence")
+            session_state.canonical_replay.consume(
+                raw, connection_id, frame_index, ingest_time
+            )
+            session_state.feature_replay.consume(
                 raw=raw,
                 connection_id=connection_id,
                 frame_index=frame_index,
                 ingest_time_utc=ingest_time,
             )
-            expected_frame_index = frame_index + 1
+            session_state.expected_next_frame_index = frame_index + 1
             first_ingest_time = first_ingest_time or ingest_time
             last_ingest_time = ingest_time
+            session_state.last_ingest_time_utc = ingest_time
             new_frames_processed += 1
 
         processed_segments.append(_segment_record(segment))
@@ -495,13 +667,10 @@ def materialize_research(
             checkpoint = _checkpoint_payload(
                 source=source,
                 product_id=product_id,
-                session_id=session_id,
-                expected_next_frame_index=expected_frame_index,
+                sessions=session_states,
                 first_ingest_time_utc=first_ingest_time,
                 last_ingest_time_utc=last_ingest_time,
                 processed_segments=processed_segments,
-                feature_replay=feature_replay,
-                canonical_replay=canonical_replay,
             )
             _atomic_write_json(checkpoint_path, checkpoint, prefix=".checkpoint.")
             uncommitted_segment_count = 0
@@ -512,13 +681,10 @@ def materialize_research(
         checkpoint = _checkpoint_payload(
             source=source,
             product_id=product_id,
-            session_id=session_id,
-            expected_next_frame_index=expected_frame_index,
+            sessions=session_states,
             first_ingest_time_utc=first_ingest_time,
             last_ingest_time_utc=last_ingest_time,
             processed_segments=processed_segments,
-            feature_replay=feature_replay,
-            canonical_replay=canonical_replay,
         )
         _atomic_write_json(checkpoint_path, checkpoint, prefix=".checkpoint.")
     elif not checkpoint_path.exists():
@@ -526,32 +692,78 @@ def materialize_research(
 
     if first_ingest_time is None or last_ingest_time is None:
         raise ValueError("Materializer checkpoint has no ingest-time bounds")
-    observations = canonical_replay.finalize(
-        session_started_at_utc=first_ingest_time,
-        session_completed_at_utc=last_ingest_time,
-        derived_at_utc=last_ingest_time,
-    )
+    observations = []
+    for state in session_states:
+        observations.extend(state.canonical_replay.finalize(
+            session_started_at_utc=state.first_ingest_time_utc,
+            session_completed_at_utc=state.last_ingest_time_utc,
+            derived_at_utc=state.last_ingest_time_utc,
+        ))
     boundaries = _boundary_frame(observations)
     if not boundaries.empty:
         boundaries = boundaries.sort_values(
             ["boundary_time_utc", "session_id"], kind="stable"
         ).reset_index(drop=True)
         if boundaries["boundary_time_utc"].duplicated().any():
-            raise ValueError("Duplicate canonical boundary timestamps in single-session replay")
+            raise ValueError("Duplicate canonical boundary timestamps across collector sessions")
     targets = build_canonical_direction_targets(boundaries)
     latest_boundary = (
         boundaries["boundary_time_utc"].max()
         if not boundaries.empty
         else None
     )
-    buckets = _feature_buckets_frame(feature_replay, latest_boundary=latest_boundary)
-    features = assemble_research_feature_frame_from_frames(boundaries, targets, buckets)
+    boundary_groups = {
+        session_id: frame.reset_index(drop=True)
+        for session_id, frame in boundaries.groupby("session_id", sort=False)
+    } if not boundaries.empty else {}
+    bucket_frames: list[pd.DataFrame] = []
+    feature_frames: list[pd.DataFrame] = []
+    for state in session_states:
+        session_boundaries = boundary_groups.get(state.session_id)
+        session_latest = (
+            session_boundaries["boundary_time_utc"].max()
+            if session_boundaries is not None and not session_boundaries.empty
+            else None
+        )
+        session_buckets = _feature_buckets_frame(
+            state.feature_replay,
+            latest_boundary=session_latest,
+        )
+        if len(session_states) > 1:
+            bucket_frames.append(
+                session_buckets.reset_index().assign(session_id=state.session_id)
+            )
+        else:
+            bucket_frames.append(session_buckets.reset_index())
+        if session_boundaries is not None and not session_boundaries.empty:
+            session_targets = targets.loc[
+                targets["timestamp"].isin(session_boundaries["boundary_time_utc"])
+            ]
+            feature_frames.append(
+                assemble_research_feature_frame_from_frames(
+                    session_boundaries,
+                    session_targets,
+                    session_buckets,
+                )
+            )
+    buckets_output = (
+        pd.concat(bucket_frames, ignore_index=True)
+        if bucket_frames
+        else pd.DataFrame(columns=["bucket_end"])
+    )
+    features = (
+        pd.concat(feature_frames, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+        if feature_frames
+        else assemble_research_feature_frame_from_frames(
+            boundaries, targets, pd.DataFrame()
+        )
+    )
 
     output_path.mkdir(parents=True, exist_ok=True)
     artifacts = {
         "canonical_boundaries.parquet": boundaries,
         "direction_targets.parquet": targets,
-        "feature_buckets.parquet": buckets.reset_index(),
+        "feature_buckets.parquet": buckets_output,
         "research_features.parquet": features,
     }
     artifact_hashes: dict[str, str] = {}
@@ -561,6 +773,13 @@ def materialize_research(
         artifact_hashes[name] = _sha256_file(artifact_path)
 
     checkpoint_sha256 = _sha256_file(checkpoint_path)
+    latest_session = session_states[-1]
+    total_processed_frames = sum(
+        state.expected_next_frame_index for state in session_states
+    )
+    checkpoint_schema_version = json.loads(
+        checkpoint_path.read_text(encoding="utf-8")
+    )["version"]
     eligible_boundaries = int(boundaries["canonical_target_eligible"].sum())
     eligible_targets = int(targets["target_eligible"].sum())
     diagnostics = {
@@ -572,11 +791,16 @@ def materialize_research(
         "source": source,
         "product_id": product_id,
         "predictor_contract_version": PREDICTOR_CONTRACT_VERSION,
-        "heartbeat_timeout_seconds": canonical_replay.heartbeat_timeout_seconds,
-        "session_id": session_id,
+        "heartbeat_timeout_seconds": latest_session.canonical_replay.heartbeat_timeout_seconds,
+        "session_id": latest_session.session_id,
+        "processed_session_count": len(session_states),
+        "ordered_processed_session_ids": [
+            state.session_id for state in session_states
+        ],
+        "latest_processed_session_id": latest_session.session_id,
         "processed_segment_count": len(processed_segments),
-        "total_processed_frame_count": expected_frame_index,
-        "expected_next_frame_index": expected_frame_index,
+        "total_processed_frame_count": total_processed_frames,
+        "expected_next_frame_index": latest_session.expected_next_frame_index,
         "first_ingest_time_utc": _iso_utc(first_ingest_time),
         "last_ingest_time_utc": _iso_utc(last_ingest_time),
         "active_partial_count_ignored": discovered.active_partial_count_ignored,
@@ -586,7 +810,7 @@ def materialize_research(
         "eligible_boundary_count": eligible_boundaries,
         "target_row_count": len(targets),
         "eligible_target_count": eligible_targets,
-        "feature_bucket_count": len(buckets),
+        "feature_bucket_count": len(buckets_output),
         "research_feature_row_count": len(features),
         "feature_ready_count": int(features["feature_ready"].sum()),
         "trainable_count": int(features["trainable"].sum()),
@@ -600,7 +824,7 @@ def materialize_research(
     _atomic_write_json(
         output_path / "materialization.json",
         {
-            "materializer_checkpoint_schema_version": RESEARCH_MATERIALIZER_CHECKPOINT_VERSION,
+            "materializer_checkpoint_schema_version": checkpoint_schema_version,
             "checkpoint_sha256": checkpoint_sha256,
             **{
                 key: value
