@@ -1,0 +1,25 @@
+[Unit]
+Description=Incrementally materialize BTC quarter-hour research artifacts
+ConditionPathExists=/var/lib/btc-qh/research_materializer_prod/checkpoint.json
+
+[Service]
+Type=oneshot
+User=martinez_elias12
+Group=martinez_elias12
+WorkingDirectory=/home/martinez_elias12/btc-quarter-hour-engine
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 75 /var/lib/btc-qh/research_materializer.lock /home/martinez_elias12/.venv/bin/python -m btc_quarter_hour_engine.research.materializer_cli --input-root /var/lib/btc-qh/data_lake_prod --output-root /var/lib/btc-qh/research_materializer_prod --product BTC-USD --max-new-segments 100 --checkpoint-every-segments 25
+SuccessExitStatus=75
+TimeoutStartSec=infinity
+SyslogIdentifier=btc-qh-research-materializer
+StandardOutput=journal
+StandardError=journal
+Nice=10
+CPUWeight=25
+IOWeight=25
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadOnlyPaths=/var/lib/btc-qh/data_lake_prod
+

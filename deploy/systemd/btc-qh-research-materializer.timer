@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly BTC quarter-hour research materialization
+
+[Timer]
+OnCalendar=*-*-* *:10:00 UTC
+Persistent=true
+Unit=btc-qh-research-materializer.service
+
+[Install]
+WantedBy=timers.target
+
