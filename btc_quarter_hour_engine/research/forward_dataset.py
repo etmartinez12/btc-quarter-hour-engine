@@ -389,12 +389,6 @@ def _group_and_validate_segments(
                     f"Ingest time regressed within session {session_id} between "
                     f"segments {previous.segment_index} and {current.segment_index}"
                 )
-        for previous, current in zip(ordered, ordered[1:]):
-            if current.first_ingest_time_utc < previous.last_ingest_time_utc:
-                raise ValueError(
-                    f"Ingest time regressed within session {session_id} between "
-                    f"segments {previous.segment_index} and {current.segment_index}"
-                )
         result[session_id] = ordered
     return result
 
