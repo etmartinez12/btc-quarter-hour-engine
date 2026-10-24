@@ -11,6 +11,7 @@ def test_research_materializer_service_contract() -> None:
 
     required_settings = (
         "Type=oneshot",
+        "RequiresMountsFor=/var/lib/btc-qh",
         "User=martinez_elias12",
         "Group=martinez_elias12",
         "WorkingDirectory=/home/martinez_elias12/btc-quarter-hour-engine",

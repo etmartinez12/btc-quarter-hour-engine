@@ -1,5 +1,6 @@
 [Unit]
 Description=Incrementally materialize BTC quarter-hour research artifacts
+RequiresMountsFor=/var/lib/btc-qh
 ConditionPathExists=/var/lib/btc-qh/research_materializer_prod/checkpoint.json
 
 [Service]
@@ -22,4 +23,3 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ReadOnlyPaths=/var/lib/btc-qh/data_lake_prod
-
