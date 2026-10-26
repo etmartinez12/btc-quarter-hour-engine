@@ -8,7 +8,14 @@ import pandas as pd
 
 from btc_quarter_hour_engine.models import (
     ExtraTreesBaselineModel,
+    HistGradientBoostingBaselineModel,
     LogisticBaselineModel,
+)
+from btc_quarter_hour_engine.research.diagnostics import (
+    dataset_quality_diagnostics,
+    feature_drift_diagnostics,
+    fold_metrics_and_model_diagnostics,
+    top_drift_features,
 )
 from btc_quarter_hour_engine.research.features import (
     PREDICTOR_CONTRACT_VERSION,
@@ -35,6 +42,11 @@ class ExploratoryResearchConfig:
     logistic_max_iter: int = 1000
     extra_trees_n_estimators: int = 300
     extra_trees_max_depth: int | None = 6
+    hist_gradient_boosting_max_iter: int = 100
+    hist_gradient_boosting_learning_rate: float = 0.1
+    hist_gradient_boosting_max_leaf_nodes: int = 15
+    hist_gradient_boosting_min_samples_leaf: int = 20
+    hist_gradient_boosting_l2_regularization: float = 1.0
 
 
 def prepare_research_frame(
@@ -168,6 +180,16 @@ def _model_factories(
         "extra_trees": lambda: ExtraTreesBaselineModel(
             n_estimators=config.extra_trees_n_estimators,
             max_depth=config.extra_trees_max_depth,
+            random_state=config.random_state,
+        ),
+        "hist_gradient_boosting": lambda: HistGradientBoostingBaselineModel(
+            max_iter=config.hist_gradient_boosting_max_iter,
+            learning_rate=config.hist_gradient_boosting_learning_rate,
+            max_leaf_nodes=config.hist_gradient_boosting_max_leaf_nodes,
+            min_samples_leaf=config.hist_gradient_boosting_min_samples_leaf,
+            l2_regularization=(
+                config.hist_gradient_boosting_l2_regularization
+            ),
             random_state=config.random_state,
         ),
     }
@@ -371,14 +393,28 @@ def run_exploratory_walk_forward(
                 f"{benchmark} does not cover the common OOF population"
             )
 
+    fold_metrics, model_diagnostics, model_agreement = (
+        fold_metrics_and_model_diagnostics(predictions, fold_records)
+    )
+    for benchmark, diagnostics in model_diagnostics.items():
+        benchmark_summary[benchmark].update(diagnostics)
+
+    drift_metadata, feature_drift = feature_drift_diagnostics(features)
+    quality = dataset_quality_diagnostics(features)
+
     summary: dict[str, Any] = {
         "mode": "exploratory_short_history",
         "scientific_claim_status": (
-            "pipeline_and_exploratory_only_not_long_horizon_validation"
+            "development_exploratory_analysis_not_untouched_prospective_validation"
         ),
         "predictor_contract_version": PREDICTOR_CONTRACT_VERSION,
         "predictor_count": len(PREDICTOR_COLUMNS),
         "n_trainable_rows": int(len(frame)),
+        "dataset_summary": quality,
+        "feature_drift": {
+            **drift_metadata,
+            "top_drift_features": top_drift_features(feature_drift),
+        },
         "n_folds": int(len(folds)),
         "n_oof_predictions_per_benchmark": int(expected_oof),
         "validation": {
@@ -390,7 +426,9 @@ def run_exploratory_walk_forward(
             ),
         },
         "folds": fold_records,
+        "fold_metrics": fold_metrics,
         "benchmarks": benchmark_summary,
+        "model_agreement": model_agreement,
     }
 
     return summary, predictions
