@@ -20,6 +20,7 @@ class HistGradientBoostingBaselineModel:
             min_samples_leaf=min_samples_leaf,
             l2_regularization=l2_regularization,
             random_state=random_state,
+            early_stopping=False,
         )
 
     def fit(self, X, y) -> "HistGradientBoostingBaselineModel":

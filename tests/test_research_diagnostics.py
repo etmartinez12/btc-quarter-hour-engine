@@ -67,6 +67,7 @@ def test_hist_gradient_boosting_wrapper_emits_valid_probabilities():
 
     probabilities = model.predict_proba(X.iloc[:10])
 
+    assert model.model.get_params()["early_stopping"] is False
     assert probabilities.shape == (10, 2)
     assert np.isfinite(probabilities).all()
     assert ((probabilities >= 0.0) & (probabilities <= 1.0)).all()
