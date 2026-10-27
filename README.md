@@ -155,9 +155,9 @@ future WebSocket BBO observations:
 
 The `bbo_state` and quarter-hour boundary row shapes are unchanged: their string `state`/`eligibility_reason` fields now carry `REBUILDING`/`book_rebuilding`, so their schema versions remain `1`. The forward session manifest advances to schema `3` to add deterministic per-connection rebuild and recovery counters to connection diagnostics and integrity summaries.
 
-## V1 model diagnostics and exploratory research benchmark
+## Versioned research diagnostics and exploratory benchmark
 
-The V1 prospective evaluation covering Oct 13–20 has already been inspected and is development evidence. Data used while designing Model V2 is also development data; neither may be presented as an untouched prospective holdout. A new untouched prospective holdout begins only after the V2 feature and model specification is frozen.
+The V1 prospective evaluation covering Oct 13–20 was inspected as development evidence. The V1 diagnostic snapshot covering Oct 6–27 also found no demonstrated directional edge; its committed summary is in [`docs/research/v1-development-diagnostics-2026-10-27.md`](docs/research/v1-development-diagnostics-2026-10-27.md). Data used while designing V2 is also development evidence; neither dataset may be presented as an untouched prospective holdout. A new untouched prospective holdout begins only after the V2 feature and model specification is frozen.
 
 Run the reproducible diagnostics against a materialized `research_features.parquet`:
 
@@ -167,7 +167,9 @@ python -m btc_quarter_hour_engine.research.diagnostics_cli `
   --output-root path\to\diagnostics
 ```
 
-The runner uses the existing chronological walk-forward splitter, strict `label_available_time < test_start` embargo, and complete finite `bbo-causal-v1` model matrix. It writes `diagnostics.json`, `oof_predictions.parquet`, `feature_drift.parquet`, and `fold_metrics.parquet`. The benchmark includes fixed naïve baselines, Logistic Regression, ExtraTrees, and a conservatively configured HistGradientBoosting baseline; no random cross-validation or hyperparameter search is used. Calibration, confidence thresholds, subgroup performance, and feature drift are descriptive development diagnostics only. No threshold is validated by this analysis, and classification accuracy alone does not establish profitability.
+The default contract is `bbo-causal-v1`, preserving the existing 114-predictor matrix and the production materializer contract. To explicitly evaluate the opt-in 91-predictor V2 research contract, add `--predictor-contract bbo-causal-v2`. V2 is built only from the causal V1 materialized feature frame; no production service selects it automatically.
+
+Both contracts use the same chronological walk-forward splitter, strict `label_available_time < test_start` embargo, folds, and model configurations. The runner writes `diagnostics.json`, `oof_predictions.parquet`, `feature_drift.parquet`, and `fold_metrics.parquet`. The benchmark includes fixed naïve baselines, Logistic Regression, ExtraTrees, and a conservatively configured HistGradientBoosting baseline; no random cross-validation or hyperparameter search is used. Calibration, confidence thresholds, subgroup performance, and feature drift are descriptive development diagnostics only. No threshold is validated by this analysis, and classification accuracy alone does not establish profitability.
 
 ### Eligibility rule
 

@@ -1172,14 +1172,56 @@ def build_raw_research_feature_frame(
     return features, diagnostics
 
 
+def predictor_columns_for_contract(
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION,
+) -> tuple[str, ...]:
+    if predictor_contract_version == PREDICTOR_CONTRACT_VERSION:
+        return PREDICTOR_COLUMNS
+    from btc_quarter_hour_engine.research.features_v2 import (
+        V2_PREDICTOR_CONTRACT_VERSION,
+        V2_PREDICTOR_COLUMNS,
+    )
+
+    if predictor_contract_version == V2_PREDICTOR_CONTRACT_VERSION:
+        return V2_PREDICTOR_COLUMNS
+    raise ValueError(
+        "Unsupported predictor contract version: "
+        f"{predictor_contract_version}"
+    )
+
+
+def research_features_for_contract(
+    features: pd.DataFrame,
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION,
+) -> pd.DataFrame:
+    if predictor_contract_version == PREDICTOR_CONTRACT_VERSION:
+        return features
+    from btc_quarter_hour_engine.research.features_v2 import (
+        V2_PREDICTOR_CONTRACT_VERSION,
+        build_v2_research_feature_frame,
+    )
+
+    if predictor_contract_version == V2_PREDICTOR_CONTRACT_VERSION:
+        return build_v2_research_feature_frame(features)
+    raise ValueError(
+        "Unsupported predictor contract version: "
+        f"{predictor_contract_version}"
+    )
+
+
 def research_predictor_columns(
     features: pd.DataFrame,
+    *,
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION,
 ) -> tuple[str, ...]:
     """Return the exact approved causal predictor contract."""
+    predictor_columns = predictor_columns_for_contract(
+        predictor_contract_version
+    )
 
     missing = [
         column
-        for column in PREDICTOR_COLUMNS
+        for column in predictor_columns
         if column not in features.columns
     ]
 
@@ -1191,7 +1233,7 @@ def research_predictor_columns(
 
     non_numeric = [
         column
-        for column in PREDICTOR_COLUMNS
+        for column in predictor_columns
         if not (
             pd.api.types.is_numeric_dtype(features[column])
             or pd.api.types.is_bool_dtype(features[column])
@@ -1204,34 +1246,42 @@ def research_predictor_columns(
             f"{non_numeric}"
         )
 
-    return PREDICTOR_COLUMNS
+    return predictor_columns
 
 
 def research_model_matrix(
     features: pd.DataFrame,
     *,
     trainable_only: bool = True,
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return leakage-safe X/y under the versioned predictor contract."""
+    contract_features = research_features_for_contract(
+        features,
+        predictor_contract_version,
+    )
 
     required = {"target", "trainable"}
 
-    missing = required.difference(features.columns)
+    missing = required.difference(contract_features.columns)
     if missing:
         raise ValueError(
             f"Feature frame missing required columns: {sorted(missing)}"
         )
 
     frame = (
-        features.loc[features["trainable"]].copy()
+        contract_features.loc[contract_features["trainable"]].copy()
         if trainable_only
-        else features.copy()
+        else contract_features.copy()
     )
 
     if frame.empty:
         raise ValueError("Model matrix contains zero rows")
 
-    columns = research_predictor_columns(frame)
+    columns = research_predictor_columns(
+        frame,
+        predictor_contract_version=predictor_contract_version,
+    )
 
     X = frame.loc[:, columns].copy()
     y = frame["target"].copy()
