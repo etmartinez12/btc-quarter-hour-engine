@@ -288,13 +288,8 @@ def build_v2_research_feature_frame(
         + timestamps.dt.microsecond / 3_600_000_000.0
     )
     hour_angle = 2.0 * np.pi * hour / 24.0
-    quarter_hour_position = (
-        timestamps.dt.hour * 4.0
-        + timestamps.dt.minute / 15.0
-        + timestamps.dt.second / 900.0
-        + timestamps.dt.microsecond / 900_000_000.0
-    )
-    quarter_hour_angle = 2.0 * np.pi * quarter_hour_position / 96.0
+    quarter_hour_slot = timestamps.dt.minute // 15
+    quarter_hour_angle = 2.0 * np.pi * quarter_hour_slot / 4.0
     day_of_week = timestamps.dt.dayofweek.to_numpy(dtype=float)
     day_angle = 2.0 * np.pi * day_of_week / 7.0
     frame["hour_sin"] = np.sin(hour_angle)

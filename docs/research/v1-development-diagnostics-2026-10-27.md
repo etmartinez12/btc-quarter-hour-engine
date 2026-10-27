@@ -50,11 +50,25 @@ advantage over the always-down baseline. Confidence accuracy was not
 monotonic, so the results do not justify a confidence threshold.
 
 The chronological fold metrics showed instability rather than a consistent
-advantage across periods. Model-agreement diagnostics are descriptive of
-shared predictions, not evidence that those predictions are correct; they do
-not change the no-demonstrated-edge conclusion. The snapshot summary used for
-this note did not include numerical fold-dispersion or pairwise-agreement
-values, so none are asserted here.
+advantage across periods:
+
+| Model | Mean accuracy | Std | Min | Max |
+|---|---:|---:|---:|---:|
+| Logistic Regression | 0.4854655432 | 0.0772566787 | 0.3333333333 | 0.65 |
+| ExtraTrees | 0.4977544418 | 0.0647737375 | 0.3541666667 | 0.6041666667 |
+| HistGradientBoosting | 0.5042694479 | 0.0666801731 | 0.3541666667 | 0.6666666667 |
+
+Pairwise model behavior was:
+
+| Model pair | Prediction agreement | Probability correlation |
+|---|---:|---:|
+| ExtraTrees vs HistGradientBoosting | 0.6985203453 | 0.4720496085 |
+| ExtraTrees vs Logistic Regression | 0.6510480888 | 0.4161336868 |
+| HistGradientBoosting vs Logistic Regression | 0.6196054254 | 0.3058100848 |
+
+These agreement and correlation values describe model diversity on shared
+predictions; diversity does not establish a predictive edge and does not
+change the no-demonstrated-edge conclusion.
 
 ## Drift finding and V2 rationale
 

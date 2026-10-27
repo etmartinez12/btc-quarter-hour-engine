@@ -36,7 +36,6 @@ from btc_quarter_hour_engine.validation.walk_forward import (
 
 @dataclass(slots=True)
 class ExploratoryResearchConfig:
-    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION
     initial_train_period: str = "72h"
     test_period: str = "12h"
     step_period: str = "12h"
@@ -49,6 +48,7 @@ class ExploratoryResearchConfig:
     hist_gradient_boosting_max_leaf_nodes: int = 15
     hist_gradient_boosting_min_samples_leaf: int = 20
     hist_gradient_boosting_l2_regularization: float = 1.0
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION
 
 
 def prepare_research_frame(

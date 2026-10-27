@@ -270,15 +270,56 @@ def test_v2_calendar_encodings_use_utc_fractional_hour_and_weekend():
     assert np.isclose(row["hour_cos"], np.cos(2.0 * np.pi * 6.25 / 24.0))
     assert np.isclose(
         row["quarter_hour_sin"],
-        np.sin(2.0 * np.pi * 25.0 / 96.0),
+        np.sin(2.0 * np.pi * 1.0 / 4.0),
     )
     assert np.isclose(
         row["quarter_hour_cos"],
-        np.cos(2.0 * np.pi * 25.0 / 96.0),
+        np.cos(2.0 * np.pi * 1.0 / 4.0),
     )
     assert np.isclose(row["day_of_week_sin"], np.sin(2.0 * np.pi * 5 / 7))
     assert np.isclose(row["day_of_week_cos"], np.cos(2.0 * np.pi * 5 / 7))
     assert row["is_weekend"] == 1.0
+
+
+def test_v2_hour_and_quarter_hour_calendar_pairs_encode_distinct_cycles():
+    source = _v1_features()
+    source["timestamp"] = pd.to_datetime(
+        [
+            "2026-01-03T06:00:00Z",
+            "2026-01-03T06:15:00Z",
+            "2026-01-03T06:30:00Z",
+            "2026-01-03T06:45:00Z",
+        ],
+        utc=True,
+    )
+    frame = build_v2_research_feature_frame(source)
+
+    hour_pairs = frame[["hour_sin", "hour_cos"]].to_numpy()
+    quarter_hour_pairs = frame[
+        ["quarter_hour_sin", "quarter_hour_cos"]
+    ].to_numpy()
+    assert not np.allclose(hour_pairs, quarter_hour_pairs)
+    np.testing.assert_allclose(
+        quarter_hour_pairs,
+        np.asarray(
+            [
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [0.0, -1.0],
+                [-1.0, 0.0],
+            ]
+        ),
+        atol=1e-12,
+    )
+
+
+def test_exploratory_config_preserves_positional_time_period_arguments():
+    config = ExploratoryResearchConfig("72h", "12h", "12h")
+
+    assert config.initial_train_period == "72h"
+    assert config.test_period == "12h"
+    assert config.step_period == "12h"
+    assert config.predictor_contract_version == "bbo-causal-v1"
 
 
 def test_v2_transformation_is_deterministic_nonmutating_and_preserves_audits():
