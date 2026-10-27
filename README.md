@@ -374,6 +374,33 @@ The sample pipeline will:
 - report pairwise prediction agreement and probability correlation across model families
 - report simple-average and validation-weighted ensemble benchmark outputs plus consensus diagnostics
 
+## V2 feature-family signal localization
+
+The dedicated research diagnostic compares the unchanged 91-predictor V2
+reference with seven group-only and seven leave-one-group-out variants, using
+the existing Logistic Regression, ExtraTrees and HistGradientBoosting wrappers.
+It preserves the 72h/12h/12h chronological expanding folds, strict
+`label_available_time < test_start` embargo, targets and identical OOF rows.
+The default 114-predictor `bbo-causal-v1` contract is unchanged.
+
+```powershell
+python -m btc_quarter_hour_engine.research.signal_localization_cli --features "C:\research\frozen\research_features.parquet" --output-root "C:\research\results\v2-localization" --predictor-contract bbo-causal-v2
+```
+
+Use an absent/empty output directory. The explicit V2 contract is mandatory.
+Outputs include deterministic JSON, CSV/Parquet predictions and descriptive
+metrics, plus a manifest with snapshot SHA256, Git SHA, family membership,
+fixed fold/model settings and output hashes. Undefined metrics are explicit,
+not zero-filled. See [the reproduction and interpretation guide](docs/research/v2-signal-localization.md)
+for the exact seven-family partition and output schemas.
+
+These are development diagnostics, not prospective validation, significance
+tests or evidence of trading profitability. Correlated families and multiple
+comparisons limit interpretation. No tuning, V3 features, ensemble optimization
+or confidence/trading-threshold selection is included. Do not run or tune on the
+real October 6-27 frozen dataset locally; implementation tests use synthetic
+causal data. Previously committed evidence artifacts are unchanged.
+
 ## Testing
 
 ```bash

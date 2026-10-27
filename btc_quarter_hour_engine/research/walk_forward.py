@@ -229,6 +229,39 @@ def _baseline_predictions(
     }
 
 
+def _model_fold_predictions(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    test: pd.DataFrame,
+    fold_number: int,
+    config: ExploratoryResearchConfig,
+) -> list[pd.DataFrame]:
+    parts = []
+    for model_name, factory in _model_factories(config).items():
+        model = factory()
+        model.fit(X_train, y_train)
+        probabilities = model.predict_proba(X_test)[:, 1]
+        parts.append(
+            pd.DataFrame(
+                {
+                    "benchmark": model_name,
+                    "benchmark_type": "model",
+                    "fold_number": fold_number,
+                    "timestamp": test["timestamp"].to_numpy(),
+                    "y_true": y_test.to_numpy(dtype=int),
+                    "y_pred": (probabilities >= 0.5).astype(int),
+                    "y_proba": probabilities,
+                    "target_log_return_15m": (
+                        test["target_log_return_15m"].to_numpy()
+                    ),
+                }
+            )
+        )
+    return parts
+
+
 def _fold_record(
     fold_number: int,
     train: pd.DataFrame,
@@ -271,8 +304,6 @@ def run_exploratory_walk_forward(
     baseline_parts: list[pd.DataFrame] = []
     fold_records: list[dict[str, Any]] = []
 
-    factories = _model_factories(cfg)
-
     for fold in folds:
         fold_number = fold["fold_number"]
         train_idx = fold["train_idx"]
@@ -294,29 +325,11 @@ def run_exploratory_walk_forward(
             )
         )
 
-        for model_name, factory in factories.items():
-            model = factory()
-            model.fit(X_train, y_train)
-
-            probabilities = model.predict_proba(X_test)[:, 1]
-            predictions = (probabilities >= 0.5).astype(int)
-
-            model_parts.append(
-                pd.DataFrame(
-                    {
-                        "benchmark": model_name,
-                        "benchmark_type": "model",
-                        "fold_number": fold_number,
-                        "timestamp": test["timestamp"].to_numpy(),
-                        "y_true": y_test.to_numpy(dtype=int),
-                        "y_pred": predictions,
-                        "y_proba": probabilities,
-                        "target_log_return_15m": (
-                            test["target_log_return_15m"].to_numpy()
-                        ),
-                    }
-                )
+        model_parts.extend(
+            _model_fold_predictions(
+                X_train, y_train, X_test, y_test, test, fold_number, cfg
             )
+        )
 
         for baseline_name, predictions in _baseline_predictions(
             train,
