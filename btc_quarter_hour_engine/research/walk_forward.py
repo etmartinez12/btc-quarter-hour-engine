@@ -19,7 +19,8 @@ from btc_quarter_hour_engine.research.diagnostics import (
 )
 from btc_quarter_hour_engine.research.features import (
     PREDICTOR_CONTRACT_VERSION,
-    PREDICTOR_COLUMNS,
+    predictor_columns_for_contract,
+    research_features_for_contract,
     research_model_matrix,
 )
 from btc_quarter_hour_engine.validation.metrics import (
@@ -47,10 +48,12 @@ class ExploratoryResearchConfig:
     hist_gradient_boosting_max_leaf_nodes: int = 15
     hist_gradient_boosting_min_samples_leaf: int = 20
     hist_gradient_boosting_l2_regularization: float = 1.0
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION
 
 
 def prepare_research_frame(
     features: pd.DataFrame,
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     required = {
         "timestamp",
@@ -66,7 +69,10 @@ def prepare_research_frame(
             f"Research feature frame missing columns: {sorted(missing)}"
         )
 
-    frame = features.copy()
+    frame = research_features_for_contract(
+        features,
+        predictor_contract_version,
+    ).copy()
 
     frame["timestamp"] = pd.to_datetime(
         frame["timestamp"],
@@ -91,7 +97,10 @@ def prepare_research_frame(
     if frame["timestamp"].duplicated().any():
         raise ValueError("Research timestamps must be unique")
 
-    X, y = research_model_matrix(frame)
+    X, y = research_model_matrix(
+        frame,
+        predictor_contract_version=predictor_contract_version,
+    )
 
     return frame, X, y
 
@@ -252,7 +261,10 @@ def run_exploratory_walk_forward(
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     cfg = config or ExploratoryResearchConfig()
 
-    frame, X, y = prepare_research_frame(features)
+    frame, X, y = prepare_research_frame(
+        features,
+        cfg.predictor_contract_version,
+    )
     folds = build_exploratory_folds(frame, cfg)
 
     model_parts: list[pd.DataFrame] = []
@@ -399,16 +411,29 @@ def run_exploratory_walk_forward(
     for benchmark, diagnostics in model_diagnostics.items():
         benchmark_summary[benchmark].update(diagnostics)
 
-    drift_metadata, feature_drift = feature_drift_diagnostics(features)
-    quality = dataset_quality_diagnostics(features)
+    predictor_columns = predictor_columns_for_contract(
+        cfg.predictor_contract_version
+    )
+    drift_metadata, feature_drift = feature_drift_diagnostics(
+        features,
+        predictor_contract_version=cfg.predictor_contract_version,
+    )
+    quality_features = research_features_for_contract(
+        features,
+        cfg.predictor_contract_version,
+    )
+    quality = dataset_quality_diagnostics(
+        quality_features,
+        predictor_columns=predictor_columns,
+    )
 
     summary: dict[str, Any] = {
         "mode": "exploratory_short_history",
         "scientific_claim_status": (
             "development_exploratory_analysis_not_untouched_prospective_validation"
         ),
-        "predictor_contract_version": PREDICTOR_CONTRACT_VERSION,
-        "predictor_count": len(PREDICTOR_COLUMNS),
+        "predictor_contract_version": cfg.predictor_contract_version,
+        "predictor_count": len(predictor_columns),
         "n_trainable_rows": int(len(frame)),
         "dataset_summary": quality,
         "feature_drift": {

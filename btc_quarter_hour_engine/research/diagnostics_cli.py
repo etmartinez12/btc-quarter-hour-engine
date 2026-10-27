@@ -36,9 +36,10 @@ def run_diagnostics(
     config: ExploratoryResearchConfig | None = None,
 ) -> dict[str, Any]:
     features = pd.read_parquet(features_path)
+    cfg = config or ExploratoryResearchConfig()
     summary, predictions = run_exploratory_walk_forward(
         features,
-        config or ExploratoryResearchConfig(),
+        cfg,
     )
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=True)
@@ -60,7 +61,10 @@ def run_diagnostics(
         feature_drift_diagnostics,
     )
 
-    _, feature_drift = feature_drift_diagnostics(features)
+    _, feature_drift = feature_drift_diagnostics(
+        features,
+        predictor_contract_version=cfg.predictor_contract_version,
+    )
     feature_drift.to_parquet(output / "feature_drift.parquet", index=False)
 
     diagnostics_path = output / "diagnostics.json"
@@ -91,10 +95,21 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--features", required=True)
     parser.add_argument("--output-root", required=True)
+    parser.add_argument(
+        "--predictor-contract",
+        choices=("bbo-causal-v1", "bbo-causal-v2"),
+        default="bbo-causal-v1",
+    )
     args = parser.parse_args(argv)
 
     try:
-        artifacts = run_diagnostics(args.features, args.output_root)
+        artifacts = run_diagnostics(
+            args.features,
+            args.output_root,
+            ExploratoryResearchConfig(
+                predictor_contract_version=args.predictor_contract
+            ),
+        )
     except ValueError as exc:
         parser.error(str(exc))
 

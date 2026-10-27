@@ -5,7 +5,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from btc_quarter_hour_engine.research.features import PREDICTOR_COLUMNS
+from btc_quarter_hour_engine.research.features import (
+    PREDICTOR_COLUMNS,
+    PREDICTOR_CONTRACT_VERSION,
+    predictor_columns_for_contract,
+    research_features_for_contract,
+)
 from btc_quarter_hour_engine.validation.metrics import (
     classification_metrics,
     pairwise_prediction_agreement,
@@ -290,8 +295,17 @@ def _distribution(values: pd.Series) -> dict[str, Any]:
 
 def feature_drift_diagnostics(
     features: pd.DataFrame,
+    *,
+    predictor_contract_version: str = PREDICTOR_CONTRACT_VERSION,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
-    missing = sorted(set(PREDICTOR_COLUMNS).difference(features.columns))
+    features = research_features_for_contract(
+        features,
+        predictor_contract_version,
+    )
+    predictor_columns = predictor_columns_for_contract(
+        predictor_contract_version
+    )
+    missing = sorted(set(predictor_columns).difference(features.columns))
     if missing:
         raise ValueError(
             "Feature drift frame is missing predictors: "
@@ -312,7 +326,7 @@ def feature_drift_diagnostics(
     late = trainable.iloc[split_index:]
     records: list[dict[str, Any]] = []
 
-    for feature_name in PREDICTOR_COLUMNS:
+    for feature_name in predictor_columns:
         early_values = _finite_values(early[feature_name])
         late_values = _finite_values(late[feature_name])
         early_stats = _distribution(early[feature_name])
@@ -389,7 +403,7 @@ def feature_drift_diagnostics(
         "early_end": early["timestamp"].max() if len(early) else None,
         "late_start": late["timestamp"].min() if len(late) else None,
         "late_end": late["timestamp"].max() if len(late) else None,
-        "predictor_count": int(len(PREDICTOR_COLUMNS)),
+        "predictor_count": int(len(predictor_columns)),
         "features_ranked_by": "absolute_drift_score descending, feature_name ascending",
         "constant_scale_rule": (
             "When both partitions have zero pooled standard deviation, shift is "
@@ -406,7 +420,11 @@ def _reason_counts(frame: pd.DataFrame, column: str) -> dict[str, int] | None:
     return {str(key): int(values[key]) for key in sorted(values.index)}
 
 
-def dataset_quality_diagnostics(features: pd.DataFrame) -> dict[str, Any]:
+def dataset_quality_diagnostics(
+    features: pd.DataFrame,
+    *,
+    predictor_columns: tuple[str, ...] = PREDICTOR_COLUMNS,
+) -> dict[str, Any]:
     frame = features.copy()
     total_rows = int(len(frame))
     if "timestamp" in frame.columns and total_rows:
@@ -420,7 +438,7 @@ def dataset_quality_diagnostics(features: pd.DataFrame) -> dict[str, Any]:
     if "feature_ready" in frame.columns:
         feature_ready = frame["feature_ready"].fillna(False).astype(bool)
     else:
-        predictor_values = frame.loc[:, list(PREDICTOR_COLUMNS)].apply(
+        predictor_values = frame.loc[:, list(predictor_columns)].apply(
             pd.to_numeric, errors="coerce"
         )
         feature_ready = pd.Series(
@@ -481,7 +499,7 @@ def dataset_quality_diagnostics(features: pd.DataFrame) -> dict[str, Any]:
         ),
         "first_timestamp": first_timestamp,
         "last_timestamp": last_timestamp,
-        "predictor_count": int(len(PREDICTOR_COLUMNS)),
+        "predictor_count": int(len(predictor_columns)),
         "rows_excluded_for_feature_readiness": int(
             total_rows - int(feature_ready.sum())
         ),
