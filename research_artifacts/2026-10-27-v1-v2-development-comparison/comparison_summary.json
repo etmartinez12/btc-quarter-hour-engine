@@ -1,0 +1,144 @@
+{
+  "status": "exploratory_development_evidence",
+  "snapshot_sha256": "ae0417ab38de3a0204baf8202d741a541e38f79597c47d3691da177ac32aa2fc",
+  "trainable_rows": 1935,
+  "folds": 35,
+  "oof_rows_per_benchmark": 1622,
+  "population_comparison": {
+    "matching_counts": true,
+    "matching_oof_keys": true,
+    "matching_baseline_accuracies": true
+  },
+  "predictor_counts": {
+    "bbo-causal-v1": 114,
+    "bbo-causal-v2": 91
+  },
+  "drift": {
+    "v1": {
+      "feature_count": 114,
+      "mean": 0.29097357116791145,
+      "median": 0.13866101434325506,
+      "p90": 0.5553325643429424,
+      "maximum": 1.3503656167698206,
+      "count_ge_0_5": 16,
+      "count_ge_1_0": 9
+    },
+    "v2": {
+      "feature_count": 91,
+      "mean": 0.17647328299754697,
+      "median": 0.11550317804979063,
+      "p90": 0.46153473751026003,
+      "maximum": 0.8128178294419228,
+      "count_ge_0_5": 6,
+      "count_ge_1_0": 0
+    }
+  },
+  "model_metrics": {
+    "v1": {
+      "always_down": {
+        "accuracy": 0.5086313193588162,
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0
+      },
+      "always_up": {
+        "accuracy": 0.4913686806411837,
+        "f1": 0.6589499793303017,
+        "precision": 0.4913686806411837,
+        "recall": 1.0
+      },
+      "causal_momentum_15m": {
+        "accuracy": 0.49445129469790383,
+        "f1": 0.48427672955974843,
+        "precision": 0.4854981084489281,
+        "recall": 0.48306148055207027
+      },
+      "extra_trees": {
+        "accuracy": 0.49815043156596794,
+        "brier_score": 0.25143528717514274,
+        "f1": 0.5250875145857643,
+        "log_loss": 0.6960711999564619,
+        "precision": 0.49073064340239914,
+        "recall": 0.5646173149309912,
+        "roc_auc": 0.5005832477852553
+      },
+      "hist_gradient_boosting": {
+        "accuracy": 0.5036991368680641,
+        "brier_score": 0.2913086804449985,
+        "f1": 0.5228215767634855,
+        "log_loss": 0.803172071534464,
+        "precision": 0.49550561797752807,
+        "recall": 0.5533249686323714,
+        "roc_auc": 0.5087730504543554
+      },
+      "logistic_regression": {
+        "accuracy": 0.4845869297163995,
+        "brier_score": 0.2768077179778042,
+        "f1": 0.5128205128205128,
+        "log_loss": 0.7600277838551197,
+        "precision": 0.47878128400435255,
+        "recall": 0.5520702634880803,
+        "roc_auc": 0.49621535302840203
+      },
+      "train_majority": {
+        "accuracy": 0.4938347718865598,
+        "f1": 0.45010046885465504,
+        "precision": 0.4827586206896552,
+        "recall": 0.4215809284818068
+      }
+    },
+    "v2": {
+      "always_down": {
+        "accuracy": 0.5086313193588162,
+        "f1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0
+      },
+      "always_up": {
+        "accuracy": 0.4913686806411837,
+        "f1": 0.6589499793303017,
+        "precision": 0.4913686806411837,
+        "recall": 1.0
+      },
+      "causal_momentum_15m": {
+        "accuracy": 0.49445129469790383,
+        "f1": 0.48427672955974843,
+        "precision": 0.4854981084489281,
+        "recall": 0.48306148055207027
+      },
+      "extra_trees": {
+        "accuracy": 0.5018495684340321,
+        "brier_score": 0.25150861755298376,
+        "f1": 0.47668393782383417,
+        "log_loss": 0.6962144348123687,
+        "precision": 0.4926372155287818,
+        "recall": 0.4617314930991217,
+        "roc_auc": 0.4988175354549257
+      },
+      "hist_gradient_boosting": {
+        "accuracy": 0.4926017262638718,
+        "brier_score": 0.289966711077211,
+        "f1": 0.4904024767801858,
+        "log_loss": 0.7966790933143987,
+        "precision": 0.4841075794621027,
+        "recall": 0.4968632371392723,
+        "roc_auc": 0.5025999011444431
+      },
+      "logistic_regression": {
+        "accuracy": 0.5036991368680641,
+        "brier_score": 0.27207016273485485,
+        "f1": 0.4965603502188868,
+        "log_loss": 0.74878963401947,
+        "precision": 0.49501246882793015,
+        "recall": 0.4981179422835634,
+        "roc_auc": 0.49893920383255397
+      },
+      "train_majority": {
+        "accuracy": 0.4938347718865598,
+        "f1": 0.45010046885465504,
+        "precision": 0.4827586206896552,
+        "recall": 0.4215809284818068
+      }
+    }
+  }
+}
