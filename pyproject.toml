@@ -35,6 +35,7 @@ btc-qh-snapshot-coinbase-book = "btc_quarter_hour_engine.acquisition.cli:snapsho
 btc-qh-collect-coinbase-bbo = "btc_quarter_hour_engine.acquisition.cli:collect_coinbase_bbo_main"
 btc-qh-build-forward-research-dataset = "btc_quarter_hour_engine.research.cli:main"
 btc-qh-materialize-research = "btc_quarter_hour_engine.research.materializer_cli:main"
+btc-qh-localize-v2-signal = "btc_quarter_hour_engine.research.signal_localization_cli:main"
 # Deprecated alias retained for backward compatibility; prefer btc-qh-collect-coinbase-bbo.
 btc-qh-run-coinbase-websocket-collector = "btc_quarter_hour_engine.acquisition.cli:run_websocket_collector_main"
 

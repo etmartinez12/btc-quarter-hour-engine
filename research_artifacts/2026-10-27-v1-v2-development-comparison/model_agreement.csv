@@ -1,0 +1,7 @@
+contract,left_model,n_common_folds,n_common_predictions,prediction_agreement,probability_correlation,right_model
+v1,extra_trees,35,1622,0.6985203452527744,0.4720496085129247,hist_gradient_boosting
+v1,extra_trees,35,1622,0.6510480887792849,0.41613368682267243,logistic_regression
+v1,hist_gradient_boosting,35,1622,0.6196054254007398,0.305810084833004,logistic_regression
+v2,extra_trees,35,1622,0.6935881627620222,0.4600393778203755,hist_gradient_boosting
+v2,extra_trees,35,1622,0.627003699136868,0.3740104647541185,logistic_regression
+v2,hist_gradient_boosting,35,1622,0.6226880394574599,0.31150841801646917,logistic_regression

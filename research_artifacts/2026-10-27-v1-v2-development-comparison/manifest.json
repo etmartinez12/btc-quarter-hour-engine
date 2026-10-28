@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "source_diagnostics": {
+    "v1": {
+      "diagnostics.json": "047383d08c5f8a7460fbf8613d43a9ee779c40e142af360ea4e4b2bf308a478b",
+      "feature_drift.parquet": "b20e79f75290cf6c1ac3a74ce561c6d52c10a4684ac3fb425f4147c5a49e3597",
+      "fold_metrics.parquet": "7962a266d30715568acbb2cec640aaea59993c722a8fd304d58dc401bd475fbe",
+      "oof_predictions.parquet": "c5d80687c800184d8fff959a79ec26a2e495b8db669b4655aadec206d7e7a909"
+    },
+    "v2": {
+      "diagnostics.json": "f0bbd3c445b6f55f181e2409fef1bb868228e0f40d19307025ab821e77e4fcc5",
+      "feature_drift.parquet": "cf5d90c8f3865e598da56838ed01b15a0168e8e6ad6fb3cc774e7b84822f169c",
+      "fold_metrics.parquet": "3c449350ae38f1fb52ebc81dd2a574ebdd22842868a1e2d49a9a3db39eab082d",
+      "oof_predictions.parquet": "4e5338274c447da91d44bc18f4df6c2702b3313fd85d3f449049342d70ab9242"
+    }
+  },
+  "source_git_commit": "51cd1552a193f9bf0a80fb261cdd0b81db0f022f",
+  "source_snapshot_sha256": "ae0417ab38de3a0204baf8202d741a541e38f79597c47d3691da177ac32aa2fc",
+  "status": "development_evidence_not_prospective"
+}
