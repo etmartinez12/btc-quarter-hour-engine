@@ -453,6 +453,13 @@ Each command accepts depth, frame/envelope count, repeat count, and seed
 options. Results report medians, throughput, semantic parity, and final heap
 sizes. `--json-output path.json` writes the same report to a file.
 
+## Offline prospective model freeze
+
+The [prospective model-freeze guide](docs/research/prospective-model-freeze.md)
+documents the offline-only CLI for the frozen October snapshot, development-only
+dry-runs, trusted artifact verification, and the separate official approval gate.
+It does not enable live inference or change collection/materialization services.
+
 ## Design notes
 
 - Phase 2 expands the feature space while keeping every feature computable from information available at or before boundary `t`.
