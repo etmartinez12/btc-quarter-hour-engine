@@ -135,3 +135,7 @@ requires a separate invocation, fresh training, and a new destination.
 No artifact here authorizes service activation. Live inference, durable
 append-only prediction evidence, operational validation, and prospective scoring
 remain separate work under the unchanged protocol.
+
+The offline causal inference adapter, immutable prediction ledger, dry-run
+interface, and remaining source-integration assumptions are documented in
+[prospective-inference-ledger.md](prospective-inference-ledger.md).
