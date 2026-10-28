@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 
 import pandas as pd
 
@@ -11,24 +13,62 @@ root = repo / "research_artifacts" / "2026-10-28-v2-signal-localization"
 
 manifest = json.loads((root / "manifest.json").read_text())
 
-assert manifest["git_sha"] == (
-    "273d732c0181303f6d7b667b67ca01436e91b659"
-)
-assert manifest["snapshot_sha256"] == (
-    "ae0417ab38de3a0204baf8202d741a541e38f79597c47d3691da177ac32aa2fc"
-)
-assert manifest["git_dirty"] is False
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
 
-for name, expected in manifest["output_sha256"].items():
-    actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
+
+require(isinstance(manifest, dict), "Invalid manifest: expected a JSON object.")
+require(
+    manifest.get("git_sha") == "273d732c0181303f6d7b667b67ca01436e91b659",
+    "Manifest provenance mismatch: unexpected research Git SHA.",
+)
+require(
+    manifest.get("snapshot_sha256")
+    == "ae0417ab38de3a0204baf8202d741a541e38f79597c47d3691da177ac32aa2fc",
+    "Manifest provenance mismatch: unexpected input snapshot SHA256.",
+)
+require(
+    manifest.get("git_dirty") is False,
+    "Manifest provenance mismatch: experiment working tree was not clean.",
+)
+require(
+    manifest.get("n_oof_predictions_per_benchmark") == 1622,
+    "Manifest provenance mismatch: expected 1,622 OOF predictions per benchmark.",
+)
+
+expected_artifacts = {
+    "fold_metrics.csv",
+    "fold_metrics.parquet",
+    "metrics.csv",
+    "metrics.parquet",
+    "oof_predictions.csv",
+    "oof_predictions.parquet",
+    "signal_localization.json",
+}
+output_checksums = manifest.get("output_sha256")
+require(
+    isinstance(output_checksums, dict)
+    and set(output_checksums) == expected_artifacts,
+    "Invalid manifest: output checksum entries do not match the frozen artifacts.",
+)
+
+for name, expected in output_checksums.items():
+    artifact_bytes = (root / name).read_bytes()
+    if name.endswith((".csv", ".json")):
+        artifact_bytes = artifact_bytes.replace(b"\r\n", b"\n")
+    actual = hashlib.sha256(artifact_bytes).hexdigest()
     if actual != expected:
         raise ValueError(f"Artifact checksum mismatch: {name}")
 
 metrics = pd.read_parquet(root / "metrics.parquet")
 predictions = pd.read_parquet(root / "oof_predictions.parquet")
 
-assert len(metrics) == 49
-assert len(predictions) == 49 * 1622
+require(len(metrics) == 49, "Expected 49 configuration metric rows.")
+require(
+    len(predictions) == 49 * 1622,
+    "Expected 79,478 OOF prediction records across 49 configurations.",
+)
 
 print("Frozen evidence: VERIFIED")
 print("Model/baseline configurations:", len(metrics))
@@ -53,7 +93,18 @@ always_down = predictions.loc[
     columns,
 ]
 
-assert len(range_only) == len(always_down) == 1622
+require(
+    len(range_only) == len(always_down) == 1622,
+    "Expected 1,622 OOF records for each paired configuration.",
+)
+require(
+    not range_only.duplicated(keys).any(),
+    "Range-only predictions contain duplicate fold/timestamp identities.",
+)
+require(
+    not always_down.duplicated(keys).any(),
+    "Always-DOWN predictions contain duplicate fold/timestamp identities.",
+)
 
 paired = range_only.merge(
     always_down,
@@ -62,12 +113,21 @@ paired = range_only.merge(
     validate="one_to_one",
 )
 
-assert len(paired) == 1622
-assert (paired["y_true_range"] == paired["y_true_down"]).all()
-assert (
-    paired["target_log_return_15m_range"]
-    == paired["target_log_return_15m_down"]
-).all()
+require(
+    len(paired) == 1622,
+    "Paired OOF identities do not cover all 1,622 observations.",
+)
+require(
+    (paired["y_true_range"] == paired["y_true_down"]).all(),
+    "Paired OOF identities have inconsistent target labels.",
+)
+require(
+    (
+        paired["target_log_return_15m_range"]
+        == paired["target_log_return_15m_down"]
+    ).all(),
+    "Paired OOF identities have inconsistent target returns.",
+)
 
 paired["range_correct"] = (
     paired["y_pred_range"] == paired["y_true_range"]
@@ -91,7 +151,20 @@ paired_results = {
     ),
 }
 
-assert sum(paired_results.values()) == 1622
+require(
+    sum(paired_results.values()) == 1622,
+    "Paired prediction outcome counts do not sum to 1,622.",
+)
+require(
+    paired_results
+    == {
+        "both_correct": 520,
+        "range_only_correct": 335,
+        "down_only_correct": 305,
+        "both_wrong": 462,
+    },
+    f"Unexpected paired research findings: {paired_results}.",
+)
 
 print("\n=== PAIRED PREDICTIONS ===")
 for name, count in paired_results.items():
@@ -105,7 +178,10 @@ print(
 
 # Temporal consistency using the original chronological fold order.
 fold_numbers = sorted(paired["fold_number"].unique())
-assert len(fold_numbers) == 35
+require(
+    len(fold_numbers) == 35,
+    f"Expected 35 chronological folds, found {len(fold_numbers)}.",
+)
 
 temporal_results = {}
 
@@ -150,10 +226,17 @@ print(
     f"{paired['y_true_range'].mean():.5f}"
 )
 
-assert (
-    temporal_results["early"]["observations"]
-    + temporal_results["late"]["observations"]
-    == 1622
+require(
+    temporal_results["early"]["folds"] == 17
+    and temporal_results["early"]["observations"] == 804
+    and temporal_results["late"]["folds"] == 18
+    and temporal_results["late"]["observations"] == 818
+    and (
+        temporal_results["early"]["observations"]
+        + temporal_results["late"]["observations"]
+        == 1622
+    ),
+    "Unexpected temporal fold/observation counts.",
 )
 
 def metric_row(mode, family, benchmark):
@@ -162,7 +245,10 @@ def metric_row(mode, family, benchmark):
         & metrics["family"].eq(family)
         & metrics["benchmark"].eq(benchmark)
     ]
-    assert len(rows) == 1
+    require(
+        len(rows) == 1,
+        f"Expected one metric row for {mode}/{family}/{benchmark}; found {len(rows)}.",
+    )
     return rows.iloc[0]
 
 
@@ -176,9 +262,12 @@ baseline = metric_row(
     "reference", "all", "always_down"
 )
 
-assert int(range_model["n_predictions"]) == 1622
-assert int(full_model["n_predictions"]) == 1622
-assert int(baseline["n_predictions"]) == 1622
+require(
+    int(range_model["n_predictions"]) == 1622
+    and int(full_model["n_predictions"]) == 1622
+    and int(baseline["n_predictions"]) == 1622,
+    "Expected 1,622 OOF predictions for each reported model.",
+)
 
 report = [
     "# V2 Signal-Localization Scientific Findings",
@@ -232,13 +321,6 @@ report_path = (
     / "v2-signal-localization-findings-2026-10-28.md"
 )
 
-report_path.write_text(
-    "\n".join(report) + "\n",
-    encoding="utf-8",
-)
-
-print("\nCreated:", report_path.name)
-
 # Preserve results for every evaluated configuration.
 def display_metric(value):
     if pd.isna(value):
@@ -257,8 +339,11 @@ ordered = ordered.sort_values(
     ["_order", "family", "benchmark"]
 )
 
-assert len(ordered) == 49
-assert ordered[["mode", "family", "benchmark"]].duplicated().sum() == 0
+require(len(ordered) == 49, "Expected 49 ordered configuration rows.")
+require(
+    ordered[["mode", "family", "benchmark"]].duplicated().sum() == 0,
+    "Configuration results contain duplicate mode/family/model identities.",
+)
 
 report += [
     "",
@@ -290,13 +375,6 @@ for _, row in ordered.iterrows():
         f"| {display_metric(delta * 100)} |"
     )
 
-report_path.write_text(
-    "\n".join(report) + "\n",
-    encoding="utf-8",
-)
-
-print("Complete results table added:", len(ordered), "rows")
-
 fold_metrics = pd.read_parquet(root / "fold_metrics.parquet")
 
 def fold_accuracy(mode, family, benchmark):
@@ -306,16 +384,25 @@ def fold_accuracy(mode, family, benchmark):
         & fold_metrics["benchmark"].eq(benchmark)
     ]
     result = rows.set_index("fold_number")["accuracy"].sort_index()
-    assert len(result) == 35
-    assert result.index.is_unique
+    require(
+        len(result) == 35,
+        f"Expected 35 fold metrics for {mode}/{family}/{benchmark}; "
+        f"found {len(result)}.",
+    )
+    require(
+        result.index.is_unique,
+        f"Duplicate fold numbers for {mode}/{family}/{benchmark}.",
+    )
     return result
 
 selected = fold_accuracy("group_only", "range_volatility", "extra_trees")
 full = fold_accuracy("reference", "all", "extra_trees")
 down = fold_accuracy("reference", "all", "always_down")
 
-assert selected.index.equals(full.index)
-assert selected.index.equals(down.index)
+require(
+    selected.index.equals(full.index) and selected.index.equals(down.index),
+    "Fold metrics do not share identical fold identities.",
+)
 
 def fold_comparison(other):
     difference = selected - other
@@ -332,8 +419,14 @@ print("\n=== FOLD CONSISTENCY ===")
 print("Versus full V2:", vs_full)
 print("Versus always-DOWN:", vs_down)
 
-assert vs_full == (22, 6, 7)
-assert vs_down == (25, 3, 7)
+require(
+    vs_full == (22, 6, 7),
+    f"Unexpected range-only versus full V2 fold findings: {vs_full}.",
+)
+require(
+    vs_down == (25, 3, 7),
+    f"Unexpected range-only versus always-DOWN fold findings: {vs_down}.",
+)
 
 net_gain = (
     paired_results["range_only_correct"]
@@ -391,10 +484,30 @@ report += [
     "ensemble selection, or V3 feature changes are authorized here.",
 ]
 
-report_path.write_text(
-    "\n".join(report) + "\n",
-    encoding="utf-8",
-)
+report_text = "\n".join(report) + "\n"
+report_path.parent.mkdir(parents=True, exist_ok=True)
+temporary_path = None
+try:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        dir=report_path.parent,
+        prefix=f".{report_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+        temporary_file.write(report_text)
+        temporary_file.flush()
+        os.fsync(temporary_file.fileno())
+    os.replace(temporary_path, report_path)
+    temporary_path = None
+finally:
+    if temporary_path is not None:
+        temporary_path.unlink(missing_ok=True)
 
+print("\nCreated:", report_path.name)
+print("Complete results table added:", len(ordered), "rows")
 print("Scientific interpretation added")
 print("Report lines:", len(report))
