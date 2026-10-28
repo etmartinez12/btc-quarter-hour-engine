@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -127,32 +128,53 @@ def test_registered_schedule_is_complete_and_immutable(tmp_path):
     ledger.close()
 
 
+def test_legacy_ledger_without_attestation_is_preserved_and_rejected(tmp_path):
+    path = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version = 1")
+    connection.execute("CREATE TABLE legacy_evidence (value TEXT NOT NULL)")
+    connection.execute("INSERT INTO legacy_evidence VALUES ('keep')")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="lacks post-commit durability"):
+        ProspectiveLedger(path)
+
+    preserved = sqlite3.connect(path)
+    assert preserved.execute("SELECT value FROM legacy_evidence").fetchone() == ("keep",)
+    assert preserved.execute("PRAGMA user_version").fetchone() == (1,)
+    preserved.close()
+
+
 def test_prediction_persists_once_with_all_frozen_evidence(tmp_path):
     ledger, clock = _ledger(tmp_path / "ledger.sqlite")
     clock.set(START + timedelta(seconds=5), 100)
-    result = ledger.append_prediction(
+    result = ledger._append_prediction_evidence(
         _evidence(),
     )
     assert result["timing_eligible"] is True
     assert ledger.lifecycle(START)["status"] == "predicted"
     assert result["persisted_at_utc"] == START + timedelta(seconds=5)
     state = ledger.lifecycle(START)
+    assert state["evaluation_eligible"] is True
+    assert state["durability_attestation"]["deadline_met"] == 1
     assert state["prediction"]["candidate_model_sha256"] == RANGE_MODEL_SHA256
     assert state["prediction"]["control_model_sha256"] == FULL_V2_MODEL_SHA256
     assert state["prediction"]["manifest_sha256"] == TRUSTED_MANIFEST_SHA256
     assert state["prediction"]["candidate_probability"] == 0.7
     assert state["prediction"]["candidate_prediction"] == 1
     assert state["prediction"]["baseline_prediction"] == 0
-    assert state["prediction"]["timing_eligible"] == 1
+    assert state["prediction"]["write_started_at_utc"] == "2026-11-15T00:00:05.000000Z"
     assert state["prediction"]["clock_health_verified"] == 1
     assert len(state["prediction"]["feature_vector_json"].encode()) > 0
     with pytest.raises(DuplicatePredictionError):
         clock.advance(1)
-        ledger.append_prediction(
+        ledger._append_prediction_evidence(
             _evidence(),
         )
     assert [event["event_type"] for event in ledger.lifecycle(START)["events"]] == [
         "prediction_recorded",
+        "durability_attested",
         "duplicate_attempt",
     ]
     ledger.close()
@@ -162,7 +184,7 @@ def test_late_write_is_an_event_not_a_prediction_and_is_never_backfilled(tmp_pat
     ledger, clock = _ledger(tmp_path / "late.sqlite")
     clock.set(START + timedelta(seconds=61), 0)
     with pytest.raises(LatePredictionError):
-        ledger.append_prediction(
+        ledger._append_prediction_evidence(
             _evidence(),
         )
     state = ledger.lifecycle(START)
@@ -183,18 +205,90 @@ def test_late_write_is_an_event_not_a_prediction_and_is_never_backfilled(tmp_pat
     ledger.close()
 
 
+def test_commit_crossing_deadline_is_persisted_but_not_evaluation_eligible(
+    tmp_path, monkeypatch
+):
+    ledger, clock = _ledger(tmp_path / "commit-crossing.sqlite")
+    clock.set(START + timedelta(seconds=59), 59)
+    original_transaction = ledger._transaction
+    transaction_count = 0
+
+    @contextmanager
+    def commit_then_advance_clock():
+        nonlocal transaction_count
+        with original_transaction():
+            yield
+        transaction_count += 1
+        if transaction_count == 1:
+            clock.advance(2)
+
+    monkeypatch.setattr(ledger, "_transaction", commit_then_advance_clock)
+    with pytest.raises(LatePredictionError, match="committed after"):
+        ledger._append_prediction_evidence(_evidence())
+
+    state = ledger.lifecycle(START)
+    assert state["prediction"] is not None
+    assert state["durability_attestation"]["deadline_met"] == 0
+    assert state["evaluation_eligible"] is False
+    assert state["status"] == "durability_late"
+    ledger.close()
+
+
+def test_interrupted_post_commit_confirmation_stays_ineligible_after_restart(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "confirmation-interrupted.sqlite"
+    ledger, clock = _ledger(path)
+    clock.set(START + timedelta(seconds=5), 5)
+    original_insert_event = ledger._insert_event
+
+    def interrupt_confirmation(boundary, event_type, *args, **kwargs):
+        if event_type == "durability_attested":
+            raise RuntimeError("simulated crash during durability confirmation")
+        return original_insert_event(boundary, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(ledger, "_insert_event", interrupt_confirmation)
+    with pytest.raises(RuntimeError, match="during durability confirmation"):
+        ledger._append_prediction_evidence(_evidence())
+    state = ledger.lifecycle(START)
+    assert state["prediction"] is not None
+    assert state["durability_attestation"] is None
+    assert state["evaluation_eligible"] is False
+    assert state["status"] == "durability_unconfirmed"
+    ledger.close()
+
+    restarted, restart_clock = _ledger(path)
+    restart_clock.set(START + timedelta(seconds=10), 10)
+    recovered = restarted.lifecycle(START)
+    assert recovered["prediction"] is not None
+    assert recovered["durability_attestation"] is None
+    assert recovered["evaluation_eligible"] is False
+    with pytest.raises(DuplicatePredictionError):
+        restarted._append_prediction_evidence(_evidence())
+    assert restarted.lifecycle(START)["durability_attestation"] is None
+    restarted.close()
+
+
+def test_public_persistence_rejects_unverified_model_bundle(tmp_path):
+    ledger, _ = _ledger(tmp_path / "unverified-model.sqlite")
+    with pytest.raises(ValueError, match="load_official_models"):
+        ledger.append_prediction(_evidence(), model_bundle=object())
+    assert ledger.lifecycle(START)["prediction"] is None
+    ledger.close()
+
+
 def test_clock_skew_fails_closed_and_is_recorded(tmp_path):
     ledger, clock = _ledger(
         tmp_path / "clock.sqlite", count=2, max_drift=1.0
     )
     clock.set(START + timedelta(seconds=1), 10)
-    ledger.append_prediction(
+    ledger._append_prediction_evidence(
         _evidence(START),
     )
     second = START + timedelta(minutes=15)
     clock.set(second + timedelta(seconds=1), 11)
     with pytest.raises(ClockHealthError, match="wall_monotonic_clock_skew"):
-        ledger.append_prediction(
+        ledger._append_prediction_evidence(
             _evidence(second),
         )
     assert ledger.lifecycle(second)["prediction"] is None
@@ -213,7 +307,7 @@ def test_interrupted_transaction_rolls_back_prediction_and_event(tmp_path, monke
 
     monkeypatch.setattr(ledger, "_insert_event", interrupt_after_event)
     with pytest.raises(RuntimeError, match="interruption"):
-        ledger.append_prediction(
+        ledger._append_prediction_evidence(
             _evidence(),
         )
     assert ledger.lifecycle(START)["prediction"] is None
@@ -221,7 +315,7 @@ def test_interrupted_transaction_rolls_back_prediction_and_event(tmp_path, monke
 
     monkeypatch.setattr(ledger, "_insert_event", original)
     clock.advance(1)
-    ledger.append_prediction(
+    ledger._append_prediction_evidence(
         _evidence(),
     )
     ledger.close()
@@ -231,7 +325,7 @@ def test_restart_preserves_prediction_and_duplicate_identity(tmp_path):
     path = tmp_path / "restart.sqlite"
     ledger, clock = _ledger(path)
     clock.set(START + timedelta(seconds=2), 0)
-    ledger.append_prediction(
+    ledger._append_prediction_evidence(
         _evidence(),
     )
     ledger.close()
@@ -241,7 +335,7 @@ def test_restart_preserves_prediction_and_duplicate_identity(tmp_path):
     assert restarted.scheduled_count == 1
     assert restarted.lifecycle(START)["prediction"] is not None
     with pytest.raises(DuplicatePredictionError):
-        restarted.append_prediction(
+        restarted._append_prediction_evidence(
             _evidence(),
         )
     restarted.close()
@@ -250,7 +344,7 @@ def test_restart_preserves_prediction_and_duplicate_identity(tmp_path):
 def test_label_is_separate_append_only_evidence_and_cannot_rewrite_prediction(tmp_path):
     ledger, clock = _ledger(tmp_path / "labels.sqlite")
     clock.set(START + timedelta(seconds=2), 0)
-    ledger.append_prediction(
+    ledger._append_prediction_evidence(
         _evidence(),
     )
     before = dict(ledger.lifecycle(START)["prediction"])
@@ -272,6 +366,7 @@ def test_label_is_separate_append_only_evidence_and_cannot_rewrite_prediction(tm
     assert after["status"] == "labeled"
     assert [event["event_type"] for event in after["events"]] == [
         "prediction_recorded",
+        "durability_attested",
         "label_attached",
     ]
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
@@ -303,26 +398,26 @@ def test_ledger_rejects_wrong_predictor_order_model_hash_and_nonfinite_data(tmp_
     bad_order = _evidence()
     bad_order["control_predictors"].reverse()
     with pytest.raises(ValueError, match="feature order"):
-        ledger.append_prediction(
+        ledger._append_prediction_evidence(
             bad_order,
         )
 
     bad_model = _evidence()
     bad_model["candidate_model_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="model or manifest hash"):
-        ledger.append_prediction(
+        ledger._append_prediction_evidence(
             bad_model,
         )
 
     bad_values = _evidence()
     bad_values["feature_vector"]["asof_spread_bps"] = float("inf")
     with pytest.raises(ValueError, match="finite"):
-        ledger.append_prediction(
+        ledger._append_prediction_evidence(
             bad_values,
         )
 
     tampered_values = _evidence()
     tampered_values["feature_vector"]["asof_spread_bps"] = 0.5
     with pytest.raises(ValueError, match="fingerprint"):
-        ledger.append_prediction(tampered_values)
+        ledger._append_prediction_evidence(tampered_values)
     ledger.close()

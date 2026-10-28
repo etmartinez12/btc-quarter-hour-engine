@@ -21,6 +21,9 @@ from btc_quarter_hour_engine.research.prospective_contract import (
 from btc_quarter_hour_engine.research.prospective_source import (
     compute_feature_fingerprint,
 )
+from btc_quarter_hour_engine.research.prospective_model_provenance import (
+    is_verified_official_bundle,
+)
 
 
 WINDOW_START = datetime(2026, 11, 15, tzinfo=timezone.utc)
@@ -28,6 +31,8 @@ WINDOW_END_EXCLUSIVE = datetime(2026, 12, 15, tzinfo=timezone.utc)
 PREDICTION_DEADLINE_SECONDS = 60
 _EVENT_TYPES = {
     "prediction_recorded",
+    "durability_attested",
+    "durability_late",
     "missing_data",
     "inference_failed",
     "late_attempt",
@@ -170,11 +175,22 @@ class ProspectiveLedger:
             isolation_level=None,
         )
         self._connection.row_factory = sqlite3.Row
+        schema_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        if schema_version not in (0, 2):
+            self._connection.close()
+            raise ValueError(
+                "Existing ledger lacks post-commit durability attestations; "
+                "preserve it read-only and initialize a new ledger"
+            )
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = 30000")
         self._connection.execute("PRAGMA synchronous = FULL")
         self._connection.execute("PRAGMA journal_mode = WAL")
-        self._initialize()
+        try:
+            self._initialize()
+        except BaseException:
+            self._connection.close()
+            raise
 
     @property
     def scheduled_count(self) -> int:
@@ -199,6 +215,12 @@ class ProspectiveLedger:
                 raise
 
     def _initialize(self) -> None:
+        schema_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        if schema_version not in (0, 2):
+            raise ValueError(
+                "Existing ledger lacks post-commit durability attestations; "
+                "preserve it read-only and initialize a new ledger"
+            )
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS scheduled_boundaries (
@@ -216,6 +238,7 @@ class ProspectiveLedger:
                 details_json TEXT NOT NULL,
                 CHECK (event_type IN (
                     'prediction_recorded', 'missing_data', 'inference_failed',
+                    'durability_attested', 'durability_late',
                     'late_attempt', 'missed', 'stale_attempt',
                     'duplicate_attempt', 'invalid_attempt', 'clock_skew',
                     'label_attached', 'duplicate_label', 'dry_run'
@@ -252,7 +275,7 @@ class ProspectiveLedger:
                 implementation_git_sha TEXT NOT NULL
                     CHECK (length(implementation_git_sha) = 40),
                 generated_at_utc TEXT NOT NULL,
-                persisted_at_utc TEXT NOT NULL,
+                write_started_at_utc TEXT NOT NULL,
                 candidate_probability REAL NOT NULL
                     CHECK (candidate_probability >= 0 AND candidate_probability <= 1),
                 candidate_prediction INTEGER NOT NULL
@@ -262,8 +285,14 @@ class ProspectiveLedger:
                 control_prediction INTEGER NOT NULL
                     CHECK (control_prediction IN (0, 1)),
                 baseline_prediction INTEGER NOT NULL CHECK (baseline_prediction = 0),
-                timing_eligible INTEGER NOT NULL CHECK (timing_eligible = 1),
                 failure_reasons_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS durability_attestations (
+                boundary_utc TEXT PRIMARY KEY
+                    REFERENCES predictions(boundary_utc),
+                attested_at_utc TEXT NOT NULL,
+                deadline_met INTEGER NOT NULL CHECK (deadline_met IN (0, 1)),
+                clock_health_verified INTEGER NOT NULL CHECK (clock_health_verified = 1)
             );
             CREATE TABLE IF NOT EXISTS labels (
                 boundary_utc TEXT PRIMARY KEY
@@ -284,6 +313,7 @@ class ProspectiveLedger:
             "scheduled_boundaries",
             "attempt_events",
             "predictions",
+            "durability_attestations",
             "labels",
         ):
             for operation in ("UPDATE", "DELETE"):
@@ -319,7 +349,7 @@ class ProspectiveLedger:
                     "VALUES (?, ?)",
                     expected,
                 )
-        self._connection.execute("PRAGMA user_version = 1")
+        self._connection.execute("PRAGMA user_version = 2")
 
     def close(self) -> None:
         self._connection.close()
@@ -386,6 +416,18 @@ class ProspectiveLedger:
             self._insert_event(boundary, event_type, recorded_at, reason, details)
 
     def append_prediction(
+        self,
+        evidence: Mapping[str, Any],
+        *,
+        model_bundle: object | None = None,
+    ) -> dict[str, Any]:
+        if not is_verified_official_bundle(model_bundle):
+            raise ValueError(
+                "Prediction persistence requires a bundle loaded by load_official_models()"
+            )
+        return self._append_prediction_evidence(evidence)
+
+    def _append_prediction_evidence(
         self,
         evidence: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -506,20 +548,20 @@ class ProspectiveLedger:
         late = False
         clock_error: ClockHealthError | None = None
         invalid_timestamp = False
-        persisted_at: datetime | None = None
+        write_started_at: datetime | None = None
         with self._transaction():
             try:
-                persisted_at = self.clock_health.now()
+                write_started_at = self.clock_health.now()
             except ClockHealthError as exc:
                 clock_error = exc
                 observed = self.clock_health.observed_wall_utc
                 if observed is not None:
                     self._insert_event(boundary, "clock_skew", observed, str(exc))
-            if clock_error is None and generated_at > persisted_at:
+            if clock_error is None and generated_at > write_started_at:
                 self._insert_event(
                     boundary,
                     "invalid_attempt",
-                    persisted_at,
+                    write_started_at,
                     "generation_timestamp_after_persistence_clock",
                 )
                 invalid_timestamp = True
@@ -527,19 +569,19 @@ class ProspectiveLedger:
                 self._insert_event(
                     boundary,
                     "invalid_attempt",
-                    persisted_at,
+                    write_started_at,
                     "generation_timestamp_before_boundary",
                 )
                 invalid_timestamp = True
             elif clock_error is None and (
-                persisted_at > boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
-                or persisted_at >= target
+                write_started_at > boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
+                or write_started_at >= target
                 or generated_at >= target
             ):
                 self._insert_event(
                     boundary,
                     "late_attempt",
-                    persisted_at,
+                    write_started_at,
                     "generation_or_persistence_after_deadline",
                 )
                 late = True
@@ -549,7 +591,7 @@ class ProspectiveLedger:
                 self._insert_event(
                     boundary,
                     "duplicate_attempt",
-                    persisted_at,
+                    write_started_at,
                     "prediction_already_recorded",
                 )
                 duplicate = True
@@ -559,12 +601,12 @@ class ProspectiveLedger:
                 self._insert_event(
                     boundary,
                     "stale_attempt",
-                    persisted_at,
+                    write_started_at,
                     "label_already_attached",
                 )
                 duplicate = True
             elif clock_error is None:
-                assert persisted_at is not None
+                assert write_started_at is not None
                 self._connection.execute(
                     """
                     INSERT INTO predictions (
@@ -579,24 +621,27 @@ class ProspectiveLedger:
                         manifest_sha256,
                         candidate_model_sha256, control_model_sha256,
                         implementation_git_sha, generated_at_utc,
-                        persisted_at_utc, candidate_probability,
+                        write_started_at_utc, candidate_probability,
                         candidate_prediction, control_probability,
                         control_prediction, baseline_prediction,
-                        timing_eligible, failure_reasons_json
+                        failure_reasons_json
                     ) VALUES (
-                        ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, 0, 1, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
                         _iso(boundary),
                         _iso(target),
+                        1,
+                        1,
                         evidence["source_session_id"],
                         _iso(watermark),
                         source_sha,
                         evidence["source_frame_count"],
                         evidence["excluded_ingest_future_count"],
                         evidence["excluded_event_future_count"],
+                        1,
                         evidence["feature_contract"],
                         evidence["feature_family_contract"],
                         fingerprint,
@@ -612,19 +657,20 @@ class ProspectiveLedger:
                         control_sha,
                         implementation_sha,
                         _iso(generated_at),
-                        _iso(persisted_at),
+                        _iso(write_started_at),
                         candidate_probability,
                         candidate_prediction,
                         control_probability,
                         control_prediction,
+                        evidence["baseline_prediction"],
                         reasons_json,
                     ),
                 )
                 self._insert_event(
                     boundary,
                     "prediction_recorded",
-                    persisted_at,
-                    "prediction_persisted_before_deadline",
+                    write_started_at,
+                    "prediction_transaction_committed_pending_durability_attestation",
                     {
                         "feature_fingerprint": fingerprint,
                         "source_provenance_sha256": source_sha,
@@ -640,16 +686,66 @@ class ProspectiveLedger:
             raise DuplicatePredictionError(
                 "A prediction or label already exists for this boundary"
             )
-        assert persisted_at is not None
+        assert write_started_at is not None
+        attested_at = self._attest_durable_commit(boundary)
+        deadline_met = (
+            attested_at <= boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
+        )
+        if not deadline_met:
+            raise LatePredictionError(
+                "Prediction transaction committed after its T+60-second deadline"
+            )
         return {
             **dict(evidence),
             "boundary_utc": boundary,
             "target_utc": target,
             "generated_at_utc": generated_at,
-            "persisted_at_utc": persisted_at,
-            "timing_eligible": True,
+            "write_started_at_utc": write_started_at,
+            "persisted_at_utc": attested_at,
+            "timing_eligible": deadline_met,
             "failure_reasons": [],
         }
+
+    def _attest_durable_commit(self, boundary: datetime) -> datetime:
+        try:
+            attested_at = self.clock_health.now()
+        except ClockHealthError as exc:
+            observed = self.clock_health.observed_wall_utc
+            if observed is not None:
+                with self._transaction():
+                    self._insert_event(boundary, "clock_skew", observed, str(exc))
+            raise
+
+        deadline_met = (
+            attested_at <= boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
+        )
+        with self._transaction():
+            exists = self._connection.execute(
+                "SELECT 1 FROM predictions WHERE boundary_utc = ?",
+                (_iso(boundary),),
+            ).fetchone()
+            if exists is None:
+                raise RuntimeError("Cannot attest a prediction transaction that is not durable")
+            self._connection.execute(
+                """
+                INSERT INTO durability_attestations (
+                    boundary_utc, attested_at_utc, deadline_met,
+                    clock_health_verified
+                ) VALUES (?, ?, ?, 1)
+                """,
+                (_iso(boundary), _iso(attested_at), int(deadline_met)),
+            )
+            self._insert_event(
+                boundary,
+                "durability_attested" if deadline_met else "durability_late",
+                attested_at,
+                (
+                    "prediction_commit_confirmed_before_deadline"
+                    if deadline_met
+                    else "prediction_commit_confirmed_after_deadline"
+                ),
+            )
+        return attested_at
 
     @staticmethod
     def _finite_number(value: Any, *, field: str) -> float:
@@ -799,6 +895,10 @@ class ProspectiveLedger:
         prediction = self._connection.execute(
             "SELECT * FROM predictions WHERE boundary_utc = ?", (boundary,)
         ).fetchone()
+        attestation = self._connection.execute(
+            "SELECT * FROM durability_attestations WHERE boundary_utc = ?",
+            (boundary,),
+        ).fetchone()
         label = self._connection.execute(
             "SELECT * FROM labels WHERE boundary_utc = ?", (boundary,)
         ).fetchone()
@@ -806,10 +906,24 @@ class ProspectiveLedger:
             "SELECT * FROM attempt_events WHERE boundary_utc = ? ORDER BY event_id",
             (boundary,),
         ).fetchall()
+        evaluation_eligible = bool(
+            attestation is not None
+            and attestation["deadline_met"] == 1
+            and attestation["clock_health_verified"] == 1
+            and _parse_utc(attestation["attested_at_utc"])
+            <= _parse_utc(schedule["boundary_utc"])
+            + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
+        )
         if label is not None:
             status = "labeled"
         elif prediction is not None:
-            status = "predicted"
+            status = (
+                "predicted"
+                if evaluation_eligible
+                else "durability_late"
+                if attestation is not None
+                else "durability_unconfirmed"
+            )
         elif events:
             status = events[-1]["event_type"]
         else:
@@ -817,6 +931,10 @@ class ProspectiveLedger:
         return {
             "schedule": dict(schedule),
             "prediction": dict(prediction) if prediction is not None else None,
+            "durability_attestation": (
+                dict(attestation) if attestation is not None else None
+            ),
+            "evaluation_eligible": evaluation_eligible,
             "label": dict(label) if label is not None else None,
             "events": [dict(row) for row in events],
             "status": status,

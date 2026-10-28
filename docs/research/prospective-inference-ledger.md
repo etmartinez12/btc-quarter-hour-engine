@@ -46,6 +46,12 @@ connected to or tested against the production collector. A future producer
 must supply trustworthy receive times and prove the watermark means all frames
 through that time have arrived. Neither property can be established by the
 local journal alone.
+Once a journal watermark is committed, no frame with ingest time at or before
+that watermark may be appended, and watermarks must advance strictly. This
+preserves already-issued snapshots against backdated additions. The Boolean
+clock/completeness fields are producer assertions, not evidence that the source
+was complete or synchronized; independent source certification is still an
+activation prerequisite.
 
 The current raw-segment writer makes frame provenance durable when segments are
 sealed, but its per-frame ingest-time metadata is not published as a separate
@@ -54,9 +60,35 @@ provides a strict snapshot adapter and offline replay interface, not a connected
 60-second production source. The snapshot's watermark and
 `clock_health_verified` value are external assertions; the local adapter cannot
 prove that a separate source has delivered every frame through T or that the
-host clock is synchronized to UTC. Do not mark those guarantees verified until
-a separately isolated VM source has been reviewed and tested. If either is
-unknown, do not produce or persist an eligible prediction.
+host clock is synchronized to UTC.
+
+The current offline adapter materializes and replays the complete source
+session, so both memory use and replay work grow with total session frame
+count. It is not a bounded low-latency replay design, and the 60-second
+requirement has not been measured or demonstrated. A bounded design should
+persist versioned `_IngestFeatureReplay` checkpoints (using its existing
+`to_checkpoint()` / `from_checkpoint()` format) frequently enough to cap tail
+replay, while retaining the complete order-book levels, sync state, connection
+epoch, last accepted exchange sequence, previous midpoint, and sufficient
+quarter-hour bucket statistics for the full 240-minute feature window. The
+checkpoint record must bind its source session, last included frame index,
+ingest/event watermarks, and a hash-chain commitment to every raw frame through
+that index. At inference, restore the latest checkpoint strictly before T,
+verify checkpoint version and digest, verify the book is synchronized, then
+replay only the contiguous post-checkpoint frame tail with matching connection
+identity and strictly increasing sequence numbers. Reject gaps, stale or
+malformed frames, invalid checkpoint state, provenance-chain mismatches, and
+any checkpoint whose committed source watermark does not cover T. Keep enough
+bucket history to recompute the existing 15/30/60/240-minute summaries exactly;
+do not approximate or change V1/V2 feature contracts. Benchmark snapshot read,
+checkpoint restore, tail replay, feature generation, inference, and durable
+commit/attestation separately under representative load before claiming the
+deadline is met. This design is documentation only; checkpointed source
+integration is not implemented here.
+
+Do not mark completeness or clock guarantees verified until a separately
+isolated VM source has been reviewed and tested. If either is unknown, do not
+produce or persist an eligible prediction.
 
 The SQLite `ClockHealth` monitor detects wall-clock regressions and wall versus
 monotonic-clock jumps after its baseline check. It does not independently verify
@@ -94,7 +126,16 @@ with a different schedule is rejected. Schedule, events, predictions, and
 labels are protected by SQLite update/delete triggers; prediction and label
 boundary identities are unique. SQLite uses `WAL`, `synchronous=FULL`, foreign
 keys, and immediate transactions. Prediction data and the corresponding
-success event commit together or neither is published.
+success event commit together or neither is published. The recorded `write_started_at_utc` is not persistence evidence.
+After that transaction commits, a separate immutable durability attestation
+records a clock-health-checked upper bound on when commit completion was
+confirmed. Primary evaluation eligibility requires this attestation to be at
+or before T+60 seconds. A late attestation is retained but ineligible; a crash
+or clock failure before confirmation leaves prediction evidence
+`durability_unconfirmed`, which remains ineligible after restart and is never
+retroactively attested. Earlier prediction rows are never updated to add
+confirmation data. Existing schema-version-1 ledgers have no commit
+attestations; they are rejected for writing and must be preserved read-only.
 
 Only complete, ready predictions with exact frozen hashes and feature ordering
 can be written. The ledger derives timing eligibility from the generation and

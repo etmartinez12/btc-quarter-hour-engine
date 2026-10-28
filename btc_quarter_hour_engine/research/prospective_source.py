@@ -278,6 +278,15 @@ class ProspectiveRawFrameJournal:
                 raise ValueError("Source ingest timestamp regressed")
             if ingest < _parse_utc(session["session_started_at_utc"]):
                 raise ValueError("Source frame precedes its registered session start")
+            latest_watermark = self._connection.execute(
+                "SELECT MAX(watermark_utc) AS latest FROM source_watermarks "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["latest"]
+            if latest_watermark is not None and ingest <= _parse_utc(latest_watermark):
+                raise ValueError(
+                    "Source frame ingest time is at or before the committed completeness watermark"
+                )
             self._connection.execute(
                 """
                 INSERT INTO source_frames (
@@ -320,8 +329,12 @@ class ProspectiveRawFrameJournal:
                 "WHERE session_id = ?",
                 (session_id,),
             ).fetchone()["latest"]
-            if latest_watermark is not None and watermark < _parse_utc(latest_watermark):
-                raise ValueError("Source watermark regressed")
+            if latest_watermark is not None:
+                previous_watermark = _parse_utc(latest_watermark)
+                if watermark == previous_watermark:
+                    raise ValueError("Source watermark is repeated")
+                if watermark < previous_watermark:
+                    raise ValueError("Source watermark regressed")
             self._connection.execute(
                 """
                 INSERT INTO source_watermarks (

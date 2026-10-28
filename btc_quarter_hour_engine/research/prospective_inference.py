@@ -33,6 +33,10 @@ from btc_quarter_hour_engine.research.prospective_ledger import (
     ClockHealthError,
     ProspectiveLedger,
 )
+from btc_quarter_hour_engine.research.prospective_model_provenance import (
+    is_verified_official_bundle,
+    register_official_bundle,
+)
 
 
 _EXPECTED_MODEL_HASHES = {
@@ -53,7 +57,7 @@ def _require_git_sha(value: str) -> str:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, eq=False)
 class FrozenModelBundle:
     models: dict[str, Any]
     model_sha256: dict[str, str]
@@ -86,12 +90,14 @@ def load_official_models(directory: str | Path) -> FrozenModelBundle:
     }
     if model_hashes != _EXPECTED_MODEL_HASHES:
         raise ValueError("Official model SHA256 values differ from the frozen protocol")
-    return FrozenModelBundle(
+    bundle = FrozenModelBundle(
         models=models,
         model_sha256=model_hashes,
         manifest_sha256=TRUSTED_MANIFEST_SHA256,
         manifest=manifest,
     )
+    register_official_bundle(bundle)
+    return bundle
 
 
 def infer_causal_prediction(
@@ -217,6 +223,10 @@ def process_boundary(
 ) -> dict[str, Any]:
     """Run one boundary and append its outcome or an explicit failure event."""
     boundary = _utc(boundary_utc, field="prediction boundary")
+    if not is_verified_official_bundle(model_bundle):
+        raise ValueError(
+            "Official prediction persistence requires a bundle loaded by load_official_models()"
+        )
     try:
         features = build_causal_feature_vector(snapshot, boundary)
     except CausalInputError as exc:
@@ -284,6 +294,4 @@ def process_boundary(
             },
         )
         raise
-    return ledger.append_prediction(
-        evidence,
-    )
+    return ledger.append_prediction(evidence, model_bundle=model_bundle)

@@ -175,6 +175,26 @@ def _bundle(candidate_probability=0.7, control_probability=0.4):
     )
 
 
+def _verified_test_bundle(monkeypatch, candidate_probability=0.7, control_probability=0.4):
+    bundle = _bundle(candidate_probability, control_probability)
+
+    def verified_loader(_directory, **kwargs):
+        assert kwargs == {
+            "trusted_manifest_sha256": TRUSTED_MANIFEST_SHA256,
+            "require_official": True,
+        }
+        return bundle.models, {
+            "status": OFFICIAL_STATUS,
+            "models": {
+                "range_volatility": {"sha256": RANGE_MODEL_SHA256},
+                "full_v2": {"sha256": FULL_V2_MODEL_SHA256},
+            },
+        }
+
+    monkeypatch.setattr(inference, "load_frozen_models", verified_loader)
+    return load_official_models("synthetic-official-fixture")
+
+
 def test_v2_features_and_inference_are_strictly_causal_and_ordered():
     vector = build_causal_feature_vector(_snapshot(), BOUNDARY)
     assert vector.data_ready and vector.feature_ready
@@ -270,6 +290,79 @@ def test_isolated_raw_frame_journal_is_durable_and_append_only(tmp_path):
             "UPDATE source_frames SET raw_bytes = raw_bytes "
             "WHERE session_id = ? AND frame_index = 0",
             (source.session_id,),
+        )
+    restarted.close()
+
+
+def test_source_watermarks_are_irreversible_across_restarts(tmp_path):
+    source = _snapshot()
+    path = tmp_path / "irreversible-source.sqlite"
+    journal = ProspectiveRawFrameJournal(path)
+    journal.start_session(source.session_id, source.session_started_at_utc)
+    first = source.frames[0]
+    journal.append_frame(
+        session_id=first.session_id,
+        connection_id=first.connection_id,
+        frame_index=0,
+        ingest_time_utc=first.ingest_time_utc,
+        raw_bytes=first.raw_bytes,
+    )
+    watermark = first.ingest_time_utc + timedelta(seconds=2)
+    journal.advance_watermark(
+        source.session_id,
+        watermark,
+        clock_health_verified=True,
+    )
+    for rejected_time in (watermark - timedelta(seconds=1), watermark):
+        with pytest.raises(ValueError, match="at or before"):
+            journal.append_frame(
+                session_id=source.session_id,
+                connection_id="connection-1",
+                frame_index=1,
+                ingest_time_utc=rejected_time,
+                raw_bytes=source.frames[1].raw_bytes,
+            )
+    with pytest.raises(ValueError, match="repeated"):
+        journal.advance_watermark(
+            source.session_id,
+            watermark,
+            clock_health_verified=True,
+        )
+    with pytest.raises(ValueError, match="regressed"):
+        journal.advance_watermark(
+            source.session_id,
+            watermark - timedelta(seconds=1),
+            clock_health_verified=True,
+        )
+    earlier_snapshot = journal.snapshot(source.session_id)
+    journal.close()
+
+    restarted = ProspectiveRawFrameJournal(path)
+    with pytest.raises(ValueError, match="at or before"):
+        restarted.append_frame(
+            session_id=source.session_id,
+            connection_id="connection-1",
+            frame_index=1,
+            ingest_time_utc=watermark,
+            raw_bytes=source.frames[1].raw_bytes,
+        )
+        assert len(earlier_snapshot.frames) == 1
+        assert len(restarted.snapshot(source.session_id).frames) == 2
+    accepted_time = watermark + timedelta(seconds=1)
+    restarted.append_frame(
+        session_id=source.session_id,
+        connection_id="connection-1",
+        frame_index=1,
+        ingest_time_utc=accepted_time,
+        raw_bytes=source.frames[1].raw_bytes,
+    )
+    with pytest.raises(ValueError, match="regressed"):
+        restarted.append_frame(
+            session_id=source.session_id,
+            connection_id="connection-1",
+            frame_index=2,
+            ingest_time_utc=watermark + timedelta(milliseconds=500),
+            raw_bytes=source.frames[2].raw_bytes,
         )
     restarted.close()
 
@@ -441,13 +534,14 @@ def test_inference_cannot_be_generated_at_or_after_target_time():
         )
 
 
-def test_boundary_runner_persists_success_and_records_missing_data(tmp_path):
+def test_boundary_runner_persists_success_and_records_missing_data(tmp_path, monkeypatch):
     boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
     class ManualClock:
         wall = boundary + timedelta(seconds=2)
         monotonic = 0.0
 
     clock = ManualClock()
+    model_bundle = _verified_test_bundle(monkeypatch)
     ledger = ProspectiveLedger(
         tmp_path / "runner.sqlite",
         clock_health=ClockHealth(
@@ -459,7 +553,7 @@ def test_boundary_runner_persists_success_and_records_missing_data(tmp_path):
     result = process_boundary(
         _snapshot(boundary),
         boundary,
-        _bundle(),
+        model_bundle,
         implementation_git_sha=IMPLEMENTATION_SHA,
         ledger=ledger,
     )
@@ -477,7 +571,7 @@ def test_boundary_runner_persists_success_and_records_missing_data(tmp_path):
                 clock_health_verified=False,
             ),
             next_boundary,
-            _bundle(),
+            model_bundle,
             implementation_git_sha=IMPLEMENTATION_SHA,
             ledger=ledger,
         )
@@ -490,6 +584,7 @@ def test_boundary_runner_persists_success_and_records_missing_data(tmp_path):
 
 def test_unexpected_inference_failure_is_recorded_and_propagated(tmp_path, monkeypatch):
     boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+    model_bundle = _verified_test_bundle(monkeypatch)
     ledger = ProspectiveLedger(
         tmp_path / "inference-failure.sqlite",
         clock_health=ClockHealth(
@@ -506,7 +601,7 @@ def test_unexpected_inference_failure_is_recorded_and_propagated(tmp_path, monke
         process_boundary(
             _snapshot(boundary),
             boundary,
-            _bundle(),
+            model_bundle,
             implementation_git_sha=IMPLEMENTATION_SHA,
             ledger=ledger,
         )
@@ -514,4 +609,37 @@ def test_unexpected_inference_failure_is_recorded_and_propagated(tmp_path, monke
     assert state["prediction"] is None
     assert state["status"] == "inference_failed"
     assert "synthetic model runtime failure" in state["events"][0]["reason"]
+    ledger.close()
+
+
+def test_process_boundary_rejects_forged_hash_only_bundle(tmp_path):
+    boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+    ledger = ProspectiveLedger(tmp_path / "forged-bundle.sqlite")
+    with pytest.raises(ValueError, match="loaded by load_official_models"):
+        process_boundary(
+            _snapshot(boundary),
+            boundary,
+            _bundle(),
+            implementation_git_sha=IMPLEMENTATION_SHA,
+            ledger=ledger,
+        )
+    assert ledger.lifecycle(boundary)["prediction"] is None
+    assert ledger.lifecycle(boundary)["events"] == []
+    ledger.close()
+
+
+def test_process_boundary_rejects_mutated_loaded_bundle(tmp_path, monkeypatch):
+    boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+    model_bundle = _verified_test_bundle(monkeypatch)
+    model_bundle.model_sha256["range_volatility"] = "0" * 64
+    ledger = ProspectiveLedger(tmp_path / "mutated-bundle.sqlite")
+    with pytest.raises(ValueError, match="loaded by load_official_models"):
+        process_boundary(
+            _snapshot(boundary),
+            boundary,
+            model_bundle,
+            implementation_git_sha=IMPLEMENTATION_SHA,
+            ledger=ledger,
+        )
+    assert ledger.lifecycle(boundary)["prediction"] is None
     ledger.close()
