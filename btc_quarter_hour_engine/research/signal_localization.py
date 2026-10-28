@@ -49,6 +49,9 @@ def _validate_input(features: pd.DataFrame) -> None:
     missing = required.difference(features.columns)
     if missing:
         raise ValueError(f"Missing localization input columns: {sorted(missing)}")
+    timestamps = pd.to_datetime(features["timestamp"], utc=True, errors="raise")
+    if timestamps.duplicated().any():
+        raise ValueError("Source timestamps must be unique across the complete input frame")
     for column in ("trainable", "feature_ready", "target_eligible"):
         if (
             not pd.api.types.is_bool_dtype(features[column])
@@ -64,6 +67,15 @@ def _validate_input(features: pd.DataFrame) -> None:
         values = pd.to_datetime(trainable[column], utc=True, errors="raise")
         if values.isna().any():
             raise ValueError(f"Trainable {column} contains missing timestamps")
+    label_available = pd.to_datetime(
+        trainable["label_available_time"], utc=True, errors="raise"
+    )
+    target_boundary = timestamps.loc[features["trainable"]] + pd.Timedelta(minutes=15)
+    if (label_available < target_boundary).any():
+        raise ValueError(
+            "Trainable label_available_time must be at least timestamp + 15 minutes "
+            "(the target boundary)"
+        )
     returns = pd.to_numeric(trainable["target_log_return_15m"], errors="raise")
     if not np.isfinite(returns.to_numpy(dtype=float)).all():
         raise ValueError("Trainable target returns must be finite")

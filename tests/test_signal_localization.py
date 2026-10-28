@@ -196,6 +196,44 @@ def test_chronological_folds_and_strict_embargo_unchanged():
         assert set(at_cutoff).isdisjoint(right["train_idx"])
 
 
+def test_label_available_before_target_boundary_rejected():
+    source = _causal_features()
+    source.loc[0, "label_available_time"] = (
+        source.loc[0, "timestamp"] + pd.Timedelta(minutes=15)
+        - pd.Timedelta(nanoseconds=1)
+    )
+    with pytest.raises(ValueError, match="label_available_time.*timestamp \\+ 15 minutes"):
+        signal_localization._validate_input(source)
+
+
+def test_delayed_label_allowed_and_strict_training_embargo_preserved():
+    source = _causal_features()
+    first_test_start = source["timestamp"].min() + pd.Timedelta(hours=72)
+    source.loc[0, "label_available_time"] = first_test_start
+    signal_localization._validate_input(source)
+    frame, _, _ = prepare_research_frame(source, "bbo-causal-v2")
+    folds = build_exploratory_folds(frame, localization_config())
+    assert 0 not in folds[0]["train_idx"]
+    assert 0 in folds[1]["train_idx"]
+    for fold in folds:
+        assert (
+            frame.iloc[fold["train_idx"]]["label_available_time"].max()
+            < fold["test_start"]
+        )
+
+
+@pytest.mark.parametrize("both_excluded", [False, True])
+def test_duplicate_source_timestamp_with_excluded_row_rejected(both_excluded):
+    source = _causal_features()
+    source.loc[1, "timestamp"] = source.loc[0, "timestamp"]
+    source.loc[1, ["trainable", "feature_ready", "target_eligible"]] = False
+    source.loc[1, "asof_spread_bps"] = np.inf
+    if both_excluded:
+        source.loc[0, ["trainable", "feature_ready", "target_eligible"]] = False
+    with pytest.raises(ValueError, match="timestamps must be unique.*complete input"):
+        run_signal_localization(source)
+
+
 def test_integration_full_reference_is_original_benchmark(experiment):
     source, (metadata, predictions, metrics, per_fold) = experiment
     reference_metadata, original = run_exploratory_walk_forward(

@@ -80,6 +80,15 @@ predictors must be finite even if a particular ablation would omit them.
 Missing columns, duplicate input columns/timestamps, nonbinary trainable targets,
 missing trainable times, invalid eligibility flags and nonfinite trainable
 predictors fail closed rather than changing the comparison population.
+Source timestamps must be unique across the complete input frame, including
+nontrainable observations; duplicates are rejected even when one or both rows
+would be excluded. Nonfinite feature values on nontrainable observations remain
+allowed.
+
+Every trainable row must satisfy
+`label_available_time >= timestamp + pd.Timedelta(minutes=15)`: a label cannot
+be available before its next-quarter-hour target boundary. Delayed labels are
+allowed, but remain subject to the strict training embargo below.
 
 The existing chronological expanding splitter creates folds once: initial
 training 72 hours, test 12 hours, step 12 hours. It retains its existing handling
