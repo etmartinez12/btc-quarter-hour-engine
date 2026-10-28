@@ -1,0 +1,3 @@
+research_artifacts/2026-10-28-v2-signal-localization/*.csv text eol=lf
+research_artifacts/2026-10-28-v2-signal-localization/*.json text eol=lf
+research_artifacts/2026-10-28-v2-signal-localization/*.parquet binary

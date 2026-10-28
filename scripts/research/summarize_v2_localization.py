@@ -11,12 +11,19 @@ import pandas as pd
 repo = Path(__file__).resolve().parents[2]
 root = repo / "research_artifacts" / "2026-10-28-v2-signal-localization"
 
-manifest = json.loads((root / "manifest.json").read_text())
-
 def require(condition, message):
     if not condition:
         raise ValueError(message)
 
+
+manifest_bytes = (root / "manifest.json").read_bytes()
+manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+require(
+    manifest_sha256
+    == "07f80e66e2c88af484d19b0197ac989dbfe4d53a2029b81443f88b2f1075d453",
+    "Manifest checksum mismatch: manifest.json",
+)
+manifest = json.loads(manifest_bytes)
 
 require(isinstance(manifest, dict), "Invalid manifest: expected a JSON object.")
 require(
@@ -55,8 +62,6 @@ require(
 
 for name, expected in output_checksums.items():
     artifact_bytes = (root / name).read_bytes()
-    if name.endswith((".csv", ".json")):
-        artifact_bytes = artifact_bytes.replace(b"\r\n", b"\n")
     actual = hashlib.sha256(artifact_bytes).hexdigest()
     if actual != expected:
         raise ValueError(f"Artifact checksum mismatch: {name}")
