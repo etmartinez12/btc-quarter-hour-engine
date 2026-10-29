@@ -16,6 +16,14 @@ V2 ExtraTrees SHA256
 `c8d2bf2289faf567896d1f514a3daf5d8c17d7a8b6cacddc1a700cb517d47fed`.
 Development-only freezes and any changed manifest or model artifact are
 rejected before inference. No model is fit, selected, or modified here.
+Official verification status is assigned only inside this loader path; there is
+no public bundle-registration API. Before official inference and persistence,
+the in-process verified status and a fingerprint of the bundle declarations
+and serialized fitted-model state are rechecked. The ledger also reruns both
+verified models against the recorded ordered 91-feature vector and rejects
+probabilities or classes that differ from that inference. This provenance
+check assumes the Python process and its loaded code are trusted: it is not a
+sandbox against hostile code with arbitrary introspection or memory access.
 
 ## Causal source contract and unresolved integration
 

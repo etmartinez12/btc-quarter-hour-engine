@@ -346,8 +346,6 @@ def test_source_watermarks_are_irreversible_across_restarts(tmp_path):
             ingest_time_utc=watermark,
             raw_bytes=source.frames[1].raw_bytes,
         )
-        assert len(earlier_snapshot.frames) == 1
-        assert len(restarted.snapshot(source.session_id).frames) == 2
     accepted_time = watermark + timedelta(seconds=1)
     restarted.append_frame(
         session_id=source.session_id,
@@ -356,6 +354,8 @@ def test_source_watermarks_are_irreversible_across_restarts(tmp_path):
         ingest_time_utc=accepted_time,
         raw_bytes=source.frames[1].raw_bytes,
     )
+    assert len(earlier_snapshot.frames) == 1
+    assert len(restarted.snapshot(source.session_id).frames) == 2
     with pytest.raises(ValueError, match="regressed"):
         restarted.append_frame(
             session_id=source.session_id,
@@ -520,6 +520,37 @@ def test_official_loader_pins_trusted_manifest_and_rejects_development_status(mo
             },
             manifest_sha256=TRUSTED_MANIFEST_SHA256,
             manifest={"status": "development_only_nonofficial"},
+        )
+
+
+def test_directly_constructed_bundle_cannot_become_official():
+    forged = _bundle()
+    vector = build_causal_feature_vector(_snapshot(), BOUNDARY)
+    assert not inference.is_verified_official_bundle(forged)
+    assert not hasattr(inference, "register_official_bundle")
+    with pytest.raises(ValueError, match="load_official_models"):
+        infer_causal_prediction(
+            vector,
+            forged,
+            implementation_git_sha=IMPLEMENTATION_SHA,
+            generated_at_utc=BOUNDARY + timedelta(seconds=1),
+            require_official_bundle=True,
+        )
+
+
+def test_verified_model_mutation_invalidates_official_bundle(monkeypatch):
+    bundle = _verified_test_bundle(monkeypatch)
+    vector = build_causal_feature_vector(_snapshot(), BOUNDARY)
+    assert inference.is_verified_official_bundle(bundle)
+    bundle.models["range_volatility"].probability = 0.99
+    assert not inference.is_verified_official_bundle(bundle)
+    with pytest.raises(ValueError, match="load_official_models"):
+        infer_causal_prediction(
+            vector,
+            bundle,
+            implementation_git_sha=IMPLEMENTATION_SHA,
+            generated_at_utc=BOUNDARY + timedelta(seconds=1),
+            require_official_bundle=True,
         )
 
 

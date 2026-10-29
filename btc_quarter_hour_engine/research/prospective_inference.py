@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import math
+import pickle
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from weakref import WeakKeyDictionary
 
 import pandas as pd
 
@@ -33,16 +36,48 @@ from btc_quarter_hour_engine.research.prospective_ledger import (
     ClockHealthError,
     ProspectiveLedger,
 )
-from btc_quarter_hour_engine.research.prospective_model_provenance import (
-    is_verified_official_bundle,
-    register_official_bundle,
-)
 
 
 _EXPECTED_MODEL_HASHES = {
     "range_volatility": RANGE_MODEL_SHA256,
     "full_v2": FULL_V2_MODEL_SHA256,
 }
+_official_bundle_state: WeakKeyDictionary[object, tuple[str, ...]] = WeakKeyDictionary()
+
+
+def _model_state_fingerprint(model: Any) -> str:
+    try:
+        serialized = pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        raise ValueError("Frozen model state cannot be fingerprinted") from exc
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _bundle_state_fingerprint(model_bundle: Any) -> tuple[str, ...]:
+    model_digests = tuple(
+        _model_state_fingerprint(model_bundle.models[name])
+        for name in ("range_volatility", "full_v2")
+    )
+    declared_digests = tuple(
+        model_bundle.model_sha256[name]
+        for name in ("range_volatility", "full_v2")
+    )
+    return (
+        str(model_bundle.manifest_sha256),
+        str(model_bundle.manifest.get("status")),
+        *declared_digests,
+        *model_digests,
+    )
+
+
+def is_verified_official_bundle(model_bundle: object) -> bool:
+    try:
+        expected = _official_bundle_state.get(model_bundle)
+        if expected is None:
+            return False
+        return _bundle_state_fingerprint(model_bundle) == expected
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _utc(value: datetime, *, field: str) -> datetime:
@@ -75,6 +110,55 @@ class FrozenModelBundle:
             raise ValueError("Exactly the frozen candidate and control models are required")
 
 
+def _verify_recorded_model_outputs(
+    evidence: dict[str, Any],
+    model_bundle: Any,
+) -> None:
+    if not is_verified_official_bundle(model_bundle):
+        raise ValueError(
+            "Official prediction requires an unmodified bundle loaded by load_official_models()"
+        )
+    if (
+        evidence.get("manifest_sha256") != model_bundle.manifest_sha256
+        or evidence.get("candidate_model_sha256")
+        != model_bundle.model_sha256["range_volatility"]
+        or evidence.get("control_model_sha256")
+        != model_bundle.model_sha256["full_v2"]
+    ):
+        raise ValueError("Prediction evidence model provenance differs from verified bundle")
+    predictors = frozen_predictors()
+    vector = evidence.get("feature_vector")
+    if not isinstance(vector, dict) or tuple(vector) != predictors["full_v2"]:
+        raise ValueError("Recorded prediction feature vector is not the frozen ordered vector")
+    matrix = pd.DataFrame(
+        [[float(vector[name]) for name in predictors["full_v2"]]],
+        columns=predictors["full_v2"],
+    )
+    for model_name, evidence_prefix, predictor_names in (
+        ("range_volatility", "candidate", predictors["range_volatility"]),
+        ("full_v2", "control", predictors["full_v2"]),
+    ):
+        probabilities = verified_probabilities(
+            model_bundle.models[model_name],
+            matrix.loc[:, list(predictor_names)],
+            predictor_names,
+        )
+        probability_up = float(probabilities[0, 1])
+        prediction = int(probability_up >= PROBABILITY_THRESHOLD)
+        recorded_probability = float(evidence[f"{evidence_prefix}_probability"])
+        recorded_prediction = evidence[f"{evidence_prefix}_prediction"]
+        if not math.isclose(
+            recorded_probability, probability_up, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                f"Recorded {evidence_prefix} probability does not match verified model inference"
+            )
+        if type(recorded_prediction) is not int or recorded_prediction != prediction:
+            raise ValueError(
+                f"Recorded {evidence_prefix} prediction does not match verified model inference"
+            )
+
+
 def load_official_models(directory: str | Path) -> FrozenModelBundle:
     """Load only the independently pinned official artifact set."""
     models, manifest = load_frozen_models(
@@ -96,7 +180,7 @@ def load_official_models(directory: str | Path) -> FrozenModelBundle:
         manifest_sha256=TRUSTED_MANIFEST_SHA256,
         manifest=manifest,
     )
-    register_official_bundle(bundle)
+    _official_bundle_state[bundle] = _bundle_state_fingerprint(bundle)
     return bundle
 
 
@@ -107,11 +191,16 @@ def infer_causal_prediction(
     implementation_git_sha: str,
     generated_at_utc: datetime | None = None,
     generation_clock: Callable[[], datetime] | None = None,
+    require_official_bundle: bool = False,
 ) -> dict[str, Any]:
     """Create immutable prediction evidence without reading any target or label."""
     implementation_sha = _require_git_sha(implementation_git_sha)
     if generated_at_utc is not None and generation_clock is not None:
         raise ValueError("Provide either an explicit dry-run timestamp or a generation clock")
+    if require_official_bundle and not is_verified_official_bundle(model_bundle):
+        raise ValueError(
+            "Official inference requires an unmodified bundle loaded by load_official_models()"
+        )
     boundary = _utc(features.boundary_utc, field="prediction boundary")
     target = _utc(features.target_utc, field="target boundary")
     if target != boundary + pd.Timedelta(minutes=15):
@@ -259,6 +348,7 @@ def process_boundary(
             model_bundle,
             implementation_git_sha=implementation_git_sha,
             generation_clock=ledger.clock_health.now,
+            require_official_bundle=True,
         )
     except ClockHealthError as exc:
         observed = ledger.clock_health.observed_wall_utc

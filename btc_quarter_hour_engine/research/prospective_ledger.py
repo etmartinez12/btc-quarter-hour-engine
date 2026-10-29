@@ -21,11 +21,6 @@ from btc_quarter_hour_engine.research.prospective_contract import (
 from btc_quarter_hour_engine.research.prospective_source import (
     compute_feature_fingerprint,
 )
-from btc_quarter_hour_engine.research.prospective_model_provenance import (
-    is_verified_official_bundle,
-)
-
-
 WINDOW_START = datetime(2026, 11, 15, tzinfo=timezone.utc)
 WINDOW_END_EXCLUSIVE = datetime(2026, 12, 15, tzinfo=timezone.utc)
 PREDICTION_DEADLINE_SECONDS = 60
@@ -421,16 +416,24 @@ class ProspectiveLedger:
         *,
         model_bundle: object | None = None,
     ) -> dict[str, Any]:
-        if not is_verified_official_bundle(model_bundle):
-            raise ValueError(
-                "Prediction persistence requires a bundle loaded by load_official_models()"
-            )
-        return self._append_prediction_evidence(evidence)
+        return self._append_prediction_evidence(evidence, model_bundle=model_bundle)
 
     def _append_prediction_evidence(
         self,
         evidence: Mapping[str, Any],
+        *,
+        model_bundle: object | None,
     ) -> dict[str, Any]:
+        from btc_quarter_hour_engine.research.prospective_inference import (
+            _verify_recorded_model_outputs,
+            is_verified_official_bundle,
+        )
+
+        if not is_verified_official_bundle(model_bundle):
+            raise ValueError(
+                "Prediction persistence requires a bundle loaded by load_official_models()"
+            )
+        _verify_recorded_model_outputs(dict(evidence), model_bundle)
         boundary = _utc(evidence["boundary_utc"], field="prediction boundary")
         target = self._scheduled_target(boundary)
         if not _is_boundary(boundary):
