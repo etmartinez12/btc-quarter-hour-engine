@@ -32,6 +32,11 @@ from btc_quarter_hour_engine.research.prospective_source import (
     build_causal_feature_vector,
     compute_feature_fingerprint,
 )
+from btc_quarter_hour_engine.research.prospective_replay import (
+    FeatureReplayCheckpoint,
+    IncrementalRawFrameSnapshot,
+    build_incremental_causal_feature_vector,
+)
 from btc_quarter_hour_engine.research.prospective_ledger import (
     ClockHealthError,
     ProspectiveLedger,
@@ -342,6 +347,75 @@ def process_boundary(
             details={"source_session_id": snapshot.session_id},
         )
         raise
+    return _persist_causal_features(
+        features,
+        boundary,
+        model_bundle,
+        implementation_git_sha=implementation_git_sha,
+        ledger=ledger,
+    )
+
+
+def process_incremental_boundary(
+    tail: IncrementalRawFrameSnapshot,
+    boundary_utc: datetime,
+    checkpoint: FeatureReplayCheckpoint,
+    model_bundle: FrozenModelBundle,
+    *,
+    implementation_git_sha: str,
+    ledger: ProspectiveLedger,
+) -> dict[str, Any]:
+    """Run one boundary from a verified checkpoint and bounded raw tail."""
+    boundary = _utc(boundary_utc, field="prediction boundary")
+    if not is_verified_official_bundle(model_bundle):
+        raise ValueError(
+            "Official prediction persistence requires a bundle loaded by load_official_models()"
+        )
+    try:
+        features = build_incremental_causal_feature_vector(
+            tail, boundary, checkpoint
+        )
+    except CausalInputError as exc:
+        recorded_at = ledger.clock_health.now()
+        ledger.append_attempt(
+            boundary,
+            event_type="missing_data",
+            recorded_at_utc=recorded_at,
+            reason=exc.reason,
+            details={
+                "data_ready": exc.data_ready,
+                "feature_ready": exc.feature_ready,
+                "source_session_id": exc.source_session_id,
+            },
+        )
+        raise
+    except Exception as exc:
+        recorded_at = ledger.clock_health.now()
+        ledger.append_attempt(
+            boundary,
+            event_type="inference_failed",
+            recorded_at_utc=recorded_at,
+            reason=f"feature_generation_failed:{type(exc).__name__}:{exc}",
+            details={"source_session_id": tail.session_id},
+        )
+        raise
+    return _persist_causal_features(
+        features,
+        boundary,
+        model_bundle,
+        implementation_git_sha=implementation_git_sha,
+        ledger=ledger,
+    )
+
+
+def _persist_causal_features(
+    features: CausalFeatureVector,
+    boundary: datetime,
+    model_bundle: FrozenModelBundle,
+    *,
+    implementation_git_sha: str,
+    ledger: ProspectiveLedger,
+) -> dict[str, Any]:
     try:
         evidence = infer_causal_prediction(
             features,
