@@ -79,8 +79,10 @@ the complete book, connection epoch and accepted sequence, prior midpoint,
 counters, and exactly the required 240-minute bucket history. Each checkpoint
 binds the session, last raw frame, ingest/event cutoffs, frozen V2 contract
 versions, and raw-prefix commitment. Its integrity digest is verified before
-replay; checkpoint files are exclusively created and cannot replace prior
-checkpoint evidence.
+replay at both public checkpoint APIs, even for caller-constructed objects.
+Checkpoint files use write-once atomic linking, file fsync before publication,
+and parent-directory fsync afterward on supported POSIX filesystems. Unsupported
+platforms fail closed. The parent must already be durably provisioned.
 
 `ProspectiveRawFrameJournal.tail_snapshot()` verifies the checkpoint's prefix
 commitment and reads only contiguous, hash-verified records after that frame
@@ -97,9 +99,24 @@ serialization distinction must be preserved and explicitly reviewed in any
 later ledger integration. The ledger schema and immutable evidence rules have
 not been changed.
 
-The bounded bootstrap API is
-`ProspectiveRawFrameJournal.snapshot_through()`: it reads only through a
-boundary and rejects prefixes above the configured 100,000-frame hard limit.
+Small bootstrap snapshots via `snapshot_through()` retain their 100,000-frame
+hard limit. Arbitrary initial history uses `warmup_chunk()` and
+`accumulate_feature_replay_warmup()` with a separately serialized schema-2
+`FeatureReplayWarmup`. Each chunk is source-chain verified, retains at most
+17 buckets, and is persisted under a unique name before the next chunk.
+Restart resumes after the verified prefix; at most an uncommitted chunk is
+repeated. `finish_feature_replay_warmup()` alone promotes an exhausted,
+cutoff-bound source prefix with the unchanged exact 240-minute readiness.
+Neither public prediction API accepts warm-up or incomplete tails.
+
+Normal journal initialization reads an immutable prefix-schema marker, not
+historical row counts. Marker-less old journals fail closed unless explicitly
+opened offline with `migrate_legacy_prefixes=True`; that one-time historical
+scan validates and atomically commits the migration. It is not normal recovery.
+After a publication failure that left a destination, `load_durable()` validates
+and resynchronizes the file and parent without overwriting evidence; ordinary
+`load()` makes no durability attestation. Orphan `.tmp` files are not selected.
+
 Normal prediction recovery requires a checkpoint strictly before T; if one is
 missing or a bootstrap/tail cap is exceeded, fail closed rather than replay an
 unbounded archive or reconstruct a missed timely prediction.

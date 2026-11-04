@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,7 @@ from btc_quarter_hour_engine.acquisition.coinbase_websocket import (
 )
 from btc_quarter_hour_engine.research.features import (
     _IngestFeatureReplay,
+    _ceil_quarter_hour,
     _feature_buckets_frame,
     _window_features,
 )
@@ -94,6 +95,8 @@ class FeatureReplayCheckpoint:
     """Versioned immutable serialized replay state and its verified source anchor."""
 
     serialized: str
+    _schema: ClassVar[int] = CHECKPOINT_SCHEMA_VERSION
+    _warmup: ClassVar[bool] = False
 
     @classmethod
     def create(
@@ -104,14 +107,14 @@ class FeatureReplayCheckpoint:
         cutoff_utc: datetime,
         last_frame_index: int,
         last_ingest_time_utc: datetime,
-        last_event_time_utc: datetime,
+        last_event_time_utc: datetime | None,
         prefix_commitment_sha256: str,
         replay: _IngestFeatureReplay,
     ) -> "FeatureReplayCheckpoint":
-        if replay.connection_id is None or replay.last_envelope_sequence_num is None:
+        if replay.connection_id is None or (not cls._warmup and replay.last_envelope_sequence_num is None):
             raise ValueError("A checkpoint requires an established connection and sequence")
         payload: dict[str, Any] = {
-            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "schema_version": cls._schema,
             "session_id": session_id,
             "session_started_at_utc": _iso(session_started_at_utc),
             "connection_id": replay.connection_id,
@@ -119,7 +122,7 @@ class FeatureReplayCheckpoint:
             "last_accepted_sequence_num": replay.last_envelope_sequence_num,
             "cutoff_utc": _iso(cutoff_utc),
             "last_ingest_time_utc": _iso(last_ingest_time_utc),
-            "last_event_time_utc": _iso(last_event_time_utc),
+            "last_event_time_utc": _iso(last_event_time_utc) if last_event_time_utc is not None else None,
             "prefix_commitment_sha256": prefix_commitment_sha256,
             "product_id": replay.product_id,
             "feature_contract": V2_PREDICTOR_CONTRACT_VERSION,
@@ -127,7 +130,7 @@ class FeatureReplayCheckpoint:
             "replay_state": replay.to_checkpoint(),
         }
         payload["integrity_sha256"] = _checkpoint_digest(payload)
-        return cls(_canonical_json(payload).decode("utf-8"))
+        return cls.from_dict(payload)
 
     @classmethod
     def from_dict(cls, value: Any) -> "FeatureReplayCheckpoint":
@@ -152,7 +155,7 @@ class FeatureReplayCheckpoint:
         }
         if set(value) != expected:
             raise ValueError("Malformed checkpoint envelope keys")
-        if type(value["schema_version"]) is not int or value["schema_version"] != CHECKPOINT_SCHEMA_VERSION:
+        if type(value["schema_version"]) is not int or value["schema_version"] != cls._schema:
             raise ValueError(f"Unsupported checkpoint schema version: {value['schema_version']!r}")
         if value["integrity_sha256"] != _checkpoint_digest(value):
             raise ValueError("Checkpoint integrity digest mismatch")
@@ -164,6 +167,8 @@ class FeatureReplayCheckpoint:
         if value["feature_family_contract"] != FAMILY_CONTRACT_VERSION:
             raise ValueError("Checkpoint feature-family contract mismatch")
         for field in ("last_frame_index", "last_accepted_sequence_num"):
+            if cls._warmup and field == "last_accepted_sequence_num" and value[field] is None:
+                continue
             if type(value[field]) is not int or value[field] < 0:
                 raise ValueError(f"Checkpoint {field} must be a nonnegative integer")
         for field in (
@@ -182,6 +187,8 @@ class FeatureReplayCheckpoint:
             "last_ingest_time_utc",
             "last_event_time_utc",
         ):
+            if cls._warmup and field == "last_event_time_utc" and value[field] is None:
+                continue
             if not isinstance(value[field], str):
                 raise ValueError(f"Checkpoint {field} must be an ISO-8601 string")
             try:
@@ -193,16 +200,28 @@ class FeatureReplayCheckpoint:
                 raise ValueError(f"Checkpoint {field} is malformed") from exc
         if not _is_boundary(parsed_times["cutoff_utc"]):
             raise ValueError("Checkpoint cutoff is not an exact quarter-hour")
-        if parsed_times["session_started_at_utc"] > parsed_times["cutoff_utc"] - _BUCKET_HISTORY:
+        if not cls._warmup and parsed_times["session_started_at_utc"] > parsed_times["cutoff_utc"] - _BUCKET_HISTORY:
             raise ValueError("Checkpoint session does not cover 240-minute history")
+        if parsed_times["last_ingest_time_utc"] < parsed_times["session_started_at_utc"]:
+            raise ValueError("Checkpoint source cutoffs precede session start")
         if (
             parsed_times["last_ingest_time_utc"] > parsed_times["cutoff_utc"]
-            or parsed_times["last_event_time_utc"] > parsed_times["cutoff_utc"]
+            or (
+                "last_event_time_utc" in parsed_times
+                and parsed_times["last_event_time_utc"] > parsed_times["cutoff_utc"]
+            )
         ):
             raise ValueError("Checkpoint source cutoffs exceed checkpoint boundary")
         # Reuse the repository's strict serializer parser for every nested order-book,
         # counter, and 240-minute bucket field before accepting a persisted checkpoint.
-        replay = _IngestFeatureReplay.from_checkpoint(value["replay_state"])
+        state = value["replay_state"]
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("buckets"), list)
+            or not 1 <= len(state["buckets"]) <= 17
+        ):
+            raise ValueError("Checkpoint exceeds bounded bucket history")
+        replay = _IngestFeatureReplay.from_checkpoint(state)
         if replay.product_id != value["product_id"] or replay.product_id != "BTC-USD":
             raise ValueError("Checkpoint product identity mismatch")
         if (
@@ -225,9 +244,15 @@ class FeatureReplayCheckpoint:
                 tz="UTC",
             )
         }
-        if set(replay.buckets) != expected_buckets:
+        if cls._warmup:
+            latest = pd.Timestamp(parsed_times["last_ingest_time_utc"]).ceil("15min")
+            retained = set(pd.date_range(end=latest, periods=17, freq="15min").to_pydatetime())
+            if not replay.buckets or not set(replay.buckets) <= retained:
+                raise ValueError("Warm-up buckets exceed bounded history")
+        elif set(replay.buckets) != expected_buckets:
             raise ValueError("Checkpoint does not contain exactly 240-minute bucket history")
-        _validate_checkpoint_book(replay)
+        if not cls._warmup:
+            _validate_checkpoint_book(replay)
         return cls(_canonical_json(value).decode("utf-8"))
 
     @property
@@ -260,9 +285,22 @@ class FeatureReplayCheckpoint:
         return cls.from_dict(value)
 
     def write_once(self, path: str | Path) -> None:
-        """Publish atomically without replacing an existing checkpoint."""
+        """Publish durably, write-once. Unsupported directory sync fails closed.
+
+        A post-link failure may leave a complete but unacknowledged destination.
+        Never remove or overwrite it: load and retry this exact content instead.
+        """
+        type(self).from_dict(self.data)
         destination = Path(path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        # Require a provisioned directory: creating ancestors here would also
+        # require syncing every ancestor before claiming durable publication.
+        directory_fd = _open_durable_directory(destination.parent)
+        try:
+            self._publish(destination, directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _publish(self, destination: Path, directory_fd: int) -> None:
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
         )
@@ -274,8 +312,44 @@ class FeatureReplayCheckpoint:
                 os.fsync(stream.fileno())
             # Hard-link creation is atomic and fails rather than overwriting.
             os.link(temporary, destination)
+            os.fsync(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def load_durable(cls, path: str | Path) -> "FeatureReplayCheckpoint":
+        """Recover a complete but unacknowledged publication without replacing it."""
+        destination = Path(path)
+        directory_fd = _open_durable_directory(destination.parent)
+        try:
+            with destination.open("rb") as stream:
+                checkpoint = cls.from_dict(json.loads(stream.read()))
+                os.fsync(stream.fileno())
+            os.fsync(directory_fd)
+            return checkpoint
+        finally:
+            os.close(directory_fd)
+
+
+def _open_durable_directory(path: Path) -> int:
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("Durable checkpoint publication requires POSIX directory fsync")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # Probe before creating any file, not just after publication.
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureReplayWarmup(FeatureReplayCheckpoint):
+    """Restartable accumulation only; schema 2 is never prediction-ready."""
+
+    _schema: ClassVar[int] = 2
+    _warmup: ClassVar[bool] = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +364,8 @@ class IncrementalRawFrameSnapshot:
     prefix_commitment_sha256: str
     frames: tuple[RawFrameRecord, ...]
     frame_commitments: tuple[tuple[int, str], ...] = ()
+    has_more: bool = False
+    through_boundary_utc: datetime | None = None
 
 
 def _validate_checkpoint_book(replay: _IngestFeatureReplay) -> None:
@@ -361,6 +437,7 @@ def _replay_frames(
             frame_index=frame.frame_index,
             ingest_time_utc=ingest,
         )
+        _trim_replay_buckets(replay, ingest)
         if replay.malformed_frames or replay.sequence_gaps or replay.stale_frames:
             raise CausalInputError("raw_frame_replay_integrity_failure", source_session_id=session_id)
         expected_index += 1
@@ -437,6 +514,111 @@ def create_feature_replay_checkpoint(
         prefix_commitment_sha256=commitment,
         replay=replay,
     )
+
+
+def _trim_replay_buckets(replay: _IngestFeatureReplay, ingest: datetime) -> None:
+    oldest = _ceil_quarter_hour(ingest) - _BUCKET_HISTORY
+    if replay.buckets and min(replay.buckets) < oldest:
+        replay.buckets = {key: value for key, value in replay.buckets.items() if key >= oldest}
+
+
+def accumulate_feature_replay_warmup(
+    chunk: IncrementalRawFrameSnapshot,
+    cutoff_utc: datetime,
+    warmup: FeatureReplayWarmup | None = None,
+) -> FeatureReplayWarmup:
+    """Verify at most one bounded chunk; persist the result before requesting more.
+
+    Unlike a ready checkpoint this state may cover less than four hours, or an
+    incomplete prefix through the target cutoff. Neither public prediction API
+    accepts its schema. Source journal chunks, not a self-reported state hash,
+    attest to the raw prefix.
+    """
+    cutoff = _utc(cutoff_utc, field="warm-up target cutoff")
+    started = _utc(chunk.session_started_at_utc, field="session start")
+    if not _is_boundary(cutoff):
+        raise ValueError("Warm-up target must be an exact UTC quarter-hour")
+    if chunk.through_boundary_utc != cutoff:
+        raise ValueError("Warm-up chunk completeness cutoff mismatch")
+    if chunk.clock_health_verified is not True or _utc(chunk.watermark_utc, field="watermark") < cutoff:
+        raise ValueError("Warm-up source completeness unverified")
+    if not isinstance(chunk.frames, tuple) or not 1 <= len(chunk.frames) <= MAX_CHECKPOINT_BOOTSTRAP_FRAMES:
+        raise ValueError("Warm-up requires a nonempty bounded immutable chunk")
+    if warmup is None:
+        replay = _IngestFeatureReplay("BTC-USD")
+        index, previous, latest = -1, None, None
+        commitment = initial_prefix_commitment(chunk.session_id, started)
+    else:
+        warmup = FeatureReplayWarmup.from_dict(warmup.data)
+        data = warmup.data
+        if chunk.session_id != data["session_id"] or _iso(started) != data["session_started_at_utc"]:
+            raise ValueError("Warm-up source session mismatch")
+        if cutoff != warmup.cutoff_utc:
+            raise ValueError("Warm-up target cannot change during accumulation")
+        replay = _IngestFeatureReplay.from_checkpoint(data["replay_state"])
+        index = warmup.last_frame_index
+        previous = datetime.fromisoformat(data["last_ingest_time_utc"].replace("Z", "+00:00"))
+        latest = (
+            datetime.fromisoformat(data["last_event_time_utc"].replace("Z", "+00:00"))
+            if data["last_event_time_utc"] is not None else None
+        )
+        commitment = warmup.prefix_commitment_sha256
+    if chunk.prefix_frame_index != index or chunk.prefix_commitment_sha256 != commitment:
+        raise ValueError("Warm-up source prefix commitment mismatch")
+    expected_commitments = tuple(
+        (frame.frame_index, chain)
+        for frame, chain in _tail_commitments(chunk.frames, commitment, index)
+    )
+    if chunk.frame_commitments != expected_commitments:
+        raise ValueError("Warm-up chunk commitment mismatch")
+    if any(_utc(frame.ingest_time_utc, field="ingest") > cutoff for frame in chunk.frames):
+        raise ValueError("Warm-up chunk exceeds target cutoff")
+    expected, previous, event, commitment, count, excluded = _replay_frames(
+        chunk.frames, session_id=chunk.session_id, expected_index=index + 1,
+        replay=replay, cutoff=cutoff, previous_ingest=previous,
+        prefix_commitment=commitment,
+    )
+    if excluded or count != len(chunk.frames):
+        raise ValueError("Warm-up chunk not fully causally replayed")
+    latest = max((value for value in (latest, event) if value is not None), default=None)
+    return FeatureReplayWarmup.create(
+        session_id=chunk.session_id, session_started_at_utc=started,
+        cutoff_utc=cutoff, last_frame_index=expected - 1,
+        last_ingest_time_utc=previous, last_event_time_utc=latest,
+        prefix_commitment_sha256=commitment, replay=replay,
+    )
+
+
+def finish_feature_replay_warmup(
+    tail: IncrementalRawFrameSnapshot,
+    warmup: FeatureReplayWarmup,
+) -> FeatureReplayCheckpoint:
+    """Promote only a source-verified exhausted prefix with exact ready history."""
+    warmup = FeatureReplayWarmup.from_dict(warmup.data)
+    if tail.through_boundary_utc != warmup.cutoff_utc:
+        raise ValueError("Warm-up completion cutoff mismatch")
+    if type(tail.has_more) is not bool or tail.has_more:
+        raise ValueError("Warm-up source prefix is incomplete")
+    if tail.frames:
+        warmup = accumulate_feature_replay_warmup(tail, warmup.cutoff_utc, warmup)
+    else:
+        data = warmup.data
+        if (
+            tail.session_id != warmup.session_id
+            or _iso(tail.session_started_at_utc) != data["session_started_at_utc"]
+            or tail.prefix_frame_index != warmup.last_frame_index
+            or tail.prefix_commitment_sha256 != warmup.prefix_commitment_sha256
+            or tail.clock_health_verified is not True
+            or tail.watermark_utc < warmup.cutoff_utc
+            or tail.frame_commitments != ()
+        ):
+            raise ValueError("Warm-up completion source mismatch")
+    data = warmup.data
+    data["schema_version"] = CHECKPOINT_SCHEMA_VERSION
+    data["integrity_sha256"] = _checkpoint_digest(data)
+    # Full ready-checkpoint validation enforces all 17 exact buckets and the
+    # original 240-minute session requirement; no partial state can self-promote.
+    return FeatureReplayCheckpoint.from_dict(data)
 
 
 def _make_vector(
@@ -542,7 +724,12 @@ def build_incremental_causal_feature_vector(
     boundary = _utc(boundary_utc, field="prediction boundary")
     if not _is_boundary(boundary):
         raise CausalInputError("prediction_boundary_not_exact_utc_quarter_hour", source_session_id=tail.session_id)
+    checkpoint = FeatureReplayCheckpoint.from_dict(checkpoint.data)
     data = checkpoint.data
+    if type(tail.has_more) is not bool or tail.has_more:
+        raise ValueError("Incomplete source tail")
+    if tail.through_boundary_utc is not None and tail.through_boundary_utc < boundary:
+        raise ValueError("Source tail does not cover prediction boundary")
     if tail.clock_health_verified is not True:
         raise CausalInputError("source_clock_health_unverified", source_session_id=tail.session_id)
     started = _utc(tail.session_started_at_utc, field="session start")
@@ -608,6 +795,7 @@ def build_incremental_causal_feature_vector(
                 source_session_id=tail.session_id,
             )
         replay.consume(raw=frame.raw_bytes, connection_id=frame.connection_id, frame_index=frame.frame_index, ingest_time_utc=ingest)
+        _trim_replay_buckets(replay, ingest)
         if replay.malformed_frames or replay.sequence_gaps or replay.stale_frames:
             raise CausalInputError("raw_frame_replay_integrity_failure", source_session_id=tail.session_id)
     if timings is not None:
@@ -653,7 +841,12 @@ def advance_feature_replay_checkpoint(
     cutoff = _utc(cutoff_utc, field="checkpoint cutoff")
     if not _is_boundary(cutoff):
         raise ValueError("Checkpoint cutoff must be an exact UTC quarter-hour")
+    checkpoint = FeatureReplayCheckpoint.from_dict(checkpoint.data)
     data = checkpoint.data
+    if type(tail.has_more) is not bool or tail.has_more:
+        raise ValueError("Incomplete source tail")
+    if tail.through_boundary_utc is not None and tail.through_boundary_utc < cutoff:
+        raise ValueError("Source tail does not cover checkpoint cutoff")
     started = _utc(tail.session_started_at_utc, field="session start")
     watermark = _utc(tail.watermark_utc, field="source watermark")
     if watermark < cutoff or tail.clock_health_verified is not True:
@@ -714,6 +907,7 @@ def advance_feature_replay_checkpoint(
         if commitment_by_index.get(frame.frame_index) != commitment:
             raise CausalInputError("raw_frame_tail_commitment_mismatch", source_session_id=tail.session_id)
         replay.consume(raw=frame.raw_bytes, connection_id=frame.connection_id, frame_index=frame.frame_index, ingest_time_utc=ingest)
+        _trim_replay_buckets(replay, ingest)
         if replay.malformed_frames or replay.sequence_gaps or replay.stale_frames:
             raise CausalInputError("raw_frame_replay_integrity_failure", source_session_id=tail.session_id)
         expected_index += 1
@@ -747,6 +941,7 @@ def tail_from_snapshot(
     checkpoint: FeatureReplayCheckpoint,
 ) -> IncrementalRawFrameSnapshot:
     """Offline verifier for tests/benchmarks; production should use journal.tail_snapshot()."""
+    checkpoint = FeatureReplayCheckpoint.from_dict(checkpoint.data)
     data = checkpoint.data
     if snapshot.session_id != data["session_id"]:
         raise CausalInputError("checkpoint_source_session_mismatch", source_session_id=snapshot.session_id)
