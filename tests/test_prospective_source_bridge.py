@@ -15,6 +15,7 @@ from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
     ClockHealthEvidence,
     NonBlockingSourcePublisher,
     ProspectiveSourceReceiver,
+    ProspectiveSourceSocketServer,
     _encode_event,
     _read_event,
     parse_chrony_tracking,
