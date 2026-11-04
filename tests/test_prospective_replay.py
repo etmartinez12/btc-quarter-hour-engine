@@ -16,6 +16,10 @@ from btc_quarter_hour_engine.research.prospective_source import (
     RawFrameSnapshot,
     build_causal_feature_vector,
 )
+from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
+    ClockHealthEvidence,
+    ProspectiveSourceReceiver,
+)
 from btc_quarter_hour_engine.research.model_freeze import OFFICIAL_STATUS, frozen_predictors
 from btc_quarter_hour_engine.research.prospective_contract import (
     FULL_V2_MODEL_SHA256,
@@ -232,6 +236,95 @@ def test_chunked_warmup_is_restartable_bounded_and_matches_full_replay(tmp_path,
     expected = build_causal_feature_vector(source, source.watermark_utc)
     assert actual.values == expected.values
     assert actual.feature_fingerprint == expected.feature_fingerprint
+
+
+def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_path):
+    source = _snapshot(end=BOUNDARY + timedelta(minutes=30))
+    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+    clock = ClockHealthEvidence(
+        observed_at_utc=BOUNDARY + timedelta(minutes=30, seconds=1),
+        synchronized=True,
+        verified=True,
+        offset_seconds=0.001,
+        reference_time_utc=BOUNDARY + timedelta(minutes=30),
+        leap_status="Normal",
+        source="synthetic test evidence",
+    )
+    receiver = ProspectiveSourceReceiver(journal, clock_health_provider=lambda: clock)
+    for frame in source.frames:
+        receiver.process(
+            {
+                "version": 1,
+                "kind": "frame",
+                "session_id": source.session_id,
+                "session_started_at_utc": source.session_started_at_utc.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "connection_id": frame.connection_id,
+                "reconnect_epoch": 0,
+                "connection_first_frame_index": 0,
+                "frame_index": frame.frame_index,
+                "ingest_time_utc": frame.ingest_time_utc.isoformat().replace("+00:00", "Z"),
+                "raw_sha256": frame.raw_frame_sha256,
+                "raw_length": len(frame.raw_bytes),
+                "producer_health": {"publisher_valid": True},
+            },
+            frame.raw_bytes,
+        )
+    receiver.process(
+        {
+            "version": 1,
+            "kind": "fence",
+            "session_id": source.session_id,
+            "watermark_utc": (BOUNDARY + timedelta(minutes=15)).isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "through_frame_index": source.frames[-1].frame_index,
+            "connection_id": source.frames[-1].connection_id,
+            "reconnect_epoch": 0,
+            "producer_health": {"publisher_valid": True},
+            "raw_length": 0,
+        },
+        b"",
+    )
+
+    warmup_chunk = journal.warmup_chunk(
+        source.session_id,
+        after_frame_index=-1,
+        expected_prefix_commitment_sha256=initial_prefix_commitment(
+            source.session_id, source.session_started_at_utc
+        ),
+        through_boundary_utc=BOUNDARY,
+    )
+    warmup = accumulate_feature_replay_warmup(warmup_chunk, BOUNDARY)
+    exhausted = journal.warmup_chunk(
+        source.session_id,
+        after_frame_index=warmup.last_frame_index,
+        expected_prefix_commitment_sha256=warmup.prefix_commitment_sha256,
+        through_boundary_utc=BOUNDARY,
+    )
+    finish_feature_replay_warmup(exhausted, warmup)
+
+    checkpoint = create_feature_replay_checkpoint(
+        journal.snapshot_through(source.session_id, boundary_utc=BOUNDARY), BOUNDARY
+    )
+    target_boundary = BOUNDARY + timedelta(minutes=15)
+    tail = journal.tail_snapshot(
+        source.session_id,
+        after_frame_index=checkpoint.last_frame_index,
+        expected_prefix_commitment_sha256=checkpoint.prefix_commitment_sha256,
+        through_boundary_utc=target_boundary,
+    )
+    incremental = build_incremental_causal_feature_vector(tail, target_boundary, checkpoint)
+    full_snapshot = journal.snapshot_through(source.session_id, boundary_utc=target_boundary)
+    full = build_causal_feature_vector(full_snapshot, target_boundary)
+
+    assert incremental.candidate_predictors == full.candidate_predictors
+    assert incremental.control_predictors == full.control_predictors
+    assert len(incremental.candidate_predictors) == 12
+    assert len(incremental.control_predictors) == 91
+    assert incremental.values == full.values
+    assert incremental.feature_fingerprint == full.feature_fingerprint
     journal.close()
 
 

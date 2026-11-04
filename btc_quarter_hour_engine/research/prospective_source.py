@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -194,6 +195,38 @@ class ProspectiveRawFrameJournal:
             CREATE TABLE IF NOT EXISTS source_prefix_schema (
                 version INTEGER PRIMARY KEY CHECK (version = 1)
             );
+            CREATE TABLE IF NOT EXISTS source_connections (
+                session_id TEXT NOT NULL REFERENCES source_sessions(session_id),
+                reconnect_epoch INTEGER NOT NULL CHECK (reconnect_epoch >= 0),
+                connection_id TEXT NOT NULL,
+                first_frame_index INTEGER NOT NULL CHECK (first_frame_index >= 0),
+                PRIMARY KEY (session_id, reconnect_epoch),
+                UNIQUE (session_id, connection_id)
+            );
+            CREATE TABLE IF NOT EXISTS source_fences (
+                session_id TEXT NOT NULL REFERENCES source_sessions(session_id),
+                watermark_utc TEXT NOT NULL,
+                through_frame_index INTEGER NOT NULL CHECK (through_frame_index >= 0),
+                connection_id TEXT NOT NULL,
+                reconnect_epoch INTEGER NOT NULL CHECK (reconnect_epoch >= 0),
+                clock_health_verified INTEGER NOT NULL CHECK (clock_health_verified IN (0, 1)),
+                clock_evidence_json TEXT NOT NULL,
+                clock_evidence_sha256 TEXT NOT NULL,
+                producer_health_json TEXT NOT NULL,
+                producer_health_sha256 TEXT NOT NULL,
+                PRIMARY KEY (session_id, watermark_utc)
+            );
+            CREATE TABLE IF NOT EXISTS source_frame_health (
+                session_id TEXT NOT NULL,
+                frame_index INTEGER NOT NULL,
+                connection_id TEXT NOT NULL,
+                reconnect_epoch INTEGER NOT NULL CHECK (reconnect_epoch >= 0),
+                producer_health_json TEXT NOT NULL,
+                producer_health_sha256 TEXT NOT NULL,
+                PRIMARY KEY (session_id, frame_index),
+                FOREIGN KEY (session_id, frame_index)
+                    REFERENCES source_frames(session_id, frame_index)
+            );
             """
         )
         for table in (
@@ -202,6 +235,9 @@ class ProspectiveRawFrameJournal:
             "source_watermarks",
             "source_prefix_commitments",
             "source_prefix_schema",
+            "source_connections",
+            "source_fences",
+            "source_frame_health",
         ):
             for operation in ("UPDATE", "DELETE"):
                 self._connection.execute(
@@ -333,6 +369,13 @@ class ProspectiveRawFrameJournal:
     def close(self) -> None:
         self._connection.close()
 
+    def session_started_at(self, session_id: str) -> datetime | None:
+        row = self._connection.execute(
+            "SELECT session_started_at_utc FROM source_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return _parse_utc(row["session_started_at_utc"]) if row is not None else None
+
     def start_session(self, session_id: str, started_at_utc: datetime) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("Source session ID must be nonempty")
@@ -344,6 +387,60 @@ class ProspectiveRawFrameJournal:
                 (session_id, _iso(started)),
             )
 
+    def register_connection_epoch(
+        self,
+        *,
+        session_id: str,
+        reconnect_epoch: int,
+        connection_id: str,
+        first_frame_index: int,
+    ) -> None:
+        if type(reconnect_epoch) is not int or reconnect_epoch < 0:
+            raise ValueError("Reconnect epoch must be a nonnegative integer")
+        if not isinstance(connection_id, str) or not connection_id:
+            raise ValueError("Connection ID must be nonempty")
+        if type(first_frame_index) is not int or first_frame_index < 0:
+            raise ValueError("First frame index must be a nonnegative integer")
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT 1 FROM source_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone() is None:
+                raise ValueError("Source session has not been registered")
+            current = self._connection.execute(
+                "SELECT reconnect_epoch, connection_id, first_frame_index "
+                "FROM source_connections WHERE session_id = ? "
+                "ORDER BY reconnect_epoch DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            existing = self._connection.execute(
+                "SELECT connection_id, first_frame_index FROM source_connections "
+                "WHERE session_id = ? AND reconnect_epoch = ?",
+                (session_id, reconnect_epoch),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["connection_id"] != connection_id
+                    or existing["first_frame_index"] != first_frame_index
+                    or current is None
+                    or current["reconnect_epoch"] != reconnect_epoch
+                ):
+                    raise ValueError("Reconnect epoch is stale or its identity changed")
+                return
+            expected_epoch = 0 if current is None else current["reconnect_epoch"] + 1
+            last_frame = self._connection.execute(
+                "SELECT MAX(frame_index) AS last_index FROM source_frames WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["last_index"]
+            expected_index = 0 if last_frame is None else last_frame + 1
+            if reconnect_epoch != expected_epoch or first_frame_index != expected_index:
+                raise ValueError("Reconnect epoch is not the next source connection")
+            self._connection.execute(
+                "INSERT INTO source_connections "
+                "(session_id, reconnect_epoch, connection_id, first_frame_index) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, reconnect_epoch, connection_id, first_frame_index),
+            )
+
     def append_frame(
         self,
         *,
@@ -352,6 +449,8 @@ class ProspectiveRawFrameJournal:
         frame_index: int,
         ingest_time_utc: datetime,
         raw_bytes: bytes,
+        reconnect_epoch: int | None = None,
+        producer_health: dict[str, Any] | None = None,
     ) -> str:
         from btc_quarter_hour_engine.research.prospective_replay import (
             advance_prefix_commitment,
@@ -368,6 +467,22 @@ class ProspectiveRawFrameJournal:
             raise TypeError("Raw frame must be immutable bytes")
         ingest = _utc(ingest_time_utc, field="frame ingest time")
         digest = hashlib.sha256(raw_bytes).hexdigest()
+        health_json: str | None = None
+        health_digest: str | None = None
+        if producer_health is not None:
+            if (
+                not isinstance(producer_health, dict)
+                or type(reconnect_epoch) is not int
+                or reconnect_epoch < 0
+            ):
+                raise ValueError("Producer health requires a registered reconnect epoch")
+            health_json = json.dumps(
+                producer_health,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            health_digest = hashlib.sha256(health_json.encode("utf-8")).hexdigest()
         with self._transaction():
             session = self._connection.execute(
                 "SELECT session_started_at_utc FROM source_sessions WHERE session_id = ?",
@@ -430,6 +545,28 @@ class ProspectiveRawFrameJournal:
                 "(session_id, frame_index, commitment_sha256) VALUES (?, ?, ?)",
                 (session_id, frame_index, commitment),
             )
+            if health_json is not None and health_digest is not None:
+                connection = self._connection.execute(
+                    "SELECT connection_id FROM source_connections "
+                    "WHERE session_id = ? AND reconnect_epoch = ?",
+                    (session_id, reconnect_epoch),
+                ).fetchone()
+                if connection is None or connection["connection_id"] != connection_id:
+                    raise ValueError("Producer health connection epoch is not registered")
+                self._connection.execute(
+                    "INSERT INTO source_frame_health "
+                    "(session_id, frame_index, connection_id, reconnect_epoch, "
+                    "producer_health_json, producer_health_sha256) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        frame_index,
+                        connection_id,
+                        reconnect_epoch,
+                        health_json,
+                        health_digest,
+                    ),
+                )
         return digest
 
     def advance_watermark(
@@ -476,6 +613,142 @@ class ProspectiveRawFrameJournal:
                 ) VALUES (?, ?, ?)
                 """,
                 (session_id, _iso(watermark), int(clock_health_verified)),
+            )
+
+    def advance_fenced_watermark(
+        self,
+        session_id: str,
+        watermark_utc: datetime,
+        *,
+        through_frame_index: int,
+        connection_id: str,
+        reconnect_epoch: int,
+        clock_health_verified: bool,
+        clock_evidence: dict[str, Any],
+        producer_health: dict[str, Any],
+    ) -> None:
+        """Commit a watermark only for a durable ordered producer fence.
+
+        The final frame is a post-cutoff witness. Its receive timestamp proves
+        that the producer had crossed the cutoff before enqueuing the fence;
+        all frames through that witness must already be durably appended.
+        """
+        if type(through_frame_index) is not int or through_frame_index < 0:
+            raise ValueError("Fence frame index must be a nonnegative integer")
+        if type(reconnect_epoch) is not int or reconnect_epoch < 0:
+            raise ValueError("Reconnect epoch must be a nonnegative integer")
+        if not isinstance(connection_id, str) or not connection_id:
+            raise ValueError("Fence connection ID must be nonempty")
+        if not isinstance(clock_health_verified, bool):
+            raise ValueError("Clock-health status must be an explicit boolean")
+        if not isinstance(clock_evidence, dict):
+            raise ValueError("Independent clock evidence is required")
+        if not isinstance(producer_health, dict) or producer_health.get("publisher_valid") is not True:
+            raise ValueError("Healthy ordered producer fence evidence is required")
+        if clock_evidence.get("verified") is not clock_health_verified:
+            raise ValueError("Clock evidence and verification status disagree")
+        if clock_evidence.get("synchronized") is not clock_health_verified:
+            raise ValueError("Clock synchronization evidence and status disagree")
+        if clock_health_verified:
+            offset = clock_evidence.get("offset_seconds")
+            if (
+                not isinstance(offset, (int, float))
+                or isinstance(offset, bool)
+                or not math.isfinite(offset)
+                or abs(offset) > 0.050
+                or clock_evidence.get("leap_status") != "Normal"
+                or not isinstance(clock_evidence.get("reference_time_utc"), str)
+                or not isinstance(clock_evidence.get("observed_at_utc"), str)
+            ):
+                raise ValueError("Verified clock evidence is incomplete or outside tolerance")
+        evidence_json = json.dumps(
+            clock_evidence, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        evidence_digest = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+        producer_health_json = json.dumps(
+            producer_health, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        producer_health_digest = hashlib.sha256(
+            producer_health_json.encode("utf-8")
+        ).hexdigest()
+        watermark = _utc(watermark_utc, field="source watermark")
+        with self._transaction():
+            session = self._connection.execute(
+                "SELECT session_started_at_utc FROM source_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError("Source session has not been registered")
+            if watermark < _parse_utc(session["session_started_at_utc"]):
+                raise ValueError("Source watermark precedes the session start")
+            frame = self._connection.execute(
+                "SELECT frame_index, connection_id, ingest_time_utc FROM source_frames "
+                "WHERE session_id = ? ORDER BY frame_index DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if (
+                frame is None
+                or frame["frame_index"] != through_frame_index
+                or frame["connection_id"] != connection_id
+                or _parse_utc(frame["ingest_time_utc"]) <= watermark
+            ):
+                raise ValueError("Fence lacks a committed post-cutoff witness frame")
+            epoch = self._connection.execute(
+                "SELECT first_frame_index FROM source_connections "
+                "WHERE session_id = ? AND reconnect_epoch = ? AND connection_id = ?",
+                (session_id, reconnect_epoch, connection_id),
+            ).fetchone()
+            if epoch is None or epoch["first_frame_index"] > through_frame_index:
+                raise ValueError("Fence reconnect epoch is not registered")
+            frame_health = self._connection.execute(
+                "SELECT connection_id, reconnect_epoch, producer_health_json, "
+                "producer_health_sha256 FROM source_frame_health "
+                "WHERE session_id = ? AND frame_index = ?",
+                (session_id, through_frame_index),
+            ).fetchone()
+            if (
+                frame_health is None
+                or frame_health["connection_id"] != connection_id
+                or frame_health["reconnect_epoch"] != reconnect_epoch
+                or hashlib.sha256(
+                    frame_health["producer_health_json"].encode("utf-8")
+                ).hexdigest()
+                != frame_health["producer_health_sha256"]
+                or json.loads(frame_health["producer_health_json"]).get(
+                    "publisher_valid"
+                )
+                is not True
+            ):
+                raise ValueError("Fence producer diagnostics are missing or inconsistent")
+            latest_watermark = self._connection.execute(
+                "SELECT MAX(watermark_utc) AS latest FROM source_watermarks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["latest"]
+            if latest_watermark is not None and watermark <= _parse_utc(latest_watermark):
+                raise ValueError("Source watermark is repeated or regressed")
+            self._connection.execute(
+                "INSERT INTO source_watermarks "
+                "(session_id, watermark_utc, clock_health_verified) VALUES (?, ?, ?)",
+                (session_id, _iso(watermark), int(clock_health_verified)),
+            )
+            self._connection.execute(
+                "INSERT INTO source_fences "
+                "(session_id, watermark_utc, through_frame_index, connection_id, "
+                "reconnect_epoch, clock_health_verified, clock_evidence_json, "
+                "clock_evidence_sha256, producer_health_json, producer_health_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    _iso(watermark),
+                    through_frame_index,
+                    connection_id,
+                    reconnect_epoch,
+                    int(clock_health_verified),
+                    evidence_json,
+                    evidence_digest,
+                    producer_health_json,
+                    producer_health_digest,
+                ),
             )
 
     def snapshot(self, session_id: str) -> RawFrameSnapshot:

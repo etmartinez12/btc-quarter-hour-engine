@@ -52,6 +52,7 @@ class CollectorResult:
     raw_frame_count: int
     level2_message_count: int
     heartbeat_message_count: int
+    source_metrics: dict[str, Any] | None = None
 
 
 def _observation_row(observation: Any) -> dict[str, Any]:
@@ -87,6 +88,8 @@ class WebSocketCollector:
     sleep_fn: Any = field(default=None)
     flush_row_threshold: int = 100_000
     flush_interval_seconds: float = 300.0
+    source_publisher: Any = None
+    source_publisher_factory: Any = None
     connection_count: int = field(default=0, init=False)
     reconnect_count: int = field(default=0, init=False)
     _frame_count: int = field(default=0, init=False)
@@ -97,6 +100,9 @@ class WebSocketCollector:
     _bbo_state_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
     _canonical_accumulator: CanonicalReplayAccumulator = field(init=False)
     _stop_fn: Any = field(default=None, init=False)
+    _source_connection_id: str | None = field(default=None, init=False)
+    _source_reconnect_epoch: int = field(default=-1, init=False)
+    _source_connection_first_frame_index: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if self.sleep_fn is None:
@@ -128,6 +134,45 @@ class WebSocketCollector:
             raw=frame.raw_bytes, message_type=message_type, connection_id=connection_id,
             sequence_num=sequence_num, ingest_time_utc=frame.received_at_utc,
         )
+        if self.source_publisher is not None:
+            if connection_id != self._source_connection_id:
+                self._source_reconnect_epoch += 1
+                self._source_connection_id = connection_id
+                self._source_connection_first_frame_index = frame_index
+            connections = self._connections()
+            connection = self.service.connection
+            health = {
+                "publisher_valid": bool(getattr(self.source_publisher, "valid", True)),
+                "heartbeat_healthy": self.service.heartbeat_is_healthy(),
+                "order_book_synchronized": self.service.order_book.state.name == "SYNCED",
+                "sequence_gap_count": sum(item.sequence_gap_count for item in connections),
+                "malformed_frame_count": sum(item.malformed_frame_count for item in connections),
+                "connection_id": connection_id,
+                "connection_last_sequence_num": (
+                    connection.last_envelope_sequence_num if connection is not None else None
+                ),
+            }
+            try:
+                published = self.source_publisher.publish_frame(
+                    connection_id=connection_id,
+                    reconnect_epoch=self._source_reconnect_epoch,
+                    frame_index=frame_index,
+                    raw_bytes=bytes(frame.raw_bytes),
+                    received_at_utc=frame.received_at_utc,
+                    producer_health=health,
+                )
+                if not published:
+                    self.service._record_diagnostic(
+                        kind="prospective_source_progress_invalid",
+                        reason=getattr(self.source_publisher, "failure_reason", None),
+                        frame_index=frame_index,
+                    )
+            except Exception as exc:
+                self.service._record_diagnostic(
+                    kind="prospective_source_publish_failed",
+                    reason=type(exc).__name__,
+                    frame_index=frame_index,
+                )
         self._canonical_accumulator.consume(
             frame.raw_bytes,
             connection_id,
@@ -145,6 +190,18 @@ class WebSocketCollector:
         stop_fn: Any = None,
     ) -> CollectorResult:
         started_at = self.service._utcnow()
+        if self.source_publisher_factory is not None:
+            if self.source_publisher is not None:
+                raise ValueError("Provide a source publisher or factory, not both")
+            try:
+                self.source_publisher = self.source_publisher_factory(
+                    self.service.session_id, started_at
+                )
+            except Exception as exc:
+                self.service._record_diagnostic(
+                    kind="prospective_source_init_failed",
+                    reason=type(exc).__name__,
+                )
         start_monotonic = self.service.monotonic_fn()
         self._checkpoint_started_monotonic = start_monotonic
         message_count = 0
@@ -199,6 +256,8 @@ class WebSocketCollector:
                 self.service.connection.disconnected_at_utc = self.service._utcnow()
                 self.service.connection.disconnect_reason = "unexpected_failure"
             self.service.client.close()
+            if self.source_publisher is not None:
+                self.source_publisher.close()
             raise
         try:
             if self.service.connection is not None:
@@ -207,10 +266,19 @@ class WebSocketCollector:
             self.service.client.close()
             self.raw_segment_writer.seal()
             completed_at = self.service._utcnow()
-            return self._finalize(started_at=started_at, completed_at=completed_at, termination_reason=termination_reason)
+            result = self._finalize(
+                started_at=started_at,
+                completed_at=completed_at,
+                termination_reason=termination_reason,
+            )
         finally:
             self.service.on_reconnect_frame = None
             self._stop_fn = None
+            if self.source_publisher is not None:
+                self.source_publisher.close()
+        if self.source_publisher is not None:
+            result.source_metrics = self.source_publisher.metrics()
+        return result
 
     def _reconnect(self) -> None:
         self._flush_normalized_checkpoint()
@@ -368,6 +436,11 @@ class WebSocketCollector:
             raw_frame_count=self._frame_count,
             level2_message_count=level2_message_count,
             heartbeat_message_count=heartbeat_message_count,
+            source_metrics=(
+                self.source_publisher.metrics()
+                if self.source_publisher is not None
+                else None
+            ),
         )
 
 

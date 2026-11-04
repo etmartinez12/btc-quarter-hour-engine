@@ -47,28 +47,33 @@ Predictions use only the two frozen models, class order `[0, 1]`, and the fixed
 recomputed by both inference and ledger validation so changed predictor values
 cannot be recorded under an earlier fingerprint.
 
-`ProspectiveRawFrameJournal` is an isolated append-only SQLite adapter for a
-future source integration. It durably records raw bytes, per-frame ingest
-metadata, session identity, and explicit completeness watermarks; it is not
-connected to or tested against the production collector. A future producer
-must supply trustworthy receive times and prove the watermark means all frames
-through that time have arrived. Neither property can be established by the
-local journal alone.
+`ProspectiveRawFrameJournal` is an isolated append-only SQLite adapter. PR #34
+adds an optional, disabled-by-default publisher at the existing collector's
+raw-frame boundary and a separate local receiver. The synthetic integration
+preserves raw bytes, collector receive times, session/frame/connection identity,
+producer health diagnostics, and commits them to the source journal. It has not
+been enabled on or validated against a production collector. The receiver
+certifies watermarks only after an ordered post-cutoff producer fence follows
+the durable contiguous frame prefix; the journal alone cannot establish
+completeness without this producer/receiver protocol.
 Once a journal watermark is committed, no frame with ingest time at or before
 that watermark may be appended, and watermarks must advance strictly. This
-preserves already-issued snapshots against backdated additions. The Boolean
-clock/completeness fields are producer assertions, not evidence that the source
-was complete or synchronized; independent source certification is still an
-activation prerequisite.
+preserves already-issued snapshots against backdated additions. The legacy
+`advance_watermark()` API remains an offline adapter that accepts an explicit
+caller assertion. The bridge instead uses the fenced-watermark API and records
+the fence, producer-health evidence, and separately evaluated chrony status.
+Those local checks are not a production host or filesystem durability
+attestation; independent VM validation is still an activation prerequisite.
 
-The current raw-segment writer makes frame provenance durable when segments are
-sealed, but its per-frame ingest-time metadata is not published as a separate
-low-latency feed while a segment is active. This implementation therefore
-provides a strict snapshot adapter and offline replay interface, not a connected
-60-second production source. The snapshot's watermark and
-`clock_health_verified` value are external assertions; the local adapter cannot
-prove that a separate source has delivered every frame through T or that the
-host clock is synchronized to UTC.
+The current raw-segment writer remains authoritative for production collection.
+The optional publisher is a separate read-only tee and does not change raw
+segment or canonical target semantics. Its local queue is bounded and
+nonblocking to the collector; overflow, transport failure, or ambiguous ack
+invalidates subsequent progress rather than reconstructing missing data. The
+receiver's default clock adapter reads chrony status, but its host evidence,
+socket permissions, and storage durability still require VM validation. The
+bridge does not implement a live scheduler or a connected 60-second prediction
+service.
 
 The original `build_causal_feature_vector()` / `process_boundary()` APIs still
 support the PR #32 complete-snapshot offline path. The bounded alternative is
@@ -93,7 +98,7 @@ unsynchronized or crossed books. It uses the unchanged existing bucket
 summaries and V2 feature builder, so parity is judged by exact ordered
 predictors and canonical feature fingerprints. The adapter does not replace
 the full-snapshot API used by existing callers and is not connected to a
-production source. Checkpoint provenance uses a hash chain rather than the
+live production collector. Checkpoint provenance uses a hash chain rather than the
 full-snapshot frame-list digest; both commit to raw provenance, but this
 serialization distinction must be preserved and explicitly reviewed in any
 later ledger integration. The ledger schema and immutable evidence rules have

@@ -116,6 +116,7 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     collector, service, transport, raw_writer = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
 
+    assert result.source_metrics is None
     assert result.observation_count == 1
     assert result.eligible_observation_count == 1
     assert result.connection_count == 1
@@ -172,6 +173,63 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert raw_writer.raw_store.verify_digest(segment["path"], segment["sha256"])
     frames = raw_writer.read_segment_frames(segment["path"])
     assert [f.decode("utf-8") for f in frames] == messages
+
+
+def test_publisher_exception_does_not_interrupt_canonical_collection(tmp_path):
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
+    ]
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+
+    class BrokenPublisher:
+        valid = True
+        failure_reason = "simulated"
+
+        def publish_frame(self, **_):
+            raise OSError("receiver unavailable")
+
+        def close(self):
+            pass
+
+        def metrics(self):
+            return {"valid": False}
+
+    collector.source_publisher = BrokenPublisher()
+    result = collector.run(max_messages=len(messages))
+
+    assert result.eligible_observation_count == 1
+    assert result.manifest["canonical_target_eligible"] is True
+    assert result.source_metrics == {"valid": False}
+    assert sum(
+        diagnostic["kind"] == "prospective_source_publish_failed"
+        for diagnostic in service.diagnostics
+    ) == len(messages)
+
+
+def test_publisher_initialization_failure_does_not_interrupt_collection(tmp_path):
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
+    ]
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+
+    def fail_initialization(*_):
+        raise OSError("receiver unavailable")
+
+    collector.source_publisher_factory = fail_initialization
+    result = collector.run(max_messages=len(messages))
+
+    assert result.eligible_observation_count == 1
+    assert result.manifest["canonical_target_eligible"] is True
+    assert result.source_metrics is None
+    assert any(
+        diagnostic["kind"] == "prospective_source_init_failed"
+        and diagnostic["reason"] == "OSError"
+        for diagnostic in service.diagnostics
+    )
 
 
 def test_small_row_threshold_checkpoints_without_reconnect_and_preserves_all_rows(tmp_path, monkeypatch):

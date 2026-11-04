@@ -1,6 +1,6 @@
 # ADR: Bounded prospective replay and source integration
 
-Status: Offline implementation complete; live source integration not authorized.
+Status: Offline bounded replay and disabled-by-default source bridge implemented; activation not authorized.
 Date: 2026-11-04.
 
 ## Decision
@@ -94,7 +94,7 @@ a checkpoint. A missing or late boundary is not reconstructed as timely.
 Checkpoint integrity is not a completeness attestation: the source watermark
 and clock-health assertion remain independent prerequisites.
 
-## Source alternatives for a later integration PR
+## Source alternatives and selected integration
 
 | Option | Canonical target and timestamps | Completeness / identity | Isolation and latency | Storage / restart |
 |---|---|---|---|---|
@@ -102,44 +102,130 @@ and clock-health assertion remain independent prerequisites.
 | **B. Independent Coinbase WebSocket sidecar** | A second Coinbase connection observes the same product but is not guaranteed to have identical delivery time, sequence epoch, snapshot timing, or transient book path. Keep the existing canonical target price source; never blend the feeds. | Requires independent connection/session IDs, sequence/gap checks, snapshot recovery, raw capture, clock verification, and completeness watermarks. Two feeds do not prove each other's completeness. | Process isolation limits collector interference, but startup, network scheduling, snapshot rebuild, and extra subscription add latency and operational failure modes. A sidecar may be unavailable while collection continues. | Separate journal and checkpoint lifecycle; restart begins a new connection epoch and must resynchronize from a snapshot. |
 | **C. Consume committed raw-segment files** | Uses the same collector's raw bytes and target definition. | Segment metadata provides durable per-frame provenance after sealing, but the currently active partial segment does not expose a proven complete low-latency frame stream. Its watermark and receive-time completeness are not suitable evidence for T+60. | No live collector hook, but waiting for segment sealing adds uncertain latency. Reading a partial file does not establish that all frames through T were delivered or durably recorded. | Simple offline recovery from sealed immutable segments; not a defensible live prediction source without a separately designed, verified live journal. |
 
-Recommendation: **Option A**, contingent on a separately reviewed bounded
-read-only tee from the existing collector and a fail-closed queue/watermark
-contract. It reuses the canonical stream and preserves collector ownership.
-No collector hook, second feed, canonical-source change, scheduler, or live
-inference is implemented here. Option C remains appropriate for offline
+Selection: **Option A** is implemented as an optional, disabled-by-default
+tee from the existing collector. It reuses the canonical stream and preserves
+collector ownership. No second feed, canonical-source change, scheduler, or
+live inference is implemented. Option C remains appropriate for offline
 rebuilds only; current raw segments are not established as low latency because
 their complete per-frame ingest metadata is unavailable until sealing.
 
+## PR #34 local source bridge
+
+The existing collector accepts an optional `source_publisher` callback at its
+raw-frame recording boundary. The CLI enables it only when the operator
+explicitly supplies `--prospective-source-socket`; omitting the flag creates
+no publisher thread and leaves collector behavior unchanged. The callback
+receives the existing session ID, connection ID, reconnect epoch, global
+frame index, exact received bytes, the original collector receive timestamp,
+digest, and producer-health diagnostics. A publisher exception or queue
+failure is recorded in the collector's in-memory diagnostics and does not
+change canonical collection or target construction.
+
+The transport is an owner-local Unix-domain `SOCK_STREAM`, not a datagram or
+message-oriented IPC API. Each event uses an 8-byte big-endian body length,
+a 4-byte header length, bounded JSON provenance, and the original frame bytes.
+The WebSocket's configured 16 MiB maximum is the transport's maximum raw-frame
+size; stream framing has no datagram/pipe message-size ceiling. A single
+publisher thread performs socket I/O and waits for a durable receiver ack.
+The collector performs only a short `put_nowait` into a queue bounded to 64
+events and 64 MiB by default. If either limit is exceeded, a frame is too
+large, the clock regresses, or delivery/acknowledgment fails, publisher state
+becomes invalid and no further events are sent; canonical collection
+continues. Shutdown that times out before queued work is acknowledged also
+invalidates the publisher. Already committed earlier fences remain immutable evidence for
+their earlier cutoffs, but a failed publisher cannot certify later cutoffs.
+There is no silent retry after an ambiguous acknowledgment: the source fails
+closed rather than risk duplicate acceptance.
+
+Run the separately configured receiver with
+`btc-qh-prospective-source-receiver --socket-path <local-socket> --journal-path
+<separate-journal.sqlite>`. The receiver owns the append-only
+`ProspectiveRawFrameJournal`; it does not write production raw segments,
+normalized artifacts, or materialized research data. The socket is created
+with mode `0600`, and the service relies on local filesystem socket
+permissions for publisher authorization. Provision a private socket directory
+under the intended service identity; do not expose or share the socket path.
+Frame headers, byte lengths, digests, session starts, epoch progression, and
+global frame continuity are validated before append. Raw-frame provenance,
+producer health, and their digests are committed atomically. Frame
+acknowledgments are sent only after the journal transaction commits with
+SQLite FULL sync.
+The receiver uses one event per stream connection so a receiver restart can
+accept the next acknowledged event. If a process fails while an ack is
+ambiguous, the current publisher invalidates itself; its data is not retried
+as timely progress. A new collector session gets a new source session ID.
+
+A fence is ordered after its frames in the publisher queue. The publisher
+emits a quarter-hour cutoff only after receiving a later frame whose
+authoritative collector timestamp is strictly beyond that cutoff. This
+post-cutoff witness makes all frames sharing the cutoff timestamp precede
+the fence. The receiver accepts it only when its `through_frame_index` equals
+the latest durably committed frame and the witness timestamp is after the
+cutoff, then commits the fence and watermark atomically. Later frames at or
+before the watermark are rejected. A producer stall, missing frame, queue
+overflow, consumer failure, stale connection epoch, malformed message,
+journal error, or missing fence therefore cannot advance completeness. The
+watermark is a durable contiguous-prefix claim, not a wall-clock timer.
+
+Clock synchronization is a separate receiver-side check using read-only
+`chronyc tracking` evidence. By default it requires a `Normal` leap status,
+absolute system offset no greater than 50 ms, and a reference observation no
+older than 120 seconds. Missing `chronyc`, unparseable evidence, future or
+stale reference time, and unhealthy status persist as unverified clock
+evidence; they never become verified from producer health or clock drift
+alone. Completeness, clock status, heartbeat health, sequence integrity, and
+order-book synchronization remain separate signals. The bounded replay still
+enforces its own sequence, timestamp, snapshot, and synchronized-book
+requirements before feature readiness.
+
+The bridge exposes enqueue, queue high-water, delivery, durable-ack,
+receiver-write, rejection, gap, and fence-latency counters. These are local
+diagnostics, not T+60 evidence. A synthetic benchmark can be run with
+`python benchmarks/benchmark_prospective_source_bridge.py`; it reports frame
+sizes, bursts, enqueue and journal/ack timings, queue peaks, CPU time, and
+Python allocation peaks. It does not measure VM scheduling, OS memory,
+production Coinbase traffic, frozen inference, or ledger commit latency.
+On platforms without Unix-domain sockets, the benchmark uses an in-memory
+fake transport; its acknowledgment timings are not IPC or durable-ack evidence.
+
 ## Boundaries and operational validation
 
-This implementation is offline-only. `ProspectiveRawFrameJournal` is an
-isolated test/research adapter; it is not connected to `WebSocketCollector`,
-the materializer, or a service. Existing protocol timing, source price, model
-artifacts, ledger evidence semantics, and prediction schedule are unchanged.
-No synthetic measurement is a production T+60-second claim.
+This implementation remains development-only. The explicitly enabled
+`WebSocketCollector` tee writes only to the separate source journal; the
+materializer, model artifacts, prediction ledger, and prediction schedule
+remain unchanged. No synthetic measurement is a production T+60-second
+claim.
 
 Before any later integration or activation, an operator/reviewer must verify
-on the intended VM and under the production service identity:
+on the intended VM and under the production service identity. The first
+validation must not activate the collector hook:
 
-1. The selected source is complete through each T, and receive timestamps,
+1. Provision a separate non-production journal path and private socket
+   directory. Start the receiver with a test socket and synthetic publisher
+   fixtures only; verify `0600` permissions and ensure the production
+   collector has no `--prospective-source-socket` argument.
+2. The selected source is complete through each T, and receive timestamps,
    UTC clock synchronization, session identity, frame indices, Coinbase
    sequence continuity, snapshot/rebuild and reconnect transitions are
    independently observable. Do not equate sealed-segment timestamps or a
    producer Boolean with proof of completeness.
-2. The read-only queue cannot block or degrade the collector; overflow,
+3. The read-only queue cannot block or degrade the collector; overflow,
    process failure, disk-full, clock skew, and unclean restart fail closed and
    produce no eligible prediction. Confirm unchanged collector/materializer
    health and canonical raw storage.
-3. Checkpoint files and raw-prefix commitments survive process/host restart;
+4. Checkpoint files and raw-prefix commitments survive process/host restart;
    corrupted, missing, reordered, duplicated, stale, wrong-session, wrong-
    connection, or discontinuous data is rejected. Verify that recovery never
    changes an existing prediction or marks a reconstructed one timely.
-4. On actual VM hardware, benchmark source reads, checkpoint restore, bounded
+5. On actual VM hardware, benchmark source reads, checkpoint restore, bounded
    tail work, feature generation, frozen-model inference, ledger transaction,
    post-commit durability attestation, and Python plus OS-level peak memory.
    Exercise increasing session sizes, cold and warm restarts, load, and
    failure paths. A synthetic benchmark does not establish this prerequisite.
-5. Re-run the unchanged prospective protocol's model-hash, feature-order,
+6. Only after separate review and explicit authorization, validate the
+   collector hook in a non-production service identity and data directory.
+   Never enable it on the production collector as part of this PR.
+7. Re-run the unchanged prospective protocol's model-hash, feature-order,
    causality, ledger immutability, deadline, restart, and duplicate-boundary
    gates. Obtain a separate implementation review and explicit activation
    approval before enabling anything live.
