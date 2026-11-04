@@ -7,10 +7,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from btc_quarter_hour_engine.research.prospective_replay import (
+        IncrementalRawFrameSnapshot,
+    )
 
 from btc_quarter_hour_engine.acquisition.coinbase_websocket import (
     parse_coinbase_ws_message,
@@ -145,7 +150,7 @@ class CausalInputError(ValueError):
 class ProspectiveRawFrameJournal:
     """Isolated durable append-only feed adapter; not connected to the collector."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, migrate_legacy_prefixes: bool = False) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(
@@ -180,9 +185,24 @@ class ProspectiveRawFrameJournal:
             );
             CREATE INDEX IF NOT EXISTS source_frames_ingest_idx
                 ON source_frames(session_id, ingest_time_utc, frame_index);
+            CREATE TABLE IF NOT EXISTS source_prefix_commitments (
+                session_id TEXT NOT NULL REFERENCES source_sessions(session_id),
+                frame_index INTEGER NOT NULL CHECK (frame_index >= 0),
+                commitment_sha256 TEXT NOT NULL,
+                PRIMARY KEY (session_id, frame_index)
+            );
+            CREATE TABLE IF NOT EXISTS source_prefix_schema (
+                version INTEGER PRIMARY KEY CHECK (version = 1)
+            );
             """
         )
-        for table in ("source_sessions", "source_frames", "source_watermarks"):
+        for table in (
+            "source_sessions",
+            "source_frames",
+            "source_watermarks",
+            "source_prefix_commitments",
+            "source_prefix_schema",
+        ):
             for operation in ("UPDATE", "DELETE"):
                 self._connection.execute(
                     f"""
@@ -193,6 +213,90 @@ class ProspectiveRawFrameJournal:
                     END
                     """
                 )
+        try:
+            self._backfill_prefix_commitments(migrate_legacy=migrate_legacy_prefixes)
+        except BaseException:
+            self._connection.close()
+            raise
+
+    def _backfill_prefix_commitments(self, *, migrate_legacy: bool = False) -> None:
+        """Explicit one-time offline migration, never a normal recovery scan."""
+        from btc_quarter_hour_engine.research.prospective_replay import (
+            advance_prefix_commitment,
+            initial_prefix_commitment,
+        )
+
+        with self._transaction():
+            if self._connection.execute(
+                "SELECT version FROM source_prefix_schema WHERE version = 1"
+            ).fetchone() is not None:
+                return
+            if not migrate_legacy and self._connection.execute(
+                "SELECT 1 FROM source_frames LIMIT 1"
+            ).fetchone() is not None:
+                raise ValueError(
+                    "Legacy prefix migration required; reopen offline with "
+                    "migrate_legacy_prefixes=True (one-time full-history work)"
+                )
+            sessions = self._connection.execute(
+                "SELECT session_id, session_started_at_utc FROM source_sessions"
+            ).fetchall()
+            for session in sessions:
+                session_id = session["session_id"]
+                row_count = self._connection.execute(
+                    "SELECT COUNT(*) AS count FROM source_frames WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()["count"]
+                existing = self._connection.execute(
+                    "SELECT COUNT(*) AS count FROM source_prefix_commitments "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()["count"]
+                if existing:
+                    if existing != row_count:
+                        raise ValueError("Source prefix commitment journal is incomplete")
+                commitment = initial_prefix_commitment(
+                    session_id, _parse_utc(session["session_started_at_utc"])
+                )
+                rows = self._connection.execute(
+                    "SELECT f.frame_index, f.connection_id, f.ingest_time_utc, "
+                    "f.raw_frame_sha256, f.raw_bytes, c.commitment_sha256 "
+                    "FROM source_frames f LEFT JOIN source_prefix_commitments c "
+                    "ON c.session_id = f.session_id AND c.frame_index = f.frame_index "
+                    "WHERE f.session_id = ? ORDER BY f.frame_index",
+                    (session_id,),
+                )
+                previous_ingest = _parse_utc(session["session_started_at_utc"])
+                for expected, row in enumerate(rows):
+                    raw = bytes(row["raw_bytes"])
+                    ingest = _parse_utc(row["ingest_time_utc"])
+                    if (
+                        row["frame_index"] != expected
+                        or hashlib.sha256(raw).hexdigest() != row["raw_frame_sha256"]
+                        or ingest < previous_ingest
+                        or not row["connection_id"]
+                    ):
+                        raise ValueError("Existing source journal fails prefix integrity validation")
+                    record = RawFrameRecord(
+                        raw_bytes=raw,
+                        session_id=session_id,
+                        connection_id=row["connection_id"],
+                        frame_index=row["frame_index"],
+                        ingest_time_utc=ingest,
+                        raw_frame_sha256=row["raw_frame_sha256"],
+                    )
+                    commitment = advance_prefix_commitment(commitment, record)
+                    if existing:
+                        if row["commitment_sha256"] != commitment:
+                            raise ValueError("Existing source prefix commitment mismatch")
+                    else:
+                        self._connection.execute(
+                            "INSERT INTO source_prefix_commitments "
+                            "(session_id, frame_index, commitment_sha256) VALUES (?, ?, ?)",
+                            (session_id, expected, commitment),
+                        )
+                    previous_ingest = ingest
+            self._connection.execute("INSERT INTO source_prefix_schema VALUES (1)")
 
     @contextmanager
     def _transaction(self):
@@ -249,6 +353,11 @@ class ProspectiveRawFrameJournal:
         ingest_time_utc: datetime,
         raw_bytes: bytes,
     ) -> str:
+        from btc_quarter_hour_engine.research.prospective_replay import (
+            advance_prefix_commitment,
+            initial_prefix_commitment,
+        )
+
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("Source session ID must be nonempty")
         if not isinstance(connection_id, str) or not connection_id:
@@ -287,6 +396,26 @@ class ProspectiveRawFrameJournal:
                 raise ValueError(
                     "Source frame ingest time is at or before the committed completeness watermark"
                 )
+            previous_commitment = self._connection.execute(
+                "SELECT commitment_sha256 FROM source_prefix_commitments "
+                "WHERE session_id = ? ORDER BY frame_index DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if previous is None:
+                commitment = initial_prefix_commitment(session_id, _parse_utc(session["session_started_at_utc"]))
+            else:
+                if previous_commitment is None:
+                    raise ValueError("Source prefix commitment is missing")
+                commitment = previous_commitment["commitment_sha256"]
+            record = RawFrameRecord(
+                raw_bytes=raw_bytes,
+                session_id=session_id,
+                connection_id=connection_id,
+                frame_index=frame_index,
+                ingest_time_utc=ingest,
+                raw_frame_sha256=digest,
+            )
+            commitment = advance_prefix_commitment(commitment, record)
             self._connection.execute(
                 """
                 INSERT INTO source_frames (
@@ -295,6 +424,11 @@ class ProspectiveRawFrameJournal:
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (session_id, frame_index, connection_id, _iso(ingest), digest, raw_bytes),
+            )
+            self._connection.execute(
+                "INSERT INTO source_prefix_commitments "
+                "(session_id, frame_index, commitment_sha256) VALUES (?, ?, ?)",
+                (session_id, frame_index, commitment),
             )
         return digest
 
@@ -379,6 +513,216 @@ class ProspectiveRawFrameJournal:
                 watermark_utc=_parse_utc(watermark["watermark_utc"]),
                 clock_health_verified=bool(watermark["clock_health_verified"]),
                 frames=frames,
+            )
+
+    def snapshot_through(
+        self,
+        session_id: str,
+        *,
+        boundary_utc: datetime,
+        max_frames: int = 100_000,
+    ) -> RawFrameSnapshot:
+        """Create a bounded bootstrap snapshot through T; reject oversized prefixes."""
+        from btc_quarter_hour_engine.research.prospective_replay import (
+            MAX_CHECKPOINT_BOOTSTRAP_FRAMES,
+            initial_prefix_commitment,
+        )
+
+        if type(max_frames) is not int or not 1 <= max_frames <= MAX_CHECKPOINT_BOOTSTRAP_FRAMES:
+            raise ValueError("Bootstrap frame limit must be within the configured hard limit")
+        with self._read_transaction():
+            session = self._connection.execute(
+                "SELECT session_started_at_utc FROM source_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError("Source session has not been registered")
+            started = _parse_utc(session["session_started_at_utc"])
+        tail = self.tail_snapshot(
+            session_id,
+            after_frame_index=-1,
+            expected_prefix_commitment_sha256=initial_prefix_commitment(session_id, started),
+            through_boundary_utc=boundary_utc,
+            max_tail_frames=max_frames,
+        )
+        return RawFrameSnapshot(
+            session_id=tail.session_id,
+            session_started_at_utc=tail.session_started_at_utc,
+            watermark_utc=tail.watermark_utc,
+            clock_health_verified=tail.clock_health_verified,
+            frames=tail.frames,
+        )
+
+    def tail_snapshot(
+        self,
+        session_id: str,
+        *,
+        after_frame_index: int,
+        expected_prefix_commitment_sha256: str,
+        through_boundary_utc: datetime,
+        max_tail_frames: int = 100_000,
+    ) -> "IncrementalRawFrameSnapshot":
+        """Read only a contiguous raw tail while checking its stored chain commitment."""
+        return self._tail_snapshot(
+            session_id, after_frame_index=after_frame_index,
+            expected_prefix_commitment_sha256=expected_prefix_commitment_sha256,
+            through_boundary_utc=through_boundary_utc,
+            max_tail_frames=max_tail_frames, allow_partial=False,
+        )
+
+    def warmup_chunk(
+        self,
+        session_id: str,
+        *,
+        after_frame_index: int,
+        expected_prefix_commitment_sha256: str,
+        through_boundary_utc: datetime,
+        max_chunk_frames: int = 10_000,
+    ) -> "IncrementalRawFrameSnapshot":
+        """Read at most one verified accumulation chunk, including a completion flag.
+
+        Persist each returned warm-up state before reading the next chunk.
+        has_more=False attests exhaustion through the requested cutoff, including
+        when many frames share the same receive timestamp at a chunk boundary.
+        """
+        return self._tail_snapshot(
+            session_id, after_frame_index=after_frame_index,
+            expected_prefix_commitment_sha256=expected_prefix_commitment_sha256,
+            through_boundary_utc=through_boundary_utc,
+            max_tail_frames=max_chunk_frames, allow_partial=True,
+        )
+
+    def _tail_snapshot(
+        self,
+        session_id: str,
+        *,
+        after_frame_index: int,
+        expected_prefix_commitment_sha256: str,
+        through_boundary_utc: datetime,
+        max_tail_frames: int,
+        allow_partial: bool,
+    ) -> "IncrementalRawFrameSnapshot":
+        from btc_quarter_hour_engine.research.prospective_replay import (
+            MAX_INCREMENTAL_TAIL_FRAMES,
+            IncrementalRawFrameSnapshot,
+            advance_prefix_commitment,
+        )
+
+        if type(after_frame_index) is not int or after_frame_index < -1:
+            raise ValueError("Tail prefix frame index must be an integer >= -1")
+        if type(max_tail_frames) is not int or max_tail_frames < 1:
+            raise ValueError("Maximum raw tail frame count must be a positive integer")
+        if max_tail_frames > MAX_INCREMENTAL_TAIL_FRAMES:
+            raise ValueError("Maximum raw tail frame count exceeds the replay hard limit")
+        if (
+            not isinstance(expected_prefix_commitment_sha256, str)
+            or len(expected_prefix_commitment_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in expected_prefix_commitment_sha256)
+        ):
+            raise ValueError("Expected prefix commitment must be lowercase SHA256")
+        boundary = _utc(through_boundary_utc, field="tail boundary")
+        with self._read_transaction():
+            session = self._connection.execute(
+                "SELECT session_started_at_utc FROM source_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError("Source session has not been registered")
+            watermark = self._connection.execute(
+                "SELECT watermark_utc, clock_health_verified FROM source_watermarks "
+                "WHERE session_id = ? AND watermark_utc >= ? "
+                "AND clock_health_verified = 1 ORDER BY watermark_utc LIMIT 1",
+                (session_id, _iso(boundary)),
+            ).fetchone()
+            if watermark is None:
+                watermark = self._connection.execute(
+                    "SELECT watermark_utc, clock_health_verified FROM source_watermarks "
+                    "WHERE session_id = ? ORDER BY watermark_id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            if watermark is None:
+                raise ValueError("Source session has no completeness watermark")
+            if _parse_utc(watermark["watermark_utc"]) < boundary:
+                raise ValueError("Source watermark does not cover requested tail boundary")
+            if after_frame_index == -1:
+                from btc_quarter_hour_engine.research.prospective_replay import initial_prefix_commitment
+
+                actual_prefix = initial_prefix_commitment(
+                    session_id, _parse_utc(session["session_started_at_utc"])
+                )
+                prefix_ingest = session["session_started_at_utc"]
+            else:
+                prefix = self._connection.execute(
+                    "SELECT c.commitment_sha256, f.ingest_time_utc "
+                    "FROM source_prefix_commitments c JOIN source_frames f "
+                    "ON f.session_id = c.session_id AND f.frame_index = c.frame_index "
+                    "WHERE c.session_id = ? AND c.frame_index = ?",
+                    (session_id, after_frame_index),
+                ).fetchone()
+                if prefix is None:
+                    raise ValueError("Source prefix commitment is missing")
+                actual_prefix = prefix["commitment_sha256"]
+                prefix_ingest = prefix["ingest_time_utc"]
+            if actual_prefix != expected_prefix_commitment_sha256:
+                raise ValueError("Source prefix commitment does not match checkpoint")
+            rows = self._connection.execute(
+                "SELECT f.frame_index, f.connection_id, f.ingest_time_utc, "
+                "f.raw_frame_sha256, f.raw_bytes, c.commitment_sha256 "
+                "FROM source_frames f LEFT JOIN source_prefix_commitments c "
+                "ON c.session_id = f.session_id AND c.frame_index = f.frame_index "
+                "WHERE f.session_id = ? "
+                "AND (f.ingest_time_utc, f.frame_index) > (?, ?) "
+                "AND f.ingest_time_utc <= ? "
+                "ORDER BY f.ingest_time_utc, f.frame_index LIMIT ?",
+                (session_id, prefix_ingest, after_frame_index, _iso(boundary), max_tail_frames + 1),
+            ).fetchall()
+            # append_frame enforces monotonic ingest times. The tuple seek on
+            # source_frames_ingest_idx avoids scanning either prior timestamp
+            # ties or a future suffix, without selecting any future raw bytes.
+            has_more = len(rows) > max_tail_frames
+            if has_more and not allow_partial:
+                raise ValueError("Source raw tail exceeds configured bounded replay limit")
+            rows = rows[:max_tail_frames]
+            expected_index = after_frame_index + 1
+            commitment = actual_prefix
+            frames = []
+            frame_commitments = []
+            previous_ingest = _parse_utc(prefix_ingest)
+            for row in rows:
+                raw = bytes(row["raw_bytes"])
+                if row["frame_index"] != expected_index or row["commitment_sha256"] is None:
+                    raise ValueError("Source raw tail has a missing or discontinuous frame")
+                if hashlib.sha256(raw).hexdigest() != row["raw_frame_sha256"]:
+                    raise ValueError("Source raw tail frame hash mismatch")
+                ingest = _parse_utc(row["ingest_time_utc"])
+                if previous_ingest is not None and ingest < previous_ingest:
+                    raise ValueError("Source raw tail ingest time regressed")
+                frame = RawFrameRecord(
+                    raw_bytes=raw,
+                    session_id=session_id,
+                    connection_id=row["connection_id"],
+                    frame_index=row["frame_index"],
+                    ingest_time_utc=ingest,
+                    raw_frame_sha256=row["raw_frame_sha256"],
+                )
+                commitment = advance_prefix_commitment(commitment, frame)
+                if commitment != row["commitment_sha256"]:
+                    raise ValueError("Source raw tail provenance chain mismatch")
+                frames.append(frame)
+                frame_commitments.append((row["frame_index"], commitment))
+                previous_ingest = ingest
+                expected_index += 1
+            return IncrementalRawFrameSnapshot(
+                session_id=session_id,
+                session_started_at_utc=_parse_utc(session["session_started_at_utc"]),
+                watermark_utc=_parse_utc(watermark["watermark_utc"]),
+                clock_health_verified=bool(watermark["clock_health_verified"]),
+                prefix_frame_index=after_frame_index,
+                prefix_commitment_sha256=actual_prefix,
+                frames=tuple(frames),
+                frame_commitments=tuple(frame_commitments),
+                has_more=has_more,
+                through_boundary_utc=boundary,
             )
 
 

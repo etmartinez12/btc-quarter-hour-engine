@@ -70,29 +70,67 @@ provides a strict snapshot adapter and offline replay interface, not a connected
 prove that a separate source has delivered every frame through T or that the
 host clock is synchronized to UTC.
 
-The current offline adapter materializes and replays the complete source
-session, so both memory use and replay work grow with total session frame
-count. It is not a bounded low-latency replay design, and the 60-second
-requirement has not been measured or demonstrated. A bounded design should
-persist versioned `_IngestFeatureReplay` checkpoints (using its existing
-`to_checkpoint()` / `from_checkpoint()` format) frequently enough to cap tail
-replay, while retaining the complete order-book levels, sync state, connection
-epoch, last accepted exchange sequence, previous midpoint, and sufficient
-quarter-hour bucket statistics for the full 240-minute feature window. The
-checkpoint record must bind its source session, last included frame index,
-ingest/event watermarks, and a hash-chain commitment to every raw frame through
-that index. At inference, restore the latest checkpoint strictly before T,
-verify checkpoint version and digest, verify the book is synchronized, then
-replay only the contiguous post-checkpoint frame tail with matching connection
-identity and strictly increasing sequence numbers. Reject gaps, stale or
-malformed frames, invalid checkpoint state, provenance-chain mismatches, and
-any checkpoint whose committed source watermark does not cover T. Keep enough
-bucket history to recompute the existing 15/30/60/240-minute summaries exactly;
-do not approximate or change V1/V2 feature contracts. Benchmark snapshot read,
-checkpoint restore, tail replay, feature generation, inference, and durable
-commit/attestation separately under representative load before claiming the
-deadline is met. This design is documentation only; checkpointed source
-integration is not implemented here.
+The original `build_causal_feature_vector()` / `process_boundary()` APIs still
+support the PR #32 complete-snapshot offline path. The bounded alternative is
+implemented in `research/prospective_replay.py` and
+`process_incremental_boundary()`: versioned `_IngestFeatureReplay` checkpoints
+reuse its existing `to_checkpoint()` / `from_checkpoint()` format and retain
+the complete book, connection epoch and accepted sequence, prior midpoint,
+counters, and exactly the required 240-minute bucket history. Each checkpoint
+binds the session, last raw frame, ingest/event cutoffs, frozen V2 contract
+versions, and raw-prefix commitment. Its integrity digest is verified before
+replay at both public checkpoint APIs, even for caller-constructed objects.
+Checkpoint files use write-once atomic linking, file fsync before publication,
+and parent-directory fsync afterward on supported POSIX filesystems. Unsupported
+platforms fail closed. The parent must already be durably provisioned.
+
+`ProspectiveRawFrameJournal.tail_snapshot()` verifies the checkpoint's prefix
+commitment and reads only contiguous, hash-verified records after that frame
+through T. The incremental adapter restores state, rejects gaps, duplicate or
+stale sequences, malformed records, at-or-before-T future exchange events,
+wrong session identity, invalid checkpoint state, missing history, and
+unsynchronized or crossed books. It uses the unchanged existing bucket
+summaries and V2 feature builder, so parity is judged by exact ordered
+predictors and canonical feature fingerprints. The adapter does not replace
+the full-snapshot API used by existing callers and is not connected to a
+production source. Checkpoint provenance uses a hash chain rather than the
+full-snapshot frame-list digest; both commit to raw provenance, but this
+serialization distinction must be preserved and explicitly reviewed in any
+later ledger integration. The ledger schema and immutable evidence rules have
+not been changed.
+
+Small bootstrap snapshots via `snapshot_through()` retain their 100,000-frame
+hard limit. Arbitrary initial history uses `warmup_chunk()` and
+`accumulate_feature_replay_warmup()` with a separately serialized schema-2
+`FeatureReplayWarmup`. Each chunk is source-chain verified, retains at most
+17 buckets, and is persisted under a unique name before the next chunk.
+Restart resumes after the verified prefix; at most an uncommitted chunk is
+repeated. `finish_feature_replay_warmup()` alone promotes an exhausted,
+cutoff-bound source prefix with the unchanged exact 240-minute readiness.
+Neither public prediction API accepts warm-up or incomplete tails.
+
+Normal journal initialization reads an immutable prefix-schema marker, not
+historical row counts. Marker-less old journals fail closed unless explicitly
+opened offline with `migrate_legacy_prefixes=True`; that one-time historical
+scan validates and atomically commits the migration. It is not normal recovery.
+After a publication failure that left a destination, `load_durable()` validates
+and resynchronizes the file and parent without overwriting evidence; ordinary
+`load()` makes no durability attestation. Orphan `.tmp` files are not selected.
+
+Normal prediction recovery requires a checkpoint strictly before T; if one is
+missing or a bootstrap/tail cap is exceeded, fail closed rather than replay an
+unbounded archive or reconstruct a missed timely prediction.
+
+The offline benchmark at `benchmarks/benchmark_prospective_replay.py`
+separates checkpoint file reads, bounded source-tail reads, checkpoint restore,
+incremental tail replay, feature generation, injectable model inference,
+injectable persistence/durability attestation, and checkpoint advancement.
+It reports per-stage median/p95/max, tail work, failures, and traced Python
+memory across increasing session sizes. Its defaults use synthetic frames,
+placeholder inference, and a synthetic FULL-sync SQLite sink. Neither the
+synthetic runs nor a local VM demonstrate production T+60-second performance.
+Architecture alternatives, VM acceptance checks, and offline commands are in
+`docs/research/prospective-bounded-replay-adr.md`.
 
 Do not mark completeness or clock guarantees verified until a separately
 isolated VM source has been reviewed and tested. If either is unknown, do not
