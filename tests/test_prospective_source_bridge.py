@@ -27,6 +27,7 @@ from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
 )
 from btc_quarter_hour_engine.research.prospective_source import (
     ProspectiveRawFrameJournal,
+    _validate_bridge_health,
     _require_bridge_prediction_health,
 )
 
@@ -52,20 +53,24 @@ def _clock(*, verified: bool = True) -> ClockHealthEvidence:
 def _producer_health(connection_id="connection-0", *, canonical_boundary=None):
     return {
         "publisher_valid": True,
-        "heartbeat_seen": False,
-        "heartbeat_last_at_utc": None,
-        "heartbeat_healthy": False,
-        "order_book_synchronized": False,
-        "connection_id": connection_id,
-        "connection_last_sequence_num": None,
-        "last_l2_sequence_num": None,
-        "sequence_gap_count": 0,
-        "stale_sequence_count": 0,
-        "heartbeat_timeout_count": 0,
-        "heartbeat_discontinuity_count": 0,
-        "malformed_frame_count": 0,
-        "malformed_level2_count": 0,
-        "crossed_book_count": 0,
+        "post_frame_health": {
+            "heartbeat_seen": False,
+            "heartbeat_last_at_utc": None,
+            "heartbeat_healthy": False,
+            "order_book_synchronized": False,
+            "connection_id": connection_id,
+            "connection_last_sequence_num": None,
+            "last_l2_sequence_num": None,
+            "sequence_gap_count": 0,
+            "stale_sequence_count": 0,
+            "heartbeat_timeout_count": 0,
+            "heartbeat_discontinuity_count": 0,
+            "malformed_frame_count": 0,
+            "malformed_level2_count": 0,
+            "crossed_book_count": 0,
+            "heartbeat_timeout_seconds": 5.0,
+        },
+        "canonical_boundary_finalized": canonical_boundary is not None,
         "canonical_boundary": canonical_boundary,
     }
 
@@ -94,7 +99,7 @@ def _boundary_health(
         "source_sequence_num": sequence if synced else None,
     }
     health = _producer_health(connection_id, canonical_boundary=canonical)
-    health.update(
+    health["post_frame_health"].update(
         heartbeat_seen=True,
         heartbeat_last_at_utc=canonical["last_heartbeat_at_utc"],
         heartbeat_healthy=eligible,
@@ -195,12 +200,14 @@ def test_publisher_receiver_preserve_raw_bytes_and_fence_same_timestamp_ties(tmp
     for header, raw_bytes in transport.events:
         receiver.process(header, raw_bytes)
     assert publisher.valid, publisher.failure_reason
-    snapshot = journal.snapshot("session-1")
-    assert [frame.raw_bytes for frame in snapshot.frames] == list(raws)
-    assert [frame.frame_index for frame in snapshot.frames] == [0, 1, 2]
-    assert [frame.ingest_time_utc for frame in snapshot.frames] == list(times)
-    assert snapshot.watermark_utc == BOUNDARY
-    assert snapshot.clock_health_verified is True
+    persisted_frames = journal._connection.execute(
+        "SELECT frame_index, raw_bytes, ingest_time_utc FROM source_frames "
+        "ORDER BY frame_index"
+    ).fetchall()
+    assert [bytes(row["raw_bytes"]) for row in persisted_frames] == list(raws)
+    assert [row["frame_index"] for row in persisted_frames] == [0, 1, 2]
+    assert [datetime.fromisoformat(row["ingest_time_utc"].replace("Z", "+00:00"))
+            for row in persisted_frames] == list(times)
     persisted_health = journal._connection.execute(
         "SELECT frame_index, connection_id, reconnect_epoch, producer_health_json, "
         "producer_health_sha256 FROM source_frame_health ORDER BY frame_index"
@@ -213,14 +220,8 @@ def test_publisher_receiver_preserve_raw_bytes_and_fence_same_timestamp_ties(tmp
         == row["producer_health_sha256"]
         for row in persisted_health
     )
-    persisted_fence = journal._connection.execute(
-        "SELECT producer_health_json, producer_health_sha256 FROM source_fences"
-    ).fetchone()
-    assert hashlib.sha256(
-        persisted_fence["producer_health_json"].encode()
-    ).hexdigest() == persisted_fence["producer_health_sha256"]
-    assert transport.events[-1][0]["kind"] == "fence"
-    assert transport.events[-1][0]["through_frame_index"] == 2
+    assert journal._connection.execute("SELECT COUNT(*) FROM source_fences").fetchone()[0] == 0
+    assert all(header["kind"] == "frame" for header, _ in transport.events)
     publisher.close()
     journal.close()
 
@@ -607,7 +608,7 @@ Leap status     : Normal
     ).verified
 
 
-def test_fenced_watermark_prevents_late_at_or_before_cutoff_frames(tmp_path):
+def test_unfinalized_boundary_cannot_be_fenced_or_certified(tmp_path):
     journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
     receiver = ProspectiveSourceReceiver(journal, clock_health_provider=_clock)
     header = _header(timestamp=BOUNDARY + timedelta(seconds=1))
@@ -623,7 +624,9 @@ def test_fenced_watermark_prevents_late_at_or_before_cutoff_frames(tmp_path):
         "producer_health": _producer_health(),
         "raw_length": 0,
     }
-    assert receiver.process(fence, b"")["durable"]
+    with pytest.raises(ValueError, match="finalized canonical boundary"):
+        receiver.process(fence, b"")
+    assert journal._connection.execute("SELECT COUNT(*) FROM source_fences").fetchone()[0] == 0
     late = dict(header)
     late.update(
         frame_index=1,
@@ -631,12 +634,12 @@ def test_fenced_watermark_prevents_late_at_or_before_cutoff_frames(tmp_path):
         ingest_time_utc=BOUNDARY.isoformat().replace("+00:00", "Z"),
     )
     late["raw_sha256"] = hashlib.sha256(b"fixture-frame").hexdigest()
-    with pytest.raises(ValueError, match="regressed|at or before"):
+    with pytest.raises(ValueError, match="regressed"):
         receiver.process(late, b"fixture-frame")
     journal.close()
 
 
-def test_receiver_restart_and_reconnect_preserve_global_frame_order(tmp_path):
+def test_receiver_restart_and_reconnect_preserve_global_frame_order_without_fence(tmp_path):
     path = tmp_path / "source.sqlite"
     journal = ProspectiveRawFrameJournal(path)
     receiver = ProspectiveSourceReceiver(
@@ -656,29 +659,16 @@ def test_receiver_restart_and_reconnect_preserve_global_frame_order(tmp_path):
     third = _header(index=2, timestamp=BOUNDARY + timedelta(milliseconds=1), connection="connection-1")
     third.update(reconnect_epoch=1, connection_first_frame_index=1)
     receiver.process(third, b"fixture-frame")
-    fence = {
-        "version": 1,
-        "kind": "fence",
-        "session_id": "session-1",
-        "watermark_utc": BOUNDARY.isoformat().replace("+00:00", "Z"),
-        "through_frame_index": 2,
-        "connection_id": "connection-1",
-        "reconnect_epoch": 1,
-        "producer_health": _producer_health("connection-1"),
-        "raw_length": 0,
-    }
-    receiver.process(fence, b"")
-    snapshot = journal.snapshot("session-1")
-    assert [frame.frame_index for frame in snapshot.frames] == [0, 1, 2]
-    assert [frame.connection_id for frame in snapshot.frames] == [
-        "connection-0",
-        "connection-1",
-        "connection-1",
+    persisted = journal._connection.execute(
+        "SELECT frame_index, connection_id FROM source_frames ORDER BY frame_index"
+    ).fetchall()
+    assert [(row["frame_index"], row["connection_id"]) for row in persisted] == [
+        (0, "connection-0"),
+        (1, "connection-1"),
+        (2, "connection-1"),
     ]
-    assert snapshot.watermark_utc == BOUNDARY
-    assert snapshot.clock_health_verified is False
-    assert snapshot.source_mode == "bridge"
-    assert snapshot.source_certified is True
+    assert journal._connection.execute("SELECT COUNT(*) FROM source_fences").fetchone()[0] == 0
+    assert journal.session_mode("session-1") == "bridge"
     journal.close()
 
 
@@ -705,7 +695,7 @@ def test_bridge_mode_rejects_legacy_and_forged_clock_certification(tmp_path):
     forged_receiver = ProspectiveSourceReceiver(
         journal, clock_health_provider=lambda: forged_clock
     )
-    with pytest.raises(ValueError, match="clock|Clock"):
+    with pytest.raises(ValueError, match="finalized canonical boundary"):
         forged_receiver.process(
             {
                 "version": 1,
@@ -726,13 +716,10 @@ def test_bridge_mode_rejects_legacy_and_forged_clock_certification(tmp_path):
     journal.close()
 
 
-def test_later_healthy_reconnection_does_not_rewrite_unhealthy_boundary(tmp_path):
+def test_later_healthy_reconnection_does_not_rewrite_unhealthy_frame_evidence(tmp_path):
     journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
     boundaries = (BOUNDARY, BOUNDARY + timedelta(minutes=15))
-    clocks = iter((_clock_at(boundaries[0], verified=False), _clock_at(boundaries[1])))
-    receiver = ProspectiveSourceReceiver(
-        journal, clock_health_provider=lambda: next(clocks)
-    )
+    receiver = ProspectiveSourceReceiver(journal, clock_health_provider=_clock)
 
     first_health = _boundary_health(
         "connection-0",
@@ -745,21 +732,6 @@ def test_later_healthy_reconnection_does_not_rewrite_unhealthy_boundary(tmp_path
     first = _header(timestamp=boundaries[0] + timedelta(seconds=1))
     first["producer_health"] = first_health
     receiver.process(first, b"fixture-frame")
-    receiver.process(
-        {
-            "version": 1,
-            "kind": "fence",
-            "session_id": "session-1",
-            "watermark_utc": boundaries[0].isoformat().replace("+00:00", "Z"),
-            "through_frame_index": 0,
-            "connection_id": "connection-0",
-            "reconnect_epoch": 0,
-            "producer_health": first_health,
-            "raw_length": 0,
-        },
-        b"",
-    )
-
     recovered_health = _boundary_health(
         "connection-1", boundaries[1], eligible=True, sequence=2
     )
@@ -771,32 +743,17 @@ def test_later_healthy_reconnection_does_not_rewrite_unhealthy_boundary(tmp_path
     recovered.update(reconnect_epoch=1, connection_first_frame_index=1)
     recovered["producer_health"] = recovered_health
     receiver.process(recovered, b"fixture-frame")
-    receiver.process(
-        {
-            "version": 1,
-            "kind": "fence",
-            "session_id": "session-1",
-            "watermark_utc": boundaries[1].isoformat().replace("+00:00", "Z"),
-            "through_frame_index": 1,
-            "connection_id": "connection-1",
-            "reconnect_epoch": 1,
-            "producer_health": recovered_health,
-            "raw_length": 0,
-        },
-        b"",
-    )
-
-    unhealthy = journal.snapshot_through(
-        "session-1", boundary_utc=boundaries[0]
-    )
-    healthy = journal.snapshot_through(
-        "session-1", boundary_utc=boundaries[1]
-    )
-    assert unhealthy.source_certified and not unhealthy.clock_health_verified
-    assert unhealthy.producer_health["canonical_boundary"]["eligibility_reason"] == "sequence_gap"
-    assert healthy.source_certified and healthy.clock_health_verified
-    assert healthy.producer_health["canonical_boundary"]["canonical_target_eligible"]
-    assert healthy.producer_health["sequence_gap_count"] == 0
+    stored = journal._connection.execute(
+        "SELECT frame_index, producer_health_json FROM source_frame_health "
+        "ORDER BY frame_index"
+    ).fetchall()
+    assert json.loads(stored[0]["producer_health_json"])["canonical_boundary"][
+        "eligibility_reason"
+    ] == "sequence_gap"
+    assert json.loads(stored[1]["producer_health_json"])["canonical_boundary"][
+        "canonical_target_eligible"
+    ] is True
+    assert journal._connection.execute("SELECT COUNT(*) FROM source_fences").fetchone()[0] == 0
     journal.close()
 
 
@@ -809,9 +766,16 @@ def test_later_healthy_reconnection_does_not_rewrite_unhealthy_boundary(tmp_path
                 **_boundary_health(
                     "connection-0", BOUNDARY, eligible=True, sequence=1
                 ),
-                "order_book_synchronized": False,
+                "canonical_boundary": {
+                    **_boundary_health(
+                        "connection-0", BOUNDARY, eligible=True, sequence=1
+                    )["canonical_boundary"],
+                    "last_heartbeat_at_utc": (
+                        BOUNDARY + timedelta(seconds=1)
+                    ).isoformat().replace("+00:00", "Z"),
+                },
             },
-            "contradicts producer health",
+            "contradicts its evidence",
         ),
     ],
 )
@@ -826,6 +790,22 @@ def test_bridge_rejects_missing_or_inconsistent_health_evidence(
         receiver.process(header, b"fixture-frame")
     assert journal.session_started_at("session-1") is None
     journal.close()
+
+
+def test_boundary_connection_may_differ_from_post_cutoff_witness_connection():
+    health = _boundary_health(
+        "connection-before-boundary", BOUNDARY, eligible=True, sequence=1
+    )
+    health["post_frame_health"]["connection_id"] = "connection-after-boundary"
+    validated = _validate_bridge_health(
+        health,
+        boundary=BOUNDARY,
+        connection_id="connection-after-boundary",
+    )
+    assert (
+        validated["canonical_boundary"]["connection_id"]
+        == "connection-before-boundary"
+    )
 
 
 @pytest.mark.parametrize(

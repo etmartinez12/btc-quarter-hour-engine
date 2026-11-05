@@ -23,6 +23,7 @@ from btc_quarter_hour_engine.research.prospective_source import (
     ProspectiveRawFrameJournal,
     _validate_bridge_health,
 )
+from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
 
 try:
     import fcntl
@@ -432,7 +433,14 @@ class NonBlockingSourcePublisher:
             )
             if cutoff > self.session_started_at_utc and received > cutoff:
                 if self._last_fence_utc is None or cutoff > self._last_fence_utc:
-                    if received <= cutoff + SOURCE_CERTIFICATION_WINDOW:
+                    finalized = (
+                        producer_health.get("canonical_boundary_finalized") is True
+                        and isinstance(producer_health.get("canonical_boundary"), dict)
+                    )
+                    if (
+                        finalized
+                        and received <= cutoff + SOURCE_CERTIFICATION_WINDOW
+                    ):
                         self.publish_fence(cutoff, producer_health=producer_health)
         return enqueued
 
@@ -571,6 +579,118 @@ class ProspectiveSourceReceiver:
         self.durable_ack_latency_max_ms = 0.0
         self.watermark_latency_max_ms = 0.0
         self._session_started: dict[str, datetime] = {}
+        self._canonical_replays: dict[str, CanonicalReplayAccumulator] = {}
+        self._canonical_timeouts: dict[str, float] = {}
+
+    def _canonical_replay(
+        self, session_id: str, heartbeat_timeout_seconds: float
+    ) -> CanonicalReplayAccumulator:
+        timeout = float(heartbeat_timeout_seconds)
+        replay = self._canonical_replays.get(session_id)
+        if replay is not None:
+            if self._canonical_timeouts[session_id] != timeout:
+                raise ValueError("Source canonical replay heartbeat tolerance changed")
+            return replay
+
+        started = self.journal.session_started_at(session_id)
+        if started is None:
+            raise ValueError("Canonical source replay session is not registered")
+        replay = CanonicalReplayAccumulator(
+            product_id="BTC-USD",
+            session_id=session_id,
+            heartbeat_timeout_seconds=timeout,
+        )
+        rows = self.journal._connection.execute(
+            "SELECT f.frame_index, f.connection_id, f.ingest_time_utc, f.raw_bytes, "
+            "h.producer_health_json FROM source_frames f "
+            "JOIN source_frame_health h ON h.session_id = f.session_id "
+            "AND h.frame_index = f.frame_index WHERE f.session_id = ? "
+            "ORDER BY f.frame_index",
+            (session_id,),
+        ).fetchall()
+        for row in rows:
+            evidence = json.loads(row["producer_health_json"])
+            frame_timeout = float(
+                evidence["post_frame_health"]["heartbeat_timeout_seconds"]
+            )
+            if frame_timeout != timeout:
+                raise ValueError("Source frame heartbeat tolerance changed within session")
+            replay.consume(
+                bytes(row["raw_bytes"]),
+                row["connection_id"],
+                row["frame_index"],
+                _parse_utc(row["ingest_time_utc"], field="frame receive timestamp"),
+            )
+        self._canonical_replays[session_id] = replay
+        self._canonical_timeouts[session_id] = timeout
+        return replay
+
+    def _verify_canonical_boundary(
+        self,
+        *,
+        session_id: str,
+        watermark: datetime,
+        frame_health: dict[str, Any],
+    ) -> None:
+        canonical = frame_health["canonical_boundary"]
+        replay = self._canonical_replay(
+            session_id,
+            frame_health["post_frame_health"]["heartbeat_timeout_seconds"],
+        )
+        if not replay.boundary_is_finalized(watermark):
+            raise ValueError("Canonical boundary was not finalized by committed raw frames")
+        latest = self.journal._connection.execute(
+            "SELECT ingest_time_utc FROM source_frames WHERE session_id = ? "
+            "ORDER BY frame_index DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if latest is None:
+            raise ValueError("Canonical source replay has no committed frame prefix")
+        started = self.journal.session_started_at(session_id)
+        if started is None:
+            raise ValueError("Canonical source replay session is not registered")
+        connections = [
+            {"connection_id": row["connection_id"]}
+            for row in self.journal._connection.execute(
+                "SELECT connection_id FROM source_connections WHERE session_id = ? "
+                "ORDER BY reconnect_epoch",
+                (session_id,),
+            ).fetchall()
+        ]
+        observations = replay.finalize(
+            session_started_at_utc=started,
+            session_completed_at_utc=_parse_utc(
+                latest["ingest_time_utc"], field="frame receive timestamp"
+            ),
+            derived_at_utc=_parse_utc(
+                latest["ingest_time_utc"], field="frame receive timestamp"
+            ),
+            connections=connections,
+        )
+        observation = next(
+            (item for item in observations if item.boundary_time_utc == watermark),
+            None,
+        )
+        if observation is None:
+            raise ValueError("Canonical replay cannot establish the fenced boundary")
+        expected = {
+            "boundary_utc": _iso(observation.boundary_time_utc),
+            "canonical_target_eligible": observation.canonical_target_eligible,
+            "eligibility_reason": observation.eligibility_reason,
+            "book_synced": observation.book_synced,
+            "last_heartbeat_at_utc": (
+                _iso(observation.last_heartbeat_at_utc)
+                if observation.last_heartbeat_at_utc is not None
+                else None
+            ),
+            "heartbeat_timeout_seconds": float(
+                observation.heartbeat_timeout_seconds
+            ),
+            "connection_id": observation.connection_id,
+            "source_sequence_num": observation.source_sequence_num,
+        }
+        if canonical != expected:
+            raise ValueError("Producer canonical boundary disagrees with raw-frame replay")
 
     def process(self, header: dict[str, Any], raw_bytes: bytes) -> dict[str, Any]:
         started = time.perf_counter_ns()
@@ -693,6 +813,9 @@ class ProspectiveSourceReceiver:
             self.frame_write_latency_max_ms, write_latency
         )
         self.frames_committed += 1
+        replay = self._canonical_replays.get(session_id)
+        if replay is not None:
+            replay.consume(raw_bytes, connection_id, frame_index, ingest)
         return {
             "durable": True,
             "kind": "frame",
@@ -718,7 +841,7 @@ class ProspectiveSourceReceiver:
             or health.get("publisher_valid") is not True
         ):
             raise ValueError("Producer fence metadata is invalid or unhealthy")
-        _validate_bridge_health(
+        validated_health = _validate_bridge_health(
             health,
             boundary=watermark,
             connection_id=connection_id,
@@ -731,6 +854,16 @@ class ProspectiveSourceReceiver:
         if latest is None or latest["frame_index"] != frame_index:
             self.gaps += 1
             raise ValueError("Producer fence arrived before its complete durable frame prefix")
+        if (
+            validated_health["canonical_boundary_finalized"] is not True
+            or validated_health["canonical_boundary"] is None
+        ):
+            raise ValueError("Producer fence lacks finalized canonical boundary evidence")
+        self._verify_canonical_boundary(
+            session_id=session_id,
+            watermark=watermark,
+            frame_health=validated_health,
+        )
         clock = self.clock_health_provider()
         if not isinstance(clock, ClockHealthEvidence):
             raise TypeError("Clock-health provider returned invalid evidence")

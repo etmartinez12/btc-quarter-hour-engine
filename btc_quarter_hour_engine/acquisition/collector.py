@@ -105,6 +105,10 @@ class WebSocketCollector:
     _stop_fn: Any = field(default=None, init=False)
     _source_connection_id: str | None = field(default=None, init=False)
     _source_reconnect_epoch: int = field(default=-1, init=False)
+    _source_session_started_at_utc: datetime | None = field(default=None, init=False)
+    _canonical_boundary_cache: dict[datetime, dict[str, Any]] = field(
+        default_factory=dict, init=False
+    )
 
     def __post_init__(self) -> None:
         if self.sleep_fn is None:
@@ -161,6 +165,8 @@ class WebSocketCollector:
     ) -> None:
         if self.source_publisher is None or frame_index is None:
             return
+        if self._source_session_started_at_utc is None:
+            raise RuntimeError("Source session start has not been initialized")
         connection = self.service.connection
         connection_id = connection.connection_id if connection is not None else None
         if connection_id != self._source_connection_id:
@@ -170,36 +176,48 @@ class WebSocketCollector:
         cutoff = received.replace(
             minute=received.minute - received.minute % 15, second=0, microsecond=0
         )
-        boundary_observation = next(
-            (
-                item
-                for item in reversed(observations)
-                if item.boundary_time_utc == cutoff
-            ),
-            None,
-        )
-        canonical_boundary = None
-        if boundary_observation is not None:
-            canonical_boundary = {
-                "boundary_utc": self._health_timestamp(
-                    boundary_observation.boundary_time_utc
+        canonical_boundary = self._canonical_boundary_cache.get(cutoff)
+        if (
+            canonical_boundary is None
+            and self._canonical_accumulator.boundary_is_finalized(cutoff)
+        ):
+            authoritative_observations = self._canonical_accumulator.finalize(
+                session_started_at_utc=self._source_session_started_at_utc,
+                session_completed_at_utc=received,
+                derived_at_utc=received,
+                connections=self._connections(),
+            )
+            boundary_observation = next(
+                (
+                    item
+                    for item in authoritative_observations
+                    if item.boundary_time_utc == cutoff
                 ),
-                "canonical_target_eligible": bool(
-                    boundary_observation.canonical_target_eligible
-                ),
-                "eligibility_reason": boundary_observation.eligibility_reason,
-                "book_synced": bool(boundary_observation.book_synced),
-                "last_heartbeat_at_utc": self._health_timestamp(
-                    boundary_observation.last_heartbeat_at_utc
-                ),
-                "heartbeat_timeout_seconds": float(
-                    boundary_observation.heartbeat_timeout_seconds
-                ),
-                "connection_id": boundary_observation.connection_id,
-                "source_sequence_num": boundary_observation.source_sequence_num,
-            }
+                None,
+            )
+            if boundary_observation is not None:
+                canonical_boundary = {
+                    "boundary_utc": self._health_timestamp(
+                        boundary_observation.boundary_time_utc
+                    ),
+                    "canonical_target_eligible": bool(
+                        boundary_observation.canonical_target_eligible
+                    ),
+                    "eligibility_reason": boundary_observation.eligibility_reason,
+                    "book_synced": bool(boundary_observation.book_synced),
+                    "last_heartbeat_at_utc": self._health_timestamp(
+                        boundary_observation.last_heartbeat_at_utc
+                    ),
+                    "heartbeat_timeout_seconds": float(
+                        boundary_observation.heartbeat_timeout_seconds
+                    ),
+                    "connection_id": boundary_observation.connection_id,
+                    "source_sequence_num": boundary_observation.source_sequence_num,
+                }
+                self._canonical_boundary_cache[cutoff] = canonical_boundary
+        canonical_boundary_finalized = canonical_boundary is not None
         diagnostics = connection
-        health = {
+        post_frame_health = {
             "publisher_valid": bool(getattr(self.source_publisher, "valid", True)),
             "heartbeat_seen": self.service.last_heartbeat_at is not None,
             "heartbeat_last_at_utc": self._health_timestamp(
@@ -235,6 +253,14 @@ class WebSocketCollector:
             "crossed_book_count": (
                 diagnostics.crossed_book_count if diagnostics is not None else 0
             ),
+            "heartbeat_timeout_seconds": float(
+                self.service.config.heartbeat_timeout_seconds
+            ),
+        }
+        health = {
+            "publisher_valid": post_frame_health.pop("publisher_valid"),
+            "post_frame_health": post_frame_health,
+            "canonical_boundary_finalized": canonical_boundary_finalized,
             "canonical_boundary": canonical_boundary,
         }
         try:
@@ -267,6 +293,7 @@ class WebSocketCollector:
         stop_fn: Any = None,
     ) -> CollectorResult:
         started_at = self.service._utcnow()
+        self._source_session_started_at_utc = started_at
         if self.source_publisher_factory is not None:
             if self.source_publisher is not None:
                 raise ValueError("Provide a source publisher or factory, not both")

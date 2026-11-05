@@ -150,8 +150,17 @@ def _validate_bridge_health(
 ) -> dict[str, Any]:
     if not isinstance(health, dict):
         raise ValueError("Bridge source producer-health evidence is missing")
-    expected = {
+    if set(health) != {
         "publisher_valid",
+        "post_frame_health",
+        "canonical_boundary_finalized",
+        "canonical_boundary",
+    }:
+        raise ValueError("Bridge source producer-health evidence is incomplete")
+    if health["publisher_valid"] is not True:
+        raise ValueError("Bridge source publisher-health evidence is invalid")
+    post_frame = health["post_frame_health"]
+    expected_post_frame = {
         "heartbeat_seen",
         "heartbeat_last_at_utc",
         "heartbeat_healthy",
@@ -166,30 +175,34 @@ def _validate_bridge_health(
         "malformed_frame_count",
         "malformed_level2_count",
         "crossed_book_count",
-        "canonical_boundary",
+        "heartbeat_timeout_seconds",
     }
-    if not expected.issubset(health):
-        raise ValueError("Bridge source producer-health evidence is incomplete")
-    if health["publisher_valid"] is not True:
-        raise ValueError("Bridge source publisher-health evidence is invalid")
-    if not isinstance(health["connection_id"], str) or not health["connection_id"]:
+    if not isinstance(post_frame, dict) or set(post_frame) != expected_post_frame:
+        raise ValueError("Bridge post-frame producer-health evidence is incomplete")
+    if not isinstance(post_frame["connection_id"], str) or not post_frame["connection_id"]:
         raise ValueError("Bridge source connection-health identity is invalid")
-    if connection_id is not None and health["connection_id"] != connection_id:
+    if connection_id is not None and post_frame["connection_id"] != connection_id:
         raise ValueError("Bridge source connection-health identity does not match")
-    if type(health["heartbeat_seen"]) is not bool:
+    if type(post_frame["heartbeat_seen"]) is not bool:
         raise ValueError("Bridge heartbeat-health evidence is invalid")
-    heartbeat = health["heartbeat_last_at_utc"]
-    if health["heartbeat_seen"] != isinstance(heartbeat, str):
+    heartbeat = post_frame["heartbeat_last_at_utc"]
+    if post_frame["heartbeat_seen"] != isinstance(heartbeat, str):
         raise ValueError("Bridge heartbeat-health timestamp is inconsistent")
     if heartbeat is not None:
         try:
             _parse_utc(heartbeat)
         except (TypeError, ValueError) as exc:
             raise ValueError("Bridge heartbeat-health timestamp is malformed") from exc
-    if type(health["order_book_synchronized"]) is not bool:
-        raise ValueError("Bridge order-book health evidence is invalid")
-    if type(health["heartbeat_healthy"]) is not bool:
+    if type(post_frame["order_book_synchronized"]) is not bool:
+        raise ValueError("Bridge post-frame order-book health evidence is invalid")
+    if type(post_frame["heartbeat_healthy"]) is not bool:
         raise ValueError("Bridge heartbeat-health status is invalid")
+    if (
+        type(post_frame["heartbeat_timeout_seconds"]) not in (int, float)
+        or not math.isfinite(float(post_frame["heartbeat_timeout_seconds"]))
+        or post_frame["heartbeat_timeout_seconds"] < 0
+    ):
+        raise ValueError("Bridge post-frame heartbeat timeout is invalid")
     for field in (
         "sequence_gap_count",
         "stale_sequence_count",
@@ -199,16 +212,23 @@ def _validate_bridge_health(
         "malformed_level2_count",
         "crossed_book_count",
     ):
-        if type(health[field]) is not int or health[field] < 0:
+        if type(post_frame[field]) is not int or post_frame[field] < 0:
             raise ValueError(f"Bridge producer-health counter {field} is invalid")
     for field in ("connection_last_sequence_num", "last_l2_sequence_num"):
-        sequence = health[field]
+        sequence = post_frame[field]
         if sequence is not None and (type(sequence) is not int or sequence < 0):
             raise ValueError("Bridge connection sequence-health evidence is invalid")
 
+    finalized = health["canonical_boundary_finalized"]
+    if type(finalized) is not bool:
+        raise ValueError("Bridge canonical boundary finalization status is invalid")
     canonical = health["canonical_boundary"]
     if canonical is None:
+        if finalized:
+            raise ValueError("Bridge finalized boundary lacks canonical evidence")
         return health
+    if not finalized:
+        raise ValueError("Bridge canonical boundary evidence is not finalized")
     if not isinstance(canonical, dict):
         raise ValueError("Bridge canonical boundary-health evidence is missing")
     if set(canonical) != {
@@ -234,15 +254,17 @@ def _validate_bridge_health(
     if type(canonical["heartbeat_timeout_seconds"]) not in (int, float):
         raise ValueError("Bridge canonical heartbeat tolerance is invalid")
     timeout = float(canonical["heartbeat_timeout_seconds"])
-    if not math.isfinite(timeout) or timeout < 0:
+    if (
+        not math.isfinite(timeout)
+        or timeout < 0
+        or timeout != float(post_frame["heartbeat_timeout_seconds"])
+    ):
         raise ValueError("Bridge canonical heartbeat tolerance is invalid")
     canonical_connection = canonical["connection_id"]
     if canonical_connection is not None and (
         not isinstance(canonical_connection, str) or not canonical_connection
     ):
         raise ValueError("Bridge canonical connection-health identity is invalid")
-    if canonical_connection is not None and canonical_connection != health["connection_id"]:
-        raise ValueError("Bridge canonical and producer connection identities disagree")
     canonical_heartbeat = canonical["last_heartbeat_at_utc"]
     if canonical_heartbeat is not None:
         if not isinstance(canonical_heartbeat, str):
@@ -270,19 +292,11 @@ def _validate_bridge_health(
             raise ValueError("Bridge canonical health decision contradicts its evidence")
         if canonical_connection is None:
             raise ValueError("Eligible bridge boundary lacks connection identity")
-        if connection_id is not None and canonical_connection != connection_id:
-            raise ValueError("Eligible bridge boundary connection does not match")
         if (
-            health["heartbeat_healthy"] is not True
-            or health["order_book_synchronized"] is not True
-            or synced is not True
-            or health["heartbeat_last_at_utc"] != last_heartbeat
+            synced is not True
             or canonical["source_sequence_num"] is None
-            or canonical["source_sequence_num"] != health["last_l2_sequence_num"]
         ):
-            raise ValueError("Bridge canonical eligibility contradicts producer health")
-    elif synced != health["order_book_synchronized"]:
-        raise ValueError("Bridge boundary book-health evidence is inconsistent")
+            raise ValueError("Bridge canonical eligibility contradicts its as-of evidence")
     return health
 
 

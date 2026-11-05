@@ -157,15 +157,22 @@ as timely progress. A new collector session gets a new source session ID.
 
 A fence is ordered after its frames in the publisher queue. The publisher
 emits a quarter-hour cutoff only after receiving a later frame whose
-authoritative collector timestamp is strictly beyond that cutoff. This
-post-cutoff witness makes all frames sharing the cutoff timestamp precede
-the fence. The receiver accepts it only when its `through_frame_index` equals
-the latest durably committed frame and the witness timestamp is after the
-cutoff, then commits the fence and watermark atomically. Later frames at or
-before the watermark are rejected. A producer stall, missing frame, queue
-overflow, consumer failure, stale connection epoch, malformed message,
-journal error, or missing fence therefore cannot advance completeness. The
-watermark is a durable contiguous-prefix claim, not a wall-clock timer.
+authoritative collector timestamp is strictly beyond that cutoff and the
+canonical replay accumulator has frozen the boundary candidate. A heartbeat
+alone is not sufficient to freeze the book state. If the first post-cutoff
+frame does not finalize the candidate, subsequent frames continue to enqueue
+without blocking collection; only an authoritative eligible or ineligible
+boundary result can be fenced, and only within the unchanged T+60-second
+window. This post-cutoff witness makes all frames sharing the cutoff timestamp
+precede the fence. The receiver accepts it only when its `through_frame_index`
+equals the latest durably committed frame, the witness timestamp is after the
+cutoff, and replaying the committed raw prefix produces the exact same
+canonical boundary evidence. It then commits the fence and watermark
+atomically. Later frames at or before the watermark are rejected. A producer
+stall, missing frame, queue overflow, consumer failure, stale connection epoch,
+malformed message, journal error, or missing fence therefore cannot advance
+completeness. The watermark is a durable contiguous-prefix claim, not a
+wall-clock timer.
 
 Bridge-backed sessions persist an explicit source mode. Their read APIs require
 the exact committed producer fence for each requested quarter-hour; the legacy
@@ -177,16 +184,19 @@ its witness arrives within 60 seconds of the boundary. An unhealthy fence for
 one boundary remains unhealthy even if a later boundary or reconnect is
 healthy; later evidence cannot replace the earlier boundary's certificate.
 
-Completeness and market-data eligibility are separate. The receiver persists
-connection-scoped heartbeat, sequence, and synchronized-book diagnostics, plus
-the canonical boundary observation produced while processing the witness.
-Prediction eligibility uses that exact observation's canonical rules, including
-heartbeat freshness, book synchronization, boundary connection identity, and
-sequence evidence; a complete source prefix alone never makes a prediction
-eligible. Reconnects begin a new diagnostics epoch, so a legitimately recovered
-book is not disqualified by an earlier connection's counters, and later
-recovery cannot make an earlier unhealthy boundary appear healthy. Missing or
-internally inconsistent producer evidence fails closed.
+Completeness and market-data eligibility are separate. Producer-health records
+distinguish post-frame operational heartbeat, connection, sequence, and book
+health from canonical as-of-boundary evidence. The collector derives the latter
+from the same `CanonicalReplayAccumulator` used by authoritative replay; the
+receiver independently replays the committed raw prefix and rejects any
+mismatch. Boundary heartbeat freshness uses only the last heartbeat at or
+before T, while post-T heartbeat/book mutations cannot rewrite a frozen
+candidate. Prediction eligibility uses that exact observation's canonical
+rules; a complete source prefix alone never makes a prediction eligible.
+Reconnects begin a new diagnostics epoch, so a legitimately recovered book is
+not disqualified by an earlier connection's counters, and later recovery cannot
+make an earlier unhealthy boundary appear healthy. Missing or internally
+inconsistent producer evidence fails closed.
 
 Clock synchronization is a separate receiver-side check using read-only
 `chronyc tracking` evidence. By default it requires a `Normal` leap status,

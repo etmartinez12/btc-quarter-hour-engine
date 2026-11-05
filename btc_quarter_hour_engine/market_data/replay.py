@@ -1611,6 +1611,16 @@ class CanonicalReplayAccumulator:
             self.observed_min = min(self.observed_min, timestamp) if self.observed_min is not None else timestamp
             self.observed_max = max(self.observed_max, timestamp) if self.observed_max is not None else timestamp
 
+    def boundary_is_finalized(self, boundary_utc: datetime) -> bool:
+        """Return whether delivery has frozen a canonical candidate at boundary T."""
+        boundary = require_utc(boundary_utc)
+        if boundary != floor_to_quarter_hour(boundary):
+            raise ValueError("Boundary must be an exact UTC quarter-hour")
+        return any(
+            boundary in state.boundary_candidates
+            for state in self._connections.values()
+        )
+
     def finalize(
         self,
         *,
