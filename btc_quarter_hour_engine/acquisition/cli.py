@@ -18,6 +18,7 @@ from .config import CoinbaseRESTConfig, CoinbaseWebSocketConfig
 from .service import acquire_coinbase_book_snapshot, acquire_coinbase_candles
 from .websocket_service import CoinbaseWebSocketService
 from .websocket_transport import WebsocketsTransport
+from .prospective_source_bridge import NonBlockingSourcePublisher
 
 
 def _parse_utc(value: str) -> datetime:
@@ -124,6 +125,14 @@ def collect_coinbase_bbo_main() -> None:
         default=300.0,
         help="Checkpoint normalized rows after this many seconds, even below the row threshold (default: 300).",
     )
+    parser.add_argument(
+        "--prospective-source-socket",
+        default=None,
+        help=(
+            "Optional local Unix socket for the isolated prospective journal receiver. "
+            "Omit to keep the prospective publisher disabled."
+        ),
+    )
     args = parser.parse_args()
 
     config = CoinbaseWebSocketConfig(product_id=args.product)
@@ -144,6 +153,16 @@ def collect_coinbase_bbo_main() -> None:
         output_root=args.output_root,
         flush_row_threshold=args.flush_row_threshold,
         flush_interval_seconds=args.flush_interval_seconds,
+        source_publisher_factory=(
+            lambda session_id, started_at: NonBlockingSourcePublisher(
+                args.prospective_source_socket,
+                session_id=session_id,
+                session_started_at_utc=started_at,
+                max_frame_bytes=config.max_message_size_bytes,
+            )
+            if args.prospective_source_socket
+            else None
+        ),
     )
     stop_event = threading.Event()
     previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
@@ -185,6 +204,9 @@ def collect_coinbase_bbo_main() -> None:
     print(f"connection_count={result.connection_count}")
     print(f"reconnect_count={result.reconnect_count}")
     print(f"canonical_target_eligible={str(result.manifest['canonical_target_eligible']).lower()}")
+    source_metrics = getattr(result, "source_metrics", None)
+    if source_metrics is not None:
+        print(f"prospective_source_metrics={source_metrics}")
 
 
 # Deprecated alias retained for backward compatibility with earlier installs

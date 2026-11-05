@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -52,10 +53,14 @@ class CollectorResult:
     raw_frame_count: int
     level2_message_count: int
     heartbeat_message_count: int
+    source_metrics: dict[str, Any] | None = None
 
 
 def _observation_row(observation: Any) -> dict[str, Any]:
-    return asdict(observation)
+    row = asdict(observation)
+    row.pop("last_heartbeat_at_utc", None)
+    row.pop("heartbeat_timeout_seconds", None)
+    return row
 
 
 @dataclass(slots=True)
@@ -87,6 +92,8 @@ class WebSocketCollector:
     sleep_fn: Any = field(default=None)
     flush_row_threshold: int = 100_000
     flush_interval_seconds: float = 300.0
+    source_publisher: Any = None
+    source_publisher_factory: Any = None
     connection_count: int = field(default=0, init=False)
     reconnect_count: int = field(default=0, init=False)
     _frame_count: int = field(default=0, init=False)
@@ -96,7 +103,21 @@ class WebSocketCollector:
     _level2_update_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
     _bbo_state_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
     _canonical_accumulator: CanonicalReplayAccumulator = field(init=False)
+    _source_canonical_accumulator: CanonicalReplayAccumulator | None = field(
+        default=None, init=False
+    )
+    _source_canonical_failure: str | None = field(default=None, init=False)
     _stop_fn: Any = field(default=None, init=False)
+    _source_connection_id: str | None = field(default=None, init=False)
+    _source_reconnect_epoch: int = field(default=-1, init=False)
+    _source_session_started_at_utc: datetime | None = field(default=None, init=False)
+    _canonical_boundary_cache: dict[datetime, dict[str, Any]] = field(
+        default_factory=dict, init=False
+    )
+    _source_canonical_latency_max_ms: float = field(default=0.0, init=False)
+    _source_enqueue_latency_max_ms: float = field(default=0.0, init=False)
+    _source_canonical_failure_count: int = field(default=0, init=False)
+    _source_pruned_boundary: datetime | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.sleep_fn is None:
@@ -112,6 +133,12 @@ class WebSocketCollector:
             session_id=self.service.session_id,
             heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
         )
+        if self.source_publisher is not None:
+            self._source_canonical_accumulator = CanonicalReplayAccumulator(
+                product_id=self.service.config.product_id,
+                session_id=self.service.session_id,
+                heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
+            )
 
     def _connections(self) -> list[Any]:
         connections = [*self.service.connection_history]
@@ -134,8 +161,184 @@ class WebSocketCollector:
             frame_index,
             frame.received_at_utc,
         )
+        if self._source_canonical_accumulator is not None and self._source_canonical_failure is None:
+            try:
+                self._source_canonical_accumulator.consume(
+                    frame.raw_bytes,
+                    connection_id,
+                    frame_index,
+                    frame.received_at_utc,
+                    enforce_live_limits=True,
+                )
+            except Exception as exc:
+                self._source_canonical_failure = type(exc).__name__
+                self._source_canonical_failure_count += 1
         self._frame_count += 1
         return frame_index
+
+    @staticmethod
+    def _health_timestamp(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+
+    def _publish_source_frame(
+        self,
+        frame: Any,
+        frame_index: int | None,
+        observations: list[Any],
+    ) -> None:
+        if self.source_publisher is None or frame_index is None:
+            return
+        connection = self.service.connection
+        connection_id = connection.connection_id if connection is not None else None
+        if connection_id != self._source_connection_id:
+            self._source_reconnect_epoch += 1
+            self._source_connection_id = connection_id
+        received = frame.received_at_utc.astimezone(timezone.utc)
+        cutoff = received.replace(
+            minute=received.minute - received.minute % 15, second=0, microsecond=0
+        )
+        canonical_started = time.perf_counter_ns()
+        canonical_boundary = None
+        try:
+            if self._source_session_started_at_utc is None:
+                raise RuntimeError("Source session start has not been initialized")
+            if (
+                cutoff > self._source_session_started_at_utc
+                and self._source_canonical_failure is None
+            ):
+                source_accumulator = self._source_canonical_accumulator
+                if source_accumulator is None:
+                    raise RuntimeError("Canonical source replay was not initialized")
+                canonical_boundary = self._canonical_boundary_cache.get(cutoff)
+                if (
+                    canonical_boundary is None
+                    and source_accumulator.boundary_is_finalized(cutoff)
+                ):
+                    observation = source_accumulator.boundary_observation(
+                        cutoff,
+                        derived_at_utc=received,
+                    )
+                    canonical_boundary = {
+                        "boundary_utc": self._health_timestamp(
+                            observation.boundary_time_utc
+                        ),
+                        "canonical_target_eligible": bool(
+                            observation.canonical_target_eligible
+                        ),
+                        "eligibility_reason": observation.eligibility_reason,
+                        "book_synced": bool(observation.book_synced),
+                        "last_heartbeat_at_utc": self._health_timestamp(
+                            observation.last_heartbeat_at_utc
+                        ),
+                        "heartbeat_timeout_seconds": float(
+                            observation.heartbeat_timeout_seconds
+                        ),
+                        "connection_id": observation.connection_id,
+                        "source_sequence_num": observation.source_sequence_num,
+                    }
+                    self._canonical_boundary_cache[cutoff] = canonical_boundary
+        except Exception as exc:
+            self._source_canonical_failure_count += 1
+            self.service._record_diagnostic(
+                kind="prospective_source_canonical_evidence_failed",
+                reason=type(exc).__name__,
+                frame_index=frame_index,
+            )
+            canonical_boundary = None
+        finally:
+            self._source_canonical_latency_max_ms = max(
+                self._source_canonical_latency_max_ms,
+                (time.perf_counter_ns() - canonical_started) / 1_000_000,
+            )
+        canonical_boundary_finalized = canonical_boundary is not None
+        diagnostics = connection
+        post_frame_health = {
+            "publisher_valid": bool(getattr(self.source_publisher, "valid", True)),
+            "heartbeat_seen": self.service.last_heartbeat_at is not None,
+            "heartbeat_last_at_utc": self._health_timestamp(
+                self.service.last_heartbeat_at
+            ),
+            "heartbeat_healthy": bool(self.service.heartbeat_is_healthy()),
+            "order_book_synchronized": self.service.order_book.is_synced(),
+            "connection_id": connection_id,
+            "connection_last_sequence_num": (
+                diagnostics.last_envelope_sequence_num if diagnostics is not None else None
+            ),
+            "last_l2_sequence_num": (
+                diagnostics.last_sequence_num if diagnostics is not None else None
+            ),
+            "sequence_gap_count": (
+                diagnostics.sequence_gap_count if diagnostics is not None else 0
+            ),
+            "stale_sequence_count": (
+                diagnostics.stale_sequence_count if diagnostics is not None else 0
+            ),
+            "heartbeat_timeout_count": (
+                diagnostics.heartbeat_timeout_count if diagnostics is not None else 0
+            ),
+            "heartbeat_discontinuity_count": (
+                diagnostics.heartbeat_discontinuity_count if diagnostics is not None else 0
+            ),
+            "malformed_frame_count": (
+                diagnostics.malformed_frame_count if diagnostics is not None else 0
+            ),
+            "malformed_level2_count": (
+                diagnostics.malformed_level2_count if diagnostics is not None else 0
+            ),
+            "crossed_book_count": (
+                diagnostics.crossed_book_count if diagnostics is not None else 0
+            ),
+            "heartbeat_timeout_seconds": float(
+                self.service.config.heartbeat_timeout_seconds
+            ),
+        }
+        health = {
+            "publisher_valid": post_frame_health.pop("publisher_valid"),
+            "post_frame_health": post_frame_health,
+            "canonical_boundary_finalized": canonical_boundary_finalized,
+            "canonical_boundary": canonical_boundary,
+        }
+        enqueue_started = time.perf_counter_ns()
+        try:
+            published = self.source_publisher.publish_frame(
+                connection_id=connection_id,
+                reconnect_epoch=self._source_reconnect_epoch,
+                frame_index=frame_index,
+                raw_bytes=bytes(frame.raw_bytes),
+                received_at_utc=frame.received_at_utc,
+                producer_health=health,
+            )
+            if not published:
+                self.service._record_diagnostic(
+                    kind="prospective_source_progress_invalid",
+                    reason=getattr(self.source_publisher, "failure_reason", None),
+                    frame_index=frame_index,
+                )
+        except Exception as exc:
+            self.service._record_diagnostic(
+                kind="prospective_source_publish_failed",
+                reason=type(exc).__name__,
+                frame_index=frame_index,
+            )
+        finally:
+            self._source_enqueue_latency_max_ms = max(
+                self._source_enqueue_latency_max_ms,
+                (time.perf_counter_ns() - enqueue_started) / 1_000_000,
+            )
+        if (
+            canonical_boundary_finalized
+            and self._source_canonical_accumulator is not None
+            and self._source_pruned_boundary != cutoff
+        ):
+            self._source_canonical_accumulator.prune_for_next_boundary(cutoff)
+            self._canonical_boundary_cache = {
+                cutoff: canonical_boundary
+            }
+            self._source_pruned_boundary = cutoff
 
     def run(
         self,
@@ -145,11 +348,31 @@ class WebSocketCollector:
         stop_fn: Any = None,
     ) -> CollectorResult:
         started_at = self.service._utcnow()
+        self._source_session_started_at_utc = started_at
+        if self.source_publisher_factory is not None:
+            if self.source_publisher is not None:
+                raise ValueError("Provide a source publisher or factory, not both")
+            try:
+                self.source_publisher = self.source_publisher_factory(
+                    self.service.session_id, started_at
+                )
+            except Exception as exc:
+                self.service._record_diagnostic(
+                    kind="prospective_source_init_failed",
+                    reason=type(exc).__name__,
+                )
+        if self.source_publisher is not None and self._source_canonical_accumulator is None:
+            self._source_canonical_accumulator = CanonicalReplayAccumulator(
+                product_id=self.service.config.product_id,
+                session_id=self.service.session_id,
+                heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
+            )
         start_monotonic = self.service.monotonic_fn()
         self._checkpoint_started_monotonic = start_monotonic
         message_count = 0
         termination_reason = "requested_stop"
         self._stop_fn = stop_fn
+        self.service.on_reconnect_frame_processed = self._publish_source_frame
         try:
             self.service.connect_and_subscribe()
             self.connection_count += 1
@@ -176,16 +399,33 @@ class WebSocketCollector:
                     self._reconnect()
                     continue
                 frame_index = self._record_frame(frame)
+                observation_start = len(self.service.observations)
                 try:
                     self.service.handle_message(
                         frame.raw_bytes, frame_index=frame_index, ingest_time_utc=frame.received_at_utc,
                         include_book_snapshot=False,
                     )
                 except EnvelopeSequenceGapError:
+                    self._publish_source_frame(
+                        frame,
+                        frame_index,
+                        self.service.observations[observation_start:],
+                    )
                     self._reconnect()
                 except ValueError:
                     if frame.parse_error:
                         self.service.record_malformed_frame(frame.raw_bytes)
+                    self._publish_source_frame(
+                        frame,
+                        frame_index,
+                        self.service.observations[observation_start:],
+                    )
+                else:
+                    self._publish_source_frame(
+                        frame,
+                        frame_index,
+                        self.service.observations[observation_start:],
+                    )
                 message_count += 1
                 self._maybe_flush_normalized_checkpoint()
         except KeyboardInterrupt:
@@ -199,6 +439,8 @@ class WebSocketCollector:
                 self.service.connection.disconnected_at_utc = self.service._utcnow()
                 self.service.connection.disconnect_reason = "unexpected_failure"
             self.service.client.close()
+            if self.source_publisher is not None:
+                self.source_publisher.close()
             raise
         try:
             if self.service.connection is not None:
@@ -207,10 +449,25 @@ class WebSocketCollector:
             self.service.client.close()
             self.raw_segment_writer.seal()
             completed_at = self.service._utcnow()
-            return self._finalize(started_at=started_at, completed_at=completed_at, termination_reason=termination_reason)
+            result = self._finalize(
+                started_at=started_at,
+                completed_at=completed_at,
+                termination_reason=termination_reason,
+            )
         finally:
             self.service.on_reconnect_frame = None
+            self.service.on_reconnect_frame_processed = None
             self._stop_fn = None
+            if self.source_publisher is not None:
+                self.source_publisher.close()
+        if self.source_publisher is not None:
+            result.source_metrics = {
+                **self.source_publisher.metrics(),
+                "collector_canonical_evidence_latency_max_ms": self._source_canonical_latency_max_ms,
+                "collector_enqueue_latency_max_ms": self._source_enqueue_latency_max_ms,
+                "collector_canonical_evidence_failures": self._source_canonical_failure_count,
+            }
+        return result
 
     def _reconnect(self) -> None:
         self._flush_normalized_checkpoint()
@@ -368,6 +625,11 @@ class WebSocketCollector:
             raw_frame_count=self._frame_count,
             level2_message_count=level2_message_count,
             heartbeat_message_count=heartbeat_message_count,
+            source_metrics=(
+                self.source_publisher.metrics()
+                if self.source_publisher is not None
+                else None
+            ),
         )
 
 

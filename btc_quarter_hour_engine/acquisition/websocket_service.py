@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -177,6 +177,20 @@ class CoinbaseWebSocketService:
     bbo_state_rows: list[dict[str, Any]] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     on_reconnect_frame: Any = None
+    on_reconnect_frame_processed: Any = None
+
+    def _tag_observations(self, observations: list[Any]) -> list[Any]:
+        connection_id = self.connection.connection_id if self.connection is not None else None
+        sequence_num = self.order_book.last_sequence_num
+        return [
+            replace(
+                observation,
+                session_id=self.session_id,
+                connection_id=connection_id,
+                source_sequence_num=sequence_num,
+            )
+            for observation in observations
+        ]
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -266,7 +280,7 @@ class CoinbaseWebSocketService:
             sequence_num = payload.get("sequence_num")
             previous_book_state = self.order_book.state
             new_observations = process_parsed_event(event=payload, book=self.order_book, processor=self.boundary_processor)
-            self.observations.extend(new_observations)
+            self.observations.extend(self._tag_observations(new_observations))
             if not self.order_book.is_synced() and self.order_book.state != OrderBookState.REBUILDING:
                 if self.connection is not None:
                     reason = self.order_book.last_error or "malformed level2 state"
@@ -334,7 +348,7 @@ class CoinbaseWebSocketService:
                 book=self.order_book,
                 event_time_utc=heartbeat_time,
             )
-            self.observations.extend(new_observations)
+            self.observations.extend(self._tag_observations(new_observations))
             self.boundary_processor.observe_heartbeat(time_utc=heartbeat_time)
             self.last_heartbeat_at = heartbeat_time
             self.last_heartbeat_monotonic = self.monotonic_fn()
@@ -407,16 +421,25 @@ class CoinbaseWebSocketService:
             except TimeoutError:
                 continue
             frame_index = self.on_reconnect_frame(frame) if self.on_reconnect_frame is not None else None
+            observation_start = len(self.observations)
             try:
                 self.handle_message(
                     frame.raw_bytes, frame_index=frame_index, ingest_time_utc=frame.received_at_utc,
                     include_book_snapshot=False,
                 )
             except EnvelopeSequenceGapError:
+                if self.on_reconnect_frame_processed is not None:
+                    self.on_reconnect_frame_processed(
+                        frame, frame_index, self.observations[observation_start:]
+                    )
                 raise
             except ValueError:
                 if frame.parse_error:
                     self.record_malformed_frame(frame.raw_bytes)
+            if self.on_reconnect_frame_processed is not None:
+                self.on_reconnect_frame_processed(
+                    frame, frame_index, self.observations[observation_start:]
+                )
             if self.order_book.is_synced():
                 return
 

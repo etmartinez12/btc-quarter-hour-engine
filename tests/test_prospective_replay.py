@@ -16,6 +16,11 @@ from btc_quarter_hour_engine.research.prospective_source import (
     RawFrameSnapshot,
     build_causal_feature_vector,
 )
+from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
+    ClockHealthEvidence,
+    ProspectiveSourceReceiver,
+)
+from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
 from btc_quarter_hour_engine.research.model_freeze import OFFICIAL_STATUS, frozen_predictors
 from btc_quarter_hour_engine.research.prospective_contract import (
     FULL_V2_MODEL_SHA256,
@@ -104,6 +109,67 @@ def _snapshot(*, end: datetime = BOUNDARY + timedelta(minutes=45)) -> RawFrameSn
         session_started_at_utc=start,
         watermark_utc=end,
         clock_health_verified=True,
+        frames=tuple(frames),
+    )
+
+
+def _with_boundary_witnesses(snapshot, boundaries):
+    boundary_set = set(boundaries)
+    frames = []
+    sequence = 0
+    for position, original in enumerate(snapshot.frames):
+        payload = json.loads(original.raw_bytes)
+        payload["sequence_num"] = sequence
+        raw_bytes = json.dumps(payload).encode()
+        frames.append(
+            RawFrameRecord(
+                raw_bytes=raw_bytes,
+                session_id=original.session_id,
+                connection_id=original.connection_id,
+                frame_index=len(frames),
+                ingest_time_utc=original.ingest_time_utc,
+                raw_frame_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+            )
+        )
+        sequence += 1
+        next_time = (
+            snapshot.frames[position + 1].ingest_time_utc
+            if position + 1 < len(snapshot.frames)
+            else None
+        )
+        if original.ingest_time_utc in boundary_set and next_time != original.ingest_time_utc:
+            heartbeat_time = original.ingest_time_utc - timedelta(seconds=1)
+            heartbeat = json.dumps(
+                {
+                    "channel": "heartbeats",
+                    "client_id": "",
+                    "timestamp": heartbeat_time.isoformat().replace("+00:00", "Z"),
+                    "sequence_num": sequence,
+                    "events": [
+                        {
+                            "current_time": heartbeat_time.isoformat().replace(
+                                "+00:00", "Z"
+                            ),
+                            "heartbeat_counter": str(sequence),
+                        }
+                    ],
+                }
+            ).encode()
+            frames.append(
+                _record(
+                    len(frames),
+                    sequence,
+                    original.ingest_time_utc,
+                    raw=heartbeat,
+                )
+            )
+            sequence += 1
+            witness_time = original.ingest_time_utc + timedelta(seconds=1)
+            frames.append(_record(len(frames), sequence, witness_time))
+            sequence += 1
+    return replace(
+        snapshot,
+        watermark_utc=max(boundaries) + timedelta(seconds=1),
         frames=tuple(frames),
     )
 
@@ -232,6 +298,183 @@ def test_chunked_warmup_is_restartable_bounded_and_matches_full_replay(tmp_path,
     expected = build_causal_feature_vector(source, source.watermark_utc)
     assert actual.values == expected.values
     assert actual.feature_fingerprint == expected.feature_fingerprint
+
+
+def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_path):
+    target_boundary = BOUNDARY + timedelta(minutes=15)
+    source = _with_boundary_witnesses(
+        _snapshot(end=target_boundary), (BOUNDARY, target_boundary)
+    )
+    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+    clock_values = iter(
+        (
+            ClockHealthEvidence(
+                observed_at_utc=boundary + timedelta(seconds=2),
+                synchronized=True,
+                verified=True,
+                offset_seconds=0.001,
+                reference_time_utc=boundary + timedelta(seconds=1),
+                leap_status="Normal",
+                source="synthetic test evidence",
+            )
+            for boundary in (BOUNDARY, target_boundary)
+        )
+    )
+    receiver = ProspectiveSourceReceiver(
+        journal, clock_health_provider=lambda: next(clock_values)
+    )
+    canonical_replay = CanonicalReplayAccumulator(
+        product_id="BTC-USD",
+        session_id=source.session_id,
+        heartbeat_timeout_seconds=10.0,
+    )
+    for frame in source.frames:
+        canonical_replay.consume(
+            frame.raw_bytes,
+            frame.connection_id,
+            frame.frame_index,
+            frame.ingest_time_utc,
+        )
+        current_boundary = frame.ingest_time_utc.replace(
+            minute=frame.ingest_time_utc.minute
+            - frame.ingest_time_utc.minute % 15,
+            second=0,
+            microsecond=0,
+        )
+        canonical_boundary = None
+        finalized = canonical_replay.boundary_is_finalized(current_boundary)
+        observation = None
+        if finalized:
+            observation = next(
+                (
+                    candidate
+                    for candidate in canonical_replay.finalize(
+                        session_started_at_utc=source.session_started_at_utc,
+                        session_completed_at_utc=frame.ingest_time_utc,
+                        derived_at_utc=frame.ingest_time_utc,
+                        connections=[{"connection_id": frame.connection_id}],
+                    )
+                    if candidate.boundary_time_utc == current_boundary
+                ),
+                None,
+            )
+        if observation is not None:
+            canonical_boundary = {
+                "boundary_utc": observation.boundary_time_utc.isoformat(
+                    timespec="microseconds"
+                ).replace("+00:00", "Z"),
+                "canonical_target_eligible": observation.canonical_target_eligible,
+                "eligibility_reason": observation.eligibility_reason,
+                "book_synced": observation.book_synced,
+                "last_heartbeat_at_utc": (
+                    observation.last_heartbeat_at_utc.isoformat(
+                        timespec="microseconds"
+                    ).replace("+00:00", "Z")
+                    if observation.last_heartbeat_at_utc is not None
+                    else None
+                ),
+                "heartbeat_timeout_seconds": 10.0,
+                "connection_id": observation.connection_id,
+                "source_sequence_num": observation.source_sequence_num,
+            }
+        source_sequence = json.loads(frame.raw_bytes).get("sequence_num")
+        health = {
+            "publisher_valid": True,
+            "post_frame_health": {
+                "heartbeat_seen": False,
+                "heartbeat_last_at_utc": None,
+                "heartbeat_healthy": False,
+                "order_book_synchronized": False,
+                "connection_id": frame.connection_id,
+                "connection_last_sequence_num": source_sequence,
+                "last_l2_sequence_num": source_sequence,
+                "sequence_gap_count": 0,
+                "stale_sequence_count": 0,
+                "heartbeat_timeout_count": 0,
+                "heartbeat_discontinuity_count": 0,
+                "malformed_frame_count": 0,
+                "malformed_level2_count": 0,
+                "crossed_book_count": 0,
+                "heartbeat_timeout_seconds": 10.0,
+            },
+            "canonical_boundary_finalized": observation is not None,
+            "canonical_boundary": canonical_boundary,
+        }
+        receiver.process(
+            {
+                "version": 1,
+                "kind": "frame",
+                "session_id": source.session_id,
+                "session_started_at_utc": source.session_started_at_utc.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "connection_id": frame.connection_id,
+                "reconnect_epoch": 0,
+                "connection_first_frame_index": 0,
+                "frame_index": frame.frame_index,
+                "ingest_time_utc": frame.ingest_time_utc.isoformat().replace("+00:00", "Z"),
+                "raw_sha256": frame.raw_frame_sha256,
+                "raw_length": len(frame.raw_bytes),
+                "producer_health": health,
+            },
+            frame.raw_bytes,
+        )
+        if canonical_boundary is not None and frame.ingest_time_utc in (
+            BOUNDARY + timedelta(seconds=1),
+            target_boundary + timedelta(seconds=1),
+        ):
+            boundary = current_boundary
+            receiver.process(
+                {
+                    "version": 1,
+                    "kind": "fence",
+                    "session_id": source.session_id,
+                    "watermark_utc": boundary.isoformat().replace("+00:00", "Z"),
+                    "through_frame_index": frame.frame_index,
+                    "connection_id": frame.connection_id,
+                    "reconnect_epoch": 0,
+                    "producer_health": health,
+                    "raw_length": 0,
+                },
+                b"",
+            )
+
+    warmup_chunk = journal.warmup_chunk(
+        source.session_id,
+        after_frame_index=-1,
+        expected_prefix_commitment_sha256=initial_prefix_commitment(
+            source.session_id, source.session_started_at_utc
+        ),
+        through_boundary_utc=BOUNDARY,
+    )
+    warmup = accumulate_feature_replay_warmup(warmup_chunk, BOUNDARY)
+    exhausted = journal.warmup_chunk(
+        source.session_id,
+        after_frame_index=warmup.last_frame_index,
+        expected_prefix_commitment_sha256=warmup.prefix_commitment_sha256,
+        through_boundary_utc=BOUNDARY,
+    )
+    finish_feature_replay_warmup(exhausted, warmup)
+
+    checkpoint = create_feature_replay_checkpoint(
+        journal.snapshot_through(source.session_id, boundary_utc=BOUNDARY), BOUNDARY
+    )
+    tail = journal.tail_snapshot(
+        source.session_id,
+        after_frame_index=checkpoint.last_frame_index,
+        expected_prefix_commitment_sha256=checkpoint.prefix_commitment_sha256,
+        through_boundary_utc=target_boundary,
+    )
+    incremental = build_incremental_causal_feature_vector(tail, target_boundary, checkpoint)
+    full_snapshot = journal.snapshot_through(source.session_id, boundary_utc=target_boundary)
+    full = build_causal_feature_vector(full_snapshot, target_boundary)
+
+    assert incremental.candidate_predictors == full.candidate_predictors
+    assert incremental.control_predictors == full.control_predictors
+    assert len(incremental.candidate_predictors) == 12
+    assert len(incremental.control_predictors) == 91
+    assert incremental.values == full.values
+    assert incremental.feature_fingerprint == full.feature_fingerprint
     journal.close()
 
 

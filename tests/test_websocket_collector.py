@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
 
@@ -12,8 +12,17 @@ from btc_quarter_hour_engine.acquisition.coinbase_websocket import CoinbaseWebSo
 from btc_quarter_hour_engine.acquisition.collector import WebSocketCollector
 from btc_quarter_hour_engine.acquisition.cli import _sigterm_stop_handler
 from btc_quarter_hour_engine.acquisition.config import CoinbaseWebSocketConfig
+from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
+    ClockHealthEvidence,
+    NonBlockingSourcePublisher,
+    ProspectiveSourceReceiver,
+)
 from btc_quarter_hour_engine.acquisition.websocket_service import CoinbaseWebSocketService
-from btc_quarter_hour_engine.market_data.replay import replay_events
+from btc_quarter_hour_engine.market_data.replay import (
+    CanonicalReplayAccumulator,
+    replay_events,
+)
+from btc_quarter_hour_engine.research.prospective_source import ProspectiveRawFrameJournal
 from btc_quarter_hour_engine.storage.forward_parquet import ForwardParquetStore
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
 
@@ -116,6 +125,7 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     collector, service, transport, raw_writer = _build_collector(tmp_path, messages)
     result = collector.run(max_messages=len(messages))
 
+    assert result.source_metrics is None
     assert result.observation_count == 1
     assert result.eligible_observation_count == 1
     assert result.connection_count == 1
@@ -144,9 +154,7 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert json.loads(result.manifest_path.read_text())["dataset_id"] == manifest["dataset_id"]
 
     # Normalized parquet output: quarter-hour BBO, plus normalized
-    # level2_updates (one row per individual book mutation across the
-    # snapshot + update messages) and bbo_state (one row per successfully
-    # applied mutation) artifacts.
+    # level2_updates and bbo_state artifacts.
     assert len(result.bbo_normalized_artifacts) == 1
     assert len(result.level2_update_artifacts) == 1
     assert len(result.bbo_state_artifacts) == 1
@@ -160,18 +168,316 @@ def test_collector_produces_eligible_observation_and_complete_manifest(tmp_path)
     assert frame["product_id"].iloc[0] == "BTC-USD"
 
     level2_frame = pd.read_parquet(result.level2_update_artifacts[0]["path"])
-    assert len(level2_frame) == 3  # 2 snapshot levels + 1 incremental update
+    assert len(level2_frame) == 3
     assert set(level2_frame["side"]) == {"bid", "ask"}
 
     bbo_state_frame = pd.read_parquet(result.bbo_state_artifacts[0]["path"])
-    assert len(bbo_state_frame) == 2  # one per successfully applied message (snapshot, update)
+    assert len(bbo_state_frame) == 2
     assert bbo_state_frame["state"].iloc[-1] == "SYNCED"
 
-    # Raw segment: exact bytes are sealed and independently readable/verifiable.
     segment = result.raw_segments[0]
     assert raw_writer.raw_store.verify_digest(segment["path"], segment["sha256"])
     frames = raw_writer.read_segment_frames(segment["path"])
     assert [f.decode("utf-8") for f in frames] == messages
+
+
+@pytest.mark.parametrize(
+    "post_boundary_order", ["heartbeat-first", "level2-first", "reconnect"]
+)
+def test_bridge_uses_as_of_boundary_health_and_finalizes_from_raw_replay(
+    tmp_path, post_boundary_order
+):
+    boundary = datetime(2026, 1, 1, 0, 15, tzinfo=timezone.utc)
+    snapshot = _snapshot(
+        1, (boundary - timedelta(seconds=10)).isoformat().replace("+00:00", "Z")
+    )
+    pre_boundary_heartbeat = _heartbeat(
+        2, (boundary - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    )
+    post_boundary_heartbeat = _heartbeat(
+        3 if post_boundary_order == "heartbeat-first" else 4,
+        (boundary + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+    )
+    post_boundary_update = _update(
+        4 if post_boundary_order == "heartbeat-first" else 3,
+        (boundary + timedelta(seconds=2 if post_boundary_order == "heartbeat-first" else 1))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "bid",
+        100.0,
+        9.0,
+    )
+    if post_boundary_order == "heartbeat-first":
+        messages = [
+            snapshot,
+            pre_boundary_heartbeat,
+            post_boundary_heartbeat,
+            post_boundary_update,
+        ]
+        received = (
+            boundary - timedelta(seconds=10),
+            boundary - timedelta(seconds=1),
+            boundary + timedelta(seconds=1),
+            boundary + timedelta(seconds=2),
+        )
+        transport_kwargs = {}
+    elif post_boundary_order == "level2-first":
+        messages = [
+            snapshot,
+            pre_boundary_heartbeat,
+            post_boundary_update,
+            post_boundary_heartbeat,
+        ]
+        received = (
+            boundary - timedelta(seconds=10),
+            boundary - timedelta(seconds=1),
+            boundary + timedelta(seconds=1),
+            boundary + timedelta(seconds=2),
+        )
+        transport_kwargs = {}
+    else:
+        messages = [
+            snapshot,
+            pre_boundary_heartbeat,
+            _heartbeat(
+                3, (boundary + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+            ),
+            _snapshot(
+                1,
+                (boundary + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+                bid=200.0,
+                ask=201.0,
+            ),
+            _heartbeat(
+                2, (boundary + timedelta(seconds=3)).isoformat().replace("+00:00", "Z")
+            ),
+        ]
+        received = (
+            boundary - timedelta(seconds=10),
+            boundary - timedelta(seconds=1),
+            boundary + timedelta(seconds=1),
+            boundary + timedelta(seconds=2),
+            boundary + timedelta(seconds=3),
+        )
+        transport_kwargs = {"connection_errors_after": 4}
+    receive_times = iter(received)
+    collector, service, _, _ = _build_collector(
+        tmp_path, messages, transport_kwargs=transport_kwargs
+    )
+    service.now_fn = lambda: boundary - timedelta(seconds=20)
+    service.client.now_fn = lambda: next(receive_times)
+
+    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+
+    class ReceiverTransport:
+        def __init__(self):
+            self.events = []
+
+        def send_and_wait_for_ack(self, header, raw_bytes):
+            self.events.append((header, raw_bytes))
+            return {
+                "durable": True,
+                "session_id": header["session_id"],
+                "through_frame_index": (
+                    header["frame_index"]
+                    if header["kind"] == "frame"
+                    else header["through_frame_index"]
+                ),
+            }
+
+    transport = ReceiverTransport()
+    publisher = NonBlockingSourcePublisher(
+        tmp_path / "unused.sock",
+        session_id=service.session_id,
+        session_started_at_utc=boundary - timedelta(seconds=20),
+        transport=transport,
+    )
+    collector.source_publisher = publisher
+    result = collector.run(
+        max_messages=4 if post_boundary_order == "reconnect" else len(messages)
+    )
+    assert publisher.valid, publisher.failure_reason
+    assert result.source_metrics["valid"] is True
+    assert result.source_metrics["collector_enqueue_latency_max_ms"] >= 0
+    assert result.source_metrics["collector_canonical_evidence_latency_max_ms"] >= 0
+    assert result.source_metrics["collector_canonical_evidence_failures"] == 0
+    assert any(header["kind"] == "fence" for header, _ in transport.events)
+
+    receiver = ProspectiveSourceReceiver(
+        journal,
+        clock_health_provider=lambda: ClockHealthEvidence(
+            observed_at_utc=boundary + timedelta(seconds=3),
+            synchronized=True,
+            verified=True,
+            offset_seconds=0.001,
+            reference_time_utc=boundary + timedelta(seconds=2),
+            leap_status="Normal",
+            source="integration fixture",
+        ),
+    )
+    for header, raw in transport.events:
+        receiver.process(header, raw)
+
+    snapshot = journal.snapshot(service.session_id)
+    assert snapshot.source_certified
+    assert snapshot.watermark_utc == boundary
+    fenced_frame_count = 3
+    assert len(snapshot.frames) == fenced_frame_count
+    assert [frame.raw_bytes.decode("utf-8") for frame in snapshot.frames] == messages[
+        :fenced_frame_count
+    ]
+    health = snapshot.producer_health
+    assert health["canonical_boundary"]["canonical_target_eligible"] is True
+    assert health["canonical_boundary"]["last_heartbeat_at_utc"] == (
+        boundary - timedelta(seconds=1)
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    expected_post_heartbeat = (
+        boundary + timedelta(seconds=1)
+        if post_boundary_order in ("heartbeat-first", "reconnect")
+        else boundary - timedelta(seconds=1)
+    )
+    expected_heartbeat_text = (
+        expected_post_heartbeat.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+        if expected_post_heartbeat is not None
+        else None
+    )
+    assert health["post_frame_health"]["heartbeat_last_at_utc"] == expected_heartbeat_text
+    if post_boundary_order == "reconnect":
+        assert health["post_frame_health"]["connection_id"] == snapshot.frames[-1].connection_id
+        assert health["canonical_boundary"]["connection_id"] == snapshot.frames[0].connection_id
+    assert health["canonical_boundary"]["source_sequence_num"] == 1
+    boundary_observation = next(
+        item
+        for item in collector._canonical_accumulator.finalize(
+            session_started_at_utc=boundary - timedelta(seconds=20),
+            session_completed_at_utc=boundary + timedelta(seconds=2),
+            derived_at_utc=boundary + timedelta(seconds=2),
+        )
+        if item.boundary_time_utc == boundary
+    )
+    assert boundary_observation.best_bid == 100.0
+    assert boundary_observation.best_bid_size == 1.0
+    journal.close()
+
+
+def test_publisher_exception_does_not_interrupt_canonical_collection(tmp_path):
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
+    ]
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+
+    class BrokenPublisher:
+        valid = True
+        failure_reason = "simulated"
+
+        def publish_frame(self, **_):
+            raise OSError("receiver unavailable")
+
+        def close(self):
+            pass
+
+        def metrics(self):
+            return {"valid": False}
+
+    collector.source_publisher = BrokenPublisher()
+    result = collector.run(max_messages=len(messages))
+
+    assert result.eligible_observation_count == 1
+    assert result.manifest["canonical_target_eligible"] is True
+    assert result.source_metrics["valid"] is False
+    assert result.source_metrics["collector_enqueue_latency_max_ms"] >= 0
+    assert result.source_metrics["collector_canonical_evidence_latency_max_ms"] >= 0
+    assert sum(
+        diagnostic["kind"] == "prospective_source_publish_failed"
+        for diagnostic in service.diagnostics
+    )
+
+
+def test_canonical_certification_exception_does_not_interrupt_collector(
+    tmp_path, monkeypatch
+):
+    boundary = datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc)
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:59Z"),
+        _heartbeat(3, "2024-01-01T00:15:01Z"),
+    ]
+    received = iter(
+        [
+            boundary - timedelta(seconds=10),
+            boundary - timedelta(seconds=1),
+            boundary + timedelta(seconds=1),
+        ]
+    )
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+    service.now_fn = lambda: boundary - timedelta(seconds=20)
+    service.client.now_fn = lambda: next(received)
+
+    class FakePublisher:
+        valid = True
+        failure_reason = None
+
+        def __init__(self):
+            self.events = []
+
+        def publish_frame(self, **kwargs):
+            self.events.append(kwargs)
+            return True
+
+        def close(self):
+            return None
+
+        def metrics(self):
+            return {"valid": self.valid}
+
+    publisher = FakePublisher()
+    collector.source_publisher = publisher
+
+    def fail_certification(*_args, **_kwargs):
+        raise RuntimeError("simulated bounded certification failure")
+
+    monkeypatch.setattr(
+        CanonicalReplayAccumulator, "boundary_observation", fail_certification
+    )
+    result = collector.run(max_messages=len(messages))
+
+    assert result.observation_count >= 1
+    assert result.raw_frame_count == len(messages)
+    assert result.source_metrics["valid"] is True
+    assert result.source_metrics["collector_canonical_evidence_failures"] == 1
+    assert len(publisher.events) == len(messages)
+    assert all(
+        event["producer_health"]["canonical_boundary"] is None
+        for event in publisher.events
+    )
+
+
+def test_publisher_initialization_failure_does_not_interrupt_collection(tmp_path):
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:55Z"),
+        _update(3, "2024-01-01T00:15:01Z", "bid", 100.5, 2.0),
+    ]
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+
+    def fail_initialization(*_):
+        raise OSError("receiver unavailable")
+
+    collector.source_publisher_factory = fail_initialization
+    result = collector.run(max_messages=len(messages))
+
+    assert result.eligible_observation_count == 1
+    assert result.manifest["canonical_target_eligible"] is True
+    assert result.source_metrics is None
+    assert any(
+        diagnostic["kind"] == "prospective_source_init_failed"
+        and diagnostic["reason"] == "OSError"
+        for diagnostic in service.diagnostics
+    )
 
 
 def test_small_row_threshold_checkpoints_without_reconnect_and_preserves_all_rows(tmp_path, monkeypatch):
