@@ -18,7 +18,10 @@ from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
     ProspectiveSourceReceiver,
 )
 from btc_quarter_hour_engine.acquisition.websocket_service import CoinbaseWebSocketService
-from btc_quarter_hour_engine.market_data.replay import replay_events
+from btc_quarter_hour_engine.market_data.replay import (
+    CanonicalReplayAccumulator,
+    replay_events,
+)
 from btc_quarter_hour_engine.research.prospective_source import ProspectiveRawFrameJournal
 from btc_quarter_hour_engine.storage.forward_parquet import ForwardParquetStore
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
@@ -295,6 +298,9 @@ def test_bridge_uses_as_of_boundary_health_and_finalizes_from_raw_replay(
     )
     assert publisher.valid, publisher.failure_reason
     assert result.source_metrics["valid"] is True
+    assert result.source_metrics["collector_enqueue_latency_max_ms"] >= 0
+    assert result.source_metrics["collector_canonical_evidence_latency_max_ms"] >= 0
+    assert result.source_metrics["collector_canonical_evidence_failures"] == 0
     assert any(header["kind"] == "fence" for header, _ in transport.events)
 
     receiver = ProspectiveSourceReceiver(
@@ -315,9 +321,7 @@ def test_bridge_uses_as_of_boundary_health_and_finalizes_from_raw_replay(
     snapshot = journal.snapshot(service.session_id)
     assert snapshot.source_certified
     assert snapshot.watermark_utc == boundary
-    fenced_frame_count = (
-        4 if post_boundary_order in ("heartbeat-first", "reconnect") else 3
-    )
+    fenced_frame_count = 3
     assert len(snapshot.frames) == fenced_frame_count
     assert [frame.raw_bytes.decode("utf-8") for frame in snapshot.frames] == messages[
         :fenced_frame_count
@@ -328,10 +332,8 @@ def test_bridge_uses_as_of_boundary_health_and_finalizes_from_raw_replay(
         boundary - timedelta(seconds=1)
     ).isoformat(timespec="microseconds").replace("+00:00", "Z")
     expected_post_heartbeat = (
-        None
-        if post_boundary_order == "reconnect"
-        else boundary + timedelta(seconds=1)
-        if post_boundary_order == "heartbeat-first"
+        boundary + timedelta(seconds=1)
+        if post_boundary_order in ("heartbeat-first", "reconnect")
         else boundary - timedelta(seconds=1)
     )
     expected_heartbeat_text = (
@@ -348,7 +350,7 @@ def test_bridge_uses_as_of_boundary_health_and_finalizes_from_raw_replay(
     assert health["canonical_boundary"]["source_sequence_num"] == 1
     boundary_observation = next(
         item
-        for item in receiver._canonical_replays[service.session_id].finalize(
+        for item in collector._canonical_accumulator.finalize(
             session_started_at_utc=boundary - timedelta(seconds=20),
             session_completed_at_utc=boundary + timedelta(seconds=2),
             derived_at_utc=boundary + timedelta(seconds=2),
@@ -386,11 +388,72 @@ def test_publisher_exception_does_not_interrupt_canonical_collection(tmp_path):
 
     assert result.eligible_observation_count == 1
     assert result.manifest["canonical_target_eligible"] is True
-    assert result.source_metrics == {"valid": False}
+    assert result.source_metrics["valid"] is False
+    assert result.source_metrics["collector_enqueue_latency_max_ms"] >= 0
+    assert result.source_metrics["collector_canonical_evidence_latency_max_ms"] >= 0
     assert sum(
         diagnostic["kind"] == "prospective_source_publish_failed"
         for diagnostic in service.diagnostics
-    ) == len(messages)
+    )
+
+
+def test_canonical_certification_exception_does_not_interrupt_collector(
+    tmp_path, monkeypatch
+):
+    boundary = datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc)
+    messages = [
+        _snapshot(1, "2024-01-01T00:14:50Z"),
+        _heartbeat(2, "2024-01-01T00:14:59Z"),
+        _heartbeat(3, "2024-01-01T00:15:01Z"),
+    ]
+    received = iter(
+        [
+            boundary - timedelta(seconds=10),
+            boundary - timedelta(seconds=1),
+            boundary + timedelta(seconds=1),
+        ]
+    )
+    collector, service, _, _ = _build_collector(tmp_path, messages)
+    service.now_fn = lambda: boundary - timedelta(seconds=20)
+    service.client.now_fn = lambda: next(received)
+
+    class FakePublisher:
+        valid = True
+        failure_reason = None
+
+        def __init__(self):
+            self.events = []
+
+        def publish_frame(self, **kwargs):
+            self.events.append(kwargs)
+            return True
+
+        def close(self):
+            return None
+
+        def metrics(self):
+            return {"valid": self.valid}
+
+    publisher = FakePublisher()
+    collector.source_publisher = publisher
+
+    def fail_certification(*_args, **_kwargs):
+        raise RuntimeError("simulated bounded certification failure")
+
+    monkeypatch.setattr(
+        CanonicalReplayAccumulator, "boundary_observation", fail_certification
+    )
+    result = collector.run(max_messages=len(messages))
+
+    assert result.observation_count >= 1
+    assert result.raw_frame_count == len(messages)
+    assert result.source_metrics["valid"] is True
+    assert result.source_metrics["collector_canonical_evidence_failures"] == 1
+    assert len(publisher.events) == len(messages)
+    assert all(
+        event["producer_health"]["canonical_boundary"] is None
+        for event in publisher.events
+    )
 
 
 def test_publisher_initialization_failure_does_not_interrupt_collection(tmp_path):

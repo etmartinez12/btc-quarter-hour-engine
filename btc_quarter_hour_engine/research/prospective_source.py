@@ -487,6 +487,52 @@ class ProspectiveRawFrameJournal:
                 FOREIGN KEY (session_id, frame_index)
                     REFERENCES source_frames(session_id, frame_index)
             );
+            CREATE TABLE IF NOT EXISTS source_canonical_checkpoints (
+                session_id TEXT PRIMARY KEY REFERENCES source_sessions(session_id),
+                frame_index INTEGER NOT NULL CHECK (frame_index >= 0),
+                prefix_commitment_sha256 TEXT NOT NULL,
+                checkpoint_json TEXT NOT NULL,
+                checkpoint_sha256 TEXT NOT NULL
+            );
+            """
+        )
+        self._connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS source_canonical_checkpoints_no_delete
+            BEFORE DELETE ON source_canonical_checkpoints
+            BEGIN
+                SELECT RAISE(ABORT, 'canonical checkpoint history is protected');
+            END;
+            CREATE TRIGGER IF NOT EXISTS source_canonical_checkpoints_insert_prefix
+            BEFORE INSERT ON source_canonical_checkpoints
+            WHEN NOT EXISTS (
+                SELECT 1 FROM source_prefix_commitments c
+                WHERE c.session_id = NEW.session_id
+                  AND c.frame_index = NEW.frame_index
+                  AND c.commitment_sha256 = NEW.prefix_commitment_sha256
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'canonical checkpoint prefix mismatch');
+            END;
+            CREATE TRIGGER IF NOT EXISTS source_canonical_checkpoints_update_prefix
+            BEFORE UPDATE ON source_canonical_checkpoints
+            WHEN (
+                NEW.frame_index < OLD.frame_index
+                OR NEW.frame_index > OLD.frame_index + 1
+                OR (
+                    NEW.frame_index = OLD.frame_index
+                    AND NEW.prefix_commitment_sha256 != OLD.prefix_commitment_sha256
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM source_prefix_commitments c
+                    WHERE c.session_id = NEW.session_id
+                      AND c.frame_index = NEW.frame_index
+                      AND c.commitment_sha256 = NEW.prefix_commitment_sha256
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'canonical checkpoint prefix mismatch');
+            END;
             """
         )
         for table in (
@@ -739,6 +785,7 @@ class ProspectiveRawFrameJournal:
         raw_bytes: bytes,
         reconnect_epoch: int | None = None,
         producer_health: dict[str, Any] | None = None,
+        canonical_replay_checkpoint: dict[str, Any] | None = None,
     ) -> str:
         from btc_quarter_hour_engine.research.prospective_replay import (
             advance_prefix_commitment,
@@ -757,6 +804,9 @@ class ProspectiveRawFrameJournal:
         digest = hashlib.sha256(raw_bytes).hexdigest()
         health_json: str | None = None
         health_digest: str | None = None
+        if canonical_replay_checkpoint is not None:
+            if not isinstance(canonical_replay_checkpoint, dict):
+                raise ValueError("Canonical replay checkpoint must be an object")
         if producer_health is not None:
             if (
                 not isinstance(producer_health, dict)
@@ -833,6 +883,13 @@ class ProspectiveRawFrameJournal:
                 "(session_id, frame_index, commitment_sha256) VALUES (?, ?, ?)",
                 (session_id, frame_index, commitment),
             )
+            if canonical_replay_checkpoint is not None:
+                self._store_canonical_checkpoint(
+                    session_id=session_id,
+                    frame_index=frame_index,
+                    prefix_commitment_sha256=commitment,
+                    state=canonical_replay_checkpoint,
+                )
             if health_json is not None and health_digest is not None:
                 connection = self._connection.execute(
                     "SELECT connection_id FROM source_connections "
@@ -856,6 +913,131 @@ class ProspectiveRawFrameJournal:
                     ),
                 )
         return digest
+
+    @staticmethod
+    def _canonical_checkpoint_payload(
+        *,
+        session_id: str,
+        frame_index: int,
+        prefix_commitment_sha256: str,
+        state: dict[str, Any],
+    ) -> tuple[str, str]:
+        payload = json.dumps(
+            {
+                "version": 1,
+                "session_id": session_id,
+                "frame_index": frame_index,
+                "prefix_commitment_sha256": prefix_commitment_sha256,
+                "state": state,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        from btc_quarter_hour_engine.market_data.replay import (
+            MAX_CANONICAL_CHECKPOINT_BYTES,
+        )
+        if len(payload.encode("utf-8")) > MAX_CANONICAL_CHECKPOINT_BYTES:
+            raise ValueError("Canonical replay checkpoint exceeds configured size limit")
+        return payload, hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _store_canonical_checkpoint(
+        self,
+        *,
+        session_id: str,
+        frame_index: int,
+        prefix_commitment_sha256: str,
+        state: dict[str, Any],
+    ) -> None:
+        payload, digest = self._canonical_checkpoint_payload(
+            session_id=session_id,
+            frame_index=frame_index,
+            prefix_commitment_sha256=prefix_commitment_sha256,
+            state=state,
+        )
+        current = self._connection.execute(
+            "SELECT frame_index FROM source_canonical_checkpoints WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if current is None and frame_index != 0:
+            raise ValueError("Canonical replay checkpoint is missing for source prefix")
+        if current is not None and frame_index not in (
+            current["frame_index"],
+            current["frame_index"] + 1,
+        ):
+            raise ValueError("Canonical replay checkpoint frame index is discontinuous")
+        self._connection.execute(
+            "INSERT INTO source_canonical_checkpoints "
+            "(session_id, frame_index, prefix_commitment_sha256, checkpoint_json, "
+            "checkpoint_sha256) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "frame_index = excluded.frame_index, "
+            "prefix_commitment_sha256 = excluded.prefix_commitment_sha256, "
+            "checkpoint_json = excluded.checkpoint_json, "
+            "checkpoint_sha256 = excluded.checkpoint_sha256",
+            (
+                session_id,
+                frame_index,
+                prefix_commitment_sha256,
+                payload,
+                digest,
+            ),
+        )
+
+    def _validate_latest_canonical_checkpoint(self, session_id: str) -> None:
+        latest = self._connection.execute(
+            "SELECT f.frame_index, c.commitment_sha256 "
+            "FROM source_frames f LEFT JOIN source_prefix_commitments c "
+            "ON c.session_id = f.session_id AND c.frame_index = f.frame_index "
+            "WHERE f.session_id = ? ORDER BY f.frame_index DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if latest is None or latest["commitment_sha256"] is None:
+            raise ValueError("Bridge source canonical checkpoint prefix is missing")
+        checkpoint = self._connection.execute(
+            "SELECT frame_index, prefix_commitment_sha256, checkpoint_json, "
+            "checkpoint_sha256 FROM source_canonical_checkpoints WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if (
+            checkpoint is None
+            or checkpoint["frame_index"] != latest["frame_index"]
+            or checkpoint["prefix_commitment_sha256"]
+            != latest["commitment_sha256"]
+            or hashlib.sha256(checkpoint["checkpoint_json"].encode("utf-8")).hexdigest()
+            != checkpoint["checkpoint_sha256"]
+        ):
+            raise ValueError("Bridge source canonical checkpoint identity or digest is invalid")
+        try:
+            payload = json.loads(checkpoint["checkpoint_json"])
+        except json.JSONDecodeError as exc:
+            raise ValueError("Bridge source canonical checkpoint JSON is malformed") from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload)
+            != {
+                "version",
+                "session_id",
+                "frame_index",
+                "prefix_commitment_sha256",
+                "state",
+            }
+            or payload["version"] != 1
+            or payload["session_id"] != session_id
+            or payload["frame_index"] != latest["frame_index"]
+            or payload["prefix_commitment_sha256"] != latest["commitment_sha256"]
+        ):
+            raise ValueError("Bridge source canonical checkpoint provenance is invalid")
+        from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
+
+        replay = CanonicalReplayAccumulator.from_checkpoint(payload["state"])
+        if (
+            replay.product_id != "BTC-USD"
+            or replay.session_id != session_id
+            or replay.frame_count != latest["frame_index"] + 1
+        ):
+            raise ValueError("Bridge source canonical checkpoint state identity is invalid")
+        replay._require_bounded_live_state()
 
     def advance_watermark(
         self,
@@ -918,6 +1100,7 @@ class ProspectiveRawFrameJournal:
         clock_health_verified: bool,
         clock_evidence: dict[str, Any],
         producer_health: dict[str, Any],
+        canonical_replay_checkpoint: dict[str, Any] | None = None,
     ) -> None:
         """Commit a watermark only for a durable ordered producer fence.
 
@@ -937,6 +1120,8 @@ class ProspectiveRawFrameJournal:
             raise ValueError("Independent clock evidence is required")
         if not isinstance(producer_health, dict) or producer_health.get("publisher_valid") is not True:
             raise ValueError("Healthy ordered producer fence evidence is required")
+        if not isinstance(canonical_replay_checkpoint, dict):
+            raise ValueError("Producer fence requires a canonical replay checkpoint")
         if clock_evidence.get("verified") is not clock_health_verified:
             raise ValueError("Clock evidence and verification status disagree")
         if clock_evidence.get("synchronized") is not clock_health_verified:
@@ -1072,6 +1257,13 @@ class ProspectiveRawFrameJournal:
                     prefix["commitment_sha256"],
                 ),
             )
+            if canonical_replay_checkpoint is not None:
+                self._store_canonical_checkpoint(
+                    session_id=session_id,
+                    frame_index=through_frame_index,
+                    prefix_commitment_sha256=prefix["commitment_sha256"],
+                    state=canonical_replay_checkpoint,
+                )
 
     def _certified_bridge_fence(
         self,
@@ -1081,6 +1273,7 @@ class ProspectiveRawFrameJournal:
         boundary = _utc(boundary, field="certified source boundary")
         if not _is_boundary(boundary):
             raise ValueError("Bridge certification requires an exact UTC quarter-hour")
+        self._validate_latest_canonical_checkpoint(session_id)
         fence = self._connection.execute(
             "SELECT f.*, w.clock_health_verified AS watermark_clock_verified, "
             "r.connection_id AS frame_connection_id, r.ingest_time_utc, "

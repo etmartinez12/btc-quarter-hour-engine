@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import socket
 import sys
@@ -64,10 +65,155 @@ def _synthetic_snapshot(target_size: int) -> bytes:
     return prefix + b"x" * padding_size + suffix
 
 
+def _benchmark_health(connection_id: str) -> dict[str, object]:
+    return {
+        "publisher_valid": True,
+        "post_frame_health": {
+            "heartbeat_seen": False,
+            "heartbeat_last_at_utc": None,
+            "heartbeat_healthy": False,
+            "order_book_synchronized": False,
+            "connection_id": connection_id,
+            "connection_last_sequence_num": None,
+            "last_l2_sequence_num": None,
+            "sequence_gap_count": 0,
+            "stale_sequence_count": 0,
+            "heartbeat_timeout_count": 0,
+            "heartbeat_discontinuity_count": 0,
+            "malformed_frame_count": 0,
+            "malformed_level2_count": 0,
+            "crossed_book_count": 0,
+            "heartbeat_timeout_seconds": 5.0,
+        },
+        "canonical_boundary_finalized": False,
+        "canonical_boundary": None,
+    }
+
+
+def _run_checkpoint_recovery_benchmark(history_frame_count: int) -> dict[str, object]:
+    """Measure checkpoint recovery without replaying the historical raw journal."""
+    with TemporaryDirectory(prefix="prospective-checkpoint-benchmark-") as directory:
+        journal_path = Path(directory) / "source.sqlite"
+        session_id = "long-session-benchmark"
+        connection_id = "benchmark-connection"
+        started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        raw = b"synthetic malformed frame for bounded-state recovery"
+        health = _benchmark_health(connection_id)
+        journal = ProspectiveRawFrameJournal(journal_path)
+        receiver = ProspectiveSourceReceiver(
+            journal,
+            clock_health_provider=lambda: ClockHealthEvidence(
+                observed_at_utc=started,
+                synchronized=False,
+                verified=False,
+                offset_seconds=None,
+                reference_time_utc=None,
+                leap_status=None,
+                source="synthetic recovery benchmark",
+                reason="no live clock evidence",
+            ),
+        )
+        tracemalloc.start()
+        history_started = time.perf_counter()
+        for index in range(history_frame_count):
+            received = started + timedelta(seconds=index + 1)
+            receiver.process(
+                {
+                    "version": 1,
+                    "kind": "frame",
+                    "session_id": session_id,
+                    "session_started_at_utc": started.isoformat().replace("+00:00", "Z"),
+                    "connection_id": connection_id,
+                    "reconnect_epoch": 0,
+                    "connection_first_frame_index": 0,
+                    "frame_index": index,
+                    "ingest_time_utc": received.isoformat().replace("+00:00", "Z"),
+                    "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                    "raw_length": len(raw),
+                    "producer_health": health,
+                },
+                raw,
+            )
+        history_seconds = time.perf_counter() - history_started
+        _, history_peak_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        checkpoint_size = journal._connection.execute(
+            "SELECT length(checkpoint_json) FROM source_canonical_checkpoints "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+        journal.close()
+
+        tracemalloc.start()
+        journal = ProspectiveRawFrameJournal(journal_path)
+        restarted_receiver = ProspectiveSourceReceiver(
+            journal,
+            clock_health_provider=lambda: ClockHealthEvidence(
+                observed_at_utc=started,
+                synchronized=False,
+                verified=False,
+                offset_seconds=None,
+                reference_time_utc=None,
+                leap_status=None,
+                source="synthetic recovery benchmark",
+                reason="no live clock evidence",
+            ),
+        )
+
+        def append(index: int) -> None:
+            received = started + timedelta(seconds=index + 1)
+            restarted_receiver.process(
+                {
+                    "version": 1,
+                    "kind": "frame",
+                    "session_id": session_id,
+                    "session_started_at_utc": started.isoformat().replace("+00:00", "Z"),
+                    "connection_id": connection_id,
+                    "reconnect_epoch": 0,
+                    "connection_first_frame_index": 0,
+                    "frame_index": index,
+                    "ingest_time_utc": received.isoformat().replace("+00:00", "Z"),
+                    "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                    "raw_length": len(raw),
+                    "producer_health": health,
+                },
+                raw,
+            )
+
+        cold_started = time.perf_counter()
+        append(history_frame_count)
+        cold_recovery_seconds = time.perf_counter() - cold_started
+        _, cold_peak_bytes = tracemalloc.get_traced_memory()
+        cold_metrics = restarted_receiver.metrics()
+        warm_started = time.perf_counter()
+        append(history_frame_count + 1)
+        warm_continuation_seconds = time.perf_counter() - warm_started
+        _, warm_peak_bytes = tracemalloc.get_traced_memory()
+        journal.close()
+        tracemalloc.stop()
+        return {
+            "historical_frames": history_frame_count,
+            "history_append_seconds": history_seconds,
+            "history_python_peak_bytes": history_peak_bytes,
+            "checkpoint_bytes": checkpoint_size,
+            "cold_receiver_recovery_seconds": cold_recovery_seconds,
+            "cold_receiver_recovery_python_peak_bytes": cold_peak_bytes,
+            "cold_checkpoint_load_latency_max_ms": cold_metrics[
+                "canonical_checkpoint_load_latency_max_ms"
+            ],
+            "warm_continuation_seconds": warm_continuation_seconds,
+            "warm_continuation_python_peak_bytes": warm_peak_bytes,
+            "recovery_mode_note": (
+                "new receiver and reopened SQLite connection; OS page cache is not purged"
+            ),
+        }
+
+
 def run_benchmark(
     *,
     frame_count_per_size: int = 3,
     frame_sizes: tuple[int, ...] = (1024, 65_536, MAX_RAW_FRAME_BYTES),
+    history_frame_count: int = 10_000,
 ) -> dict[str, object]:
     with TemporaryDirectory(prefix="prospective-source-benchmark-") as directory:
         root = Path(directory)
@@ -186,9 +332,8 @@ def run_benchmark(
                     raw_bytes=payload_by_size[size],
                     received_at_utc=received,
                     producer_health={
+                        **_benchmark_health("synthetic-connection"),
                         "publisher_valid": publisher.valid,
-                        "heartbeat_healthy": True,
-                        "order_book_synchronized": True,
                     },
                 ):
                     break
@@ -247,6 +392,9 @@ def run_benchmark(
             "continuity_failures": receiver_metrics["source_gaps"]
             + receiver_metrics["frames_rejected"],
             "publisher_valid": publisher_metrics["valid"],
+            "checkpoint_recovery": _run_checkpoint_recovery_benchmark(
+                history_frame_count
+            ),
         }
 
 
@@ -255,6 +403,12 @@ def main() -> None:
         description="Measure the local prospective source publisher and journal path."
     )
     parser.add_argument("--frame-count-per-size", type=_positive_int, default=3)
+    parser.add_argument(
+        "--history-frames",
+        type=_positive_int,
+        default=10_000,
+        help="Historical source rows to exercise before receiver restart recovery.",
+    )
     parser.add_argument(
         "--frame-sizes",
         type=_frame_sizes,
@@ -266,6 +420,7 @@ def main() -> None:
         run_benchmark(
             frame_count_per_size=args.frame_count_per_size,
             frame_sizes=args.frame_sizes,
+            history_frame_count=args.history_frames,
         ),
         indent=2,
         sort_keys=True,

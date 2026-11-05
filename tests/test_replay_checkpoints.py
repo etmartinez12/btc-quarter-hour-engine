@@ -237,6 +237,123 @@ def test_canonical_checkpoint_continuation_matches_observations_exactly():
     assert resumed._connections["conn-2"].boundary_candidates
 
 
+def test_bounded_boundary_observation_matches_authoritative_replay_after_reconnect():
+    frames = _stream()
+    frames[5:] = [
+        _snapshot("2026-01-01T00:29:59Z", 1),
+        _frame("heartbeats", "2026-01-01T00:30:00Z", 2),
+        _update(3, "2026-01-01T00:30:01Z", "bid", 100.5, 2.0),
+        _frame("heartbeats", "2026-01-01T00:44:59Z", 4),
+        _update(5, "2026-01-01T00:45:01Z", "offer", 101.0, 0.0),
+    ]
+    connection_ids = ["conn-1"] * 5 + ["conn-2"] * 5
+    replay = _canonical_replay(frames, connection_ids)
+    authoritative = _finalize(replay)
+    derived_at = _utc("2026-01-01T02:00:00Z")
+    for boundary in (
+        _utc("2026-01-01T00:15:00Z"),
+        _utc("2026-01-01T00:30:00Z"),
+        _utc("2026-01-01T00:45:00Z"),
+    ):
+        assert replay.boundary_is_finalized(boundary)
+        assert replay.boundary_observation(
+            boundary, derived_at_utc=derived_at
+        ) == next(row for row in authoritative if row.boundary_time_utc == boundary)
+
+    next_boundary = _utc("2026-01-01T00:30:00Z")
+    expected = next(
+        row for row in authoritative if row.boundary_time_utc == next_boundary
+    )
+    replay.prune_for_next_boundary(_utc("2026-01-01T00:15:00Z"))
+    assert replay.boundary_observation(
+        next_boundary, derived_at_utc=derived_at
+    ) == expected
+
+
+def test_heartbeat_first_crossing_finalizes_as_of_boundary_book():
+    frames = [
+        _snapshot("2026-01-01T00:14:50Z", 1),
+        _frame("heartbeats", "2026-01-01T00:14:59Z", 2),
+        _frame("heartbeats", "2026-01-01T00:15:01Z", 3),
+    ]
+    replay = _canonical_replay(frames, ["conn-1"] * len(frames))
+    boundary = _utc("2026-01-01T00:15:00Z")
+    derived_at = _utc("2026-01-01T02:00:00Z")
+    authoritative = _finalize(replay)
+    assert replay.boundary_is_finalized(boundary)
+    observation = replay.boundary_observation(
+        boundary, derived_at_utc=derived_at
+    )
+    expected = next(row for row in authoritative if row.boundary_time_utc == boundary)
+    assert observation == expected
+    assert observation.last_heartbeat_at_utc == _utc("2026-01-01T00:14:59Z")
+
+
+def test_large_delayed_event_fails_within_live_boundary_limit():
+    replay = CanonicalReplayAccumulator(
+        product_id="BTC-USD", session_id="session-1", heartbeat_timeout_seconds=30
+    )
+    replay.consume(
+        _snapshot("2026-01-01T00:00:00Z", 1),
+        "conn-1",
+        0,
+        _utc("2026-01-01T00:00:00Z"),
+        enforce_live_limits=True,
+    )
+    with pytest.raises(ValueError, match="boundary limit"):
+        replay.consume(
+            _frame("heartbeats", "2026-02-01T00:00:00Z", 2),
+            "conn-1",
+            1,
+            _utc("2026-02-01T00:00:00Z"),
+            enforce_live_limits=True,
+        )
+    assert len(replay._connections["conn-1"].boundary_candidates) <= 64
+
+
+def test_bounded_boundary_observation_matches_replay_with_delayed_and_malformed_frames():
+    frames = [
+        _snapshot("2026-01-01T00:14:50Z", 1),
+        _frame("heartbeats", "2026-01-01T00:14:55Z", 2),
+        _update(3, "2026-01-01T00:15:03Z", "bid", 100.0, 1.5),
+        b"malformed source frame",
+        _frame(
+            "l2_data",
+            "2026-01-01T00:30:03Z",
+            4,
+            updates=[("offer", "2026-01-01T00:29:59Z", 101.0, 1.5)],
+        ),
+        _frame("heartbeats", "2026-01-01T00:30:04Z", 5),
+    ]
+    ingests = [
+        _utc("2026-01-01T00:14:50Z"),
+        _utc("2026-01-01T00:14:55Z"),
+        _utc("2026-01-01T00:15:03Z"),
+        _utc("2026-01-01T00:15:04Z"),
+        _utc("2026-01-01T00:30:03Z"),
+        _utc("2026-01-01T00:30:04Z"),
+    ]
+    replay = CanonicalReplayAccumulator(
+        product_id="BTC-USD", session_id="session-1", heartbeat_timeout_seconds=30
+    )
+    for index, (raw, ingest) in enumerate(zip(frames, ingests)):
+        replay.consume(raw, "conn-1", index, ingest)
+    derived_at = _utc("2026-01-01T02:00:00Z")
+    authoritative = replay.finalize(
+        session_started_at_utc=_utc("2026-01-01T00:00:00Z"),
+        session_completed_at_utc=_utc("2026-01-01T01:00:00Z"),
+        derived_at_utc=derived_at,
+    )
+    for boundary in (
+        _utc("2026-01-01T00:15:00Z"),
+        _utc("2026-01-01T00:30:00Z"),
+    ):
+        assert replay.boundary_is_finalized(boundary)
+        assert replay.boundary_observation(
+            boundary, derived_at_utc=derived_at
+        ) == next(row for row in authoritative if row.boundary_time_utc == boundary)
+
+
 @pytest.mark.parametrize(
     ("restore", "checkpoint"),
     [

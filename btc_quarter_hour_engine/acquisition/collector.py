@@ -4,6 +4,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,10 @@ class WebSocketCollector:
     _level2_update_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
     _bbo_state_artifacts: list[dict[str, Any]] = field(default_factory=list, init=False)
     _canonical_accumulator: CanonicalReplayAccumulator = field(init=False)
+    _source_canonical_accumulator: CanonicalReplayAccumulator | None = field(
+        default=None, init=False
+    )
+    _source_canonical_failure: str | None = field(default=None, init=False)
     _stop_fn: Any = field(default=None, init=False)
     _source_connection_id: str | None = field(default=None, init=False)
     _source_reconnect_epoch: int = field(default=-1, init=False)
@@ -109,6 +114,10 @@ class WebSocketCollector:
     _canonical_boundary_cache: dict[datetime, dict[str, Any]] = field(
         default_factory=dict, init=False
     )
+    _source_canonical_latency_max_ms: float = field(default=0.0, init=False)
+    _source_enqueue_latency_max_ms: float = field(default=0.0, init=False)
+    _source_canonical_failure_count: int = field(default=0, init=False)
+    _source_pruned_boundary: datetime | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if self.sleep_fn is None:
@@ -124,6 +133,12 @@ class WebSocketCollector:
             session_id=self.service.session_id,
             heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
         )
+        if self.source_publisher is not None:
+            self._source_canonical_accumulator = CanonicalReplayAccumulator(
+                product_id=self.service.config.product_id,
+                session_id=self.service.session_id,
+                heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
+            )
 
     def _connections(self) -> list[Any]:
         connections = [*self.service.connection_history]
@@ -146,6 +161,18 @@ class WebSocketCollector:
             frame_index,
             frame.received_at_utc,
         )
+        if self._source_canonical_accumulator is not None and self._source_canonical_failure is None:
+            try:
+                self._source_canonical_accumulator.consume(
+                    frame.raw_bytes,
+                    connection_id,
+                    frame_index,
+                    frame.received_at_utc,
+                    enforce_live_limits=True,
+                )
+            except Exception as exc:
+                self._source_canonical_failure = type(exc).__name__
+                self._source_canonical_failure_count += 1
         self._frame_count += 1
         return frame_index
 
@@ -165,8 +192,6 @@ class WebSocketCollector:
     ) -> None:
         if self.source_publisher is None or frame_index is None:
             return
-        if self._source_session_started_at_utc is None:
-            raise RuntimeError("Source session start has not been initialized")
         connection = self.service.connection
         connection_id = connection.connection_id if connection is not None else None
         if connection_id != self._source_connection_id:
@@ -176,45 +201,59 @@ class WebSocketCollector:
         cutoff = received.replace(
             minute=received.minute - received.minute % 15, second=0, microsecond=0
         )
-        canonical_boundary = self._canonical_boundary_cache.get(cutoff)
-        if (
-            canonical_boundary is None
-            and self._canonical_accumulator.boundary_is_finalized(cutoff)
-        ):
-            authoritative_observations = self._canonical_accumulator.finalize(
-                session_started_at_utc=self._source_session_started_at_utc,
-                session_completed_at_utc=received,
-                derived_at_utc=received,
-                connections=self._connections(),
+        canonical_started = time.perf_counter_ns()
+        canonical_boundary = None
+        try:
+            if self._source_session_started_at_utc is None:
+                raise RuntimeError("Source session start has not been initialized")
+            if (
+                cutoff > self._source_session_started_at_utc
+                and self._source_canonical_failure is None
+            ):
+                source_accumulator = self._source_canonical_accumulator
+                if source_accumulator is None:
+                    raise RuntimeError("Canonical source replay was not initialized")
+                canonical_boundary = self._canonical_boundary_cache.get(cutoff)
+                if (
+                    canonical_boundary is None
+                    and source_accumulator.boundary_is_finalized(cutoff)
+                ):
+                    observation = source_accumulator.boundary_observation(
+                        cutoff,
+                        derived_at_utc=received,
+                    )
+                    canonical_boundary = {
+                        "boundary_utc": self._health_timestamp(
+                            observation.boundary_time_utc
+                        ),
+                        "canonical_target_eligible": bool(
+                            observation.canonical_target_eligible
+                        ),
+                        "eligibility_reason": observation.eligibility_reason,
+                        "book_synced": bool(observation.book_synced),
+                        "last_heartbeat_at_utc": self._health_timestamp(
+                            observation.last_heartbeat_at_utc
+                        ),
+                        "heartbeat_timeout_seconds": float(
+                            observation.heartbeat_timeout_seconds
+                        ),
+                        "connection_id": observation.connection_id,
+                        "source_sequence_num": observation.source_sequence_num,
+                    }
+                    self._canonical_boundary_cache[cutoff] = canonical_boundary
+        except Exception as exc:
+            self._source_canonical_failure_count += 1
+            self.service._record_diagnostic(
+                kind="prospective_source_canonical_evidence_failed",
+                reason=type(exc).__name__,
+                frame_index=frame_index,
             )
-            boundary_observation = next(
-                (
-                    item
-                    for item in authoritative_observations
-                    if item.boundary_time_utc == cutoff
-                ),
-                None,
+            canonical_boundary = None
+        finally:
+            self._source_canonical_latency_max_ms = max(
+                self._source_canonical_latency_max_ms,
+                (time.perf_counter_ns() - canonical_started) / 1_000_000,
             )
-            if boundary_observation is not None:
-                canonical_boundary = {
-                    "boundary_utc": self._health_timestamp(
-                        boundary_observation.boundary_time_utc
-                    ),
-                    "canonical_target_eligible": bool(
-                        boundary_observation.canonical_target_eligible
-                    ),
-                    "eligibility_reason": boundary_observation.eligibility_reason,
-                    "book_synced": bool(boundary_observation.book_synced),
-                    "last_heartbeat_at_utc": self._health_timestamp(
-                        boundary_observation.last_heartbeat_at_utc
-                    ),
-                    "heartbeat_timeout_seconds": float(
-                        boundary_observation.heartbeat_timeout_seconds
-                    ),
-                    "connection_id": boundary_observation.connection_id,
-                    "source_sequence_num": boundary_observation.source_sequence_num,
-                }
-                self._canonical_boundary_cache[cutoff] = canonical_boundary
         canonical_boundary_finalized = canonical_boundary is not None
         diagnostics = connection
         post_frame_health = {
@@ -263,6 +302,7 @@ class WebSocketCollector:
             "canonical_boundary_finalized": canonical_boundary_finalized,
             "canonical_boundary": canonical_boundary,
         }
+        enqueue_started = time.perf_counter_ns()
         try:
             published = self.source_publisher.publish_frame(
                 connection_id=connection_id,
@@ -284,6 +324,21 @@ class WebSocketCollector:
                 reason=type(exc).__name__,
                 frame_index=frame_index,
             )
+        finally:
+            self._source_enqueue_latency_max_ms = max(
+                self._source_enqueue_latency_max_ms,
+                (time.perf_counter_ns() - enqueue_started) / 1_000_000,
+            )
+        if (
+            canonical_boundary_finalized
+            and self._source_canonical_accumulator is not None
+            and self._source_pruned_boundary != cutoff
+        ):
+            self._source_canonical_accumulator.prune_for_next_boundary(cutoff)
+            self._canonical_boundary_cache = {
+                cutoff: canonical_boundary
+            }
+            self._source_pruned_boundary = cutoff
 
     def run(
         self,
@@ -306,6 +361,12 @@ class WebSocketCollector:
                     kind="prospective_source_init_failed",
                     reason=type(exc).__name__,
                 )
+        if self.source_publisher is not None and self._source_canonical_accumulator is None:
+            self._source_canonical_accumulator = CanonicalReplayAccumulator(
+                product_id=self.service.config.product_id,
+                session_id=self.service.session_id,
+                heartbeat_timeout_seconds=self.service.config.heartbeat_timeout_seconds,
+            )
         start_monotonic = self.service.monotonic_fn()
         self._checkpoint_started_monotonic = start_monotonic
         message_count = 0
@@ -400,7 +461,12 @@ class WebSocketCollector:
             if self.source_publisher is not None:
                 self.source_publisher.close()
         if self.source_publisher is not None:
-            result.source_metrics = self.source_publisher.metrics()
+            result.source_metrics = {
+                **self.source_publisher.metrics(),
+                "collector_canonical_evidence_latency_max_ms": self._source_canonical_latency_max_ms,
+                "collector_enqueue_latency_max_ms": self._source_enqueue_latency_max_ms,
+                "collector_canonical_evidence_failures": self._source_canonical_failure_count,
+            }
         return result
 
     def _reconnect(self) -> None:

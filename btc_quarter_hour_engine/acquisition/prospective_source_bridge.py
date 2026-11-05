@@ -578,6 +578,8 @@ class ProspectiveSourceReceiver:
         self.frame_write_latency_max_ms = 0.0
         self.durable_ack_latency_max_ms = 0.0
         self.watermark_latency_max_ms = 0.0
+        self.canonical_checkpoint_load_latency_max_ms = 0.0
+        self.canonical_checkpoint_bytes_max = 0
         self._session_started: dict[str, datetime] = {}
         self._canonical_replays: dict[str, CanonicalReplayAccumulator] = {}
         self._canonical_timeouts: dict[str, float] = {}
@@ -592,37 +594,82 @@ class ProspectiveSourceReceiver:
                 raise ValueError("Source canonical replay heartbeat tolerance changed")
             return replay
 
+        started_at = time.perf_counter_ns()
         started = self.journal.session_started_at(session_id)
         if started is None:
             raise ValueError("Canonical source replay session is not registered")
-        replay = CanonicalReplayAccumulator(
-            product_id="BTC-USD",
-            session_id=session_id,
-            heartbeat_timeout_seconds=timeout,
-        )
-        rows = self.journal._connection.execute(
-            "SELECT f.frame_index, f.connection_id, f.ingest_time_utc, f.raw_bytes, "
-            "h.producer_health_json FROM source_frames f "
-            "JOIN source_frame_health h ON h.session_id = f.session_id "
-            "AND h.frame_index = f.frame_index WHERE f.session_id = ? "
-            "ORDER BY f.frame_index",
+        latest = self.journal._connection.execute(
+            "SELECT f.frame_index, p.commitment_sha256 "
+            "FROM source_frames f LEFT JOIN source_prefix_commitments p "
+            "ON p.session_id = f.session_id AND p.frame_index = f.frame_index "
+            "WHERE f.session_id = ? ORDER BY f.frame_index DESC LIMIT 1",
             (session_id,),
-        ).fetchall()
-        for row in rows:
-            evidence = json.loads(row["producer_health_json"])
-            frame_timeout = float(
-                evidence["post_frame_health"]["heartbeat_timeout_seconds"]
+        ).fetchone()
+        if latest is None:
+            replay = CanonicalReplayAccumulator(
+                product_id="BTC-USD",
+                session_id=session_id,
+                heartbeat_timeout_seconds=timeout,
             )
-            if frame_timeout != timeout:
-                raise ValueError("Source frame heartbeat tolerance changed within session")
-            replay.consume(
-                bytes(row["raw_bytes"]),
-                row["connection_id"],
-                row["frame_index"],
-                _parse_utc(row["ingest_time_utc"], field="frame receive timestamp"),
+        else:
+            checkpoint = self.journal._connection.execute(
+                "SELECT frame_index, prefix_commitment_sha256, checkpoint_json, "
+                "checkpoint_sha256 FROM source_canonical_checkpoints "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if checkpoint is None:
+                raise ValueError("Canonical replay checkpoint is missing for committed source")
+            checkpoint_json = checkpoint["checkpoint_json"]
+            if (
+                checkpoint["frame_index"] != latest["frame_index"]
+                or latest["commitment_sha256"] is None
+                or checkpoint["prefix_commitment_sha256"]
+                != latest["commitment_sha256"]
+                or hashlib.sha256(checkpoint_json.encode("utf-8")).hexdigest()
+                != checkpoint["checkpoint_sha256"]
+            ):
+                raise ValueError("Canonical replay checkpoint identity or digest is invalid")
+            try:
+                payload = json.loads(checkpoint_json)
+            except json.JSONDecodeError as exc:
+                raise ValueError("Canonical replay checkpoint JSON is malformed") from exc
+            if (
+                not isinstance(payload, dict)
+                or set(payload)
+                != {
+                    "version",
+                    "session_id",
+                    "frame_index",
+                    "prefix_commitment_sha256",
+                    "state",
+                }
+                or payload["version"] != 1
+                or payload["session_id"] != session_id
+                or payload["frame_index"] != latest["frame_index"]
+                or payload["prefix_commitment_sha256"]
+                != latest["commitment_sha256"]
+            ):
+                raise ValueError("Canonical replay checkpoint provenance is invalid")
+            replay = CanonicalReplayAccumulator.from_checkpoint(payload["state"])
+            if (
+                replay.product_id != "BTC-USD"
+                or replay.session_id != session_id
+                or replay.heartbeat_timeout_seconds != timeout
+                or replay.frame_count != latest["frame_index"] + 1
+            ):
+                raise ValueError("Canonical replay checkpoint state identity is invalid")
+            replay._require_bounded_live_state()
+            self.canonical_checkpoint_bytes_max = max(
+                self.canonical_checkpoint_bytes_max,
+                len(checkpoint_json.encode("utf-8")),
             )
         self._canonical_replays[session_id] = replay
         self._canonical_timeouts[session_id] = timeout
+        self.canonical_checkpoint_load_latency_max_ms = max(
+            self.canonical_checkpoint_load_latency_max_ms,
+            (time.perf_counter_ns() - started_at) / 1_000_000,
+        )
         return replay
 
     def _verify_canonical_boundary(
@@ -639,34 +686,18 @@ class ProspectiveSourceReceiver:
         )
         if not replay.boundary_is_finalized(watermark):
             raise ValueError("Canonical boundary was not finalized by committed raw frames")
-        latest = self.journal._connection.execute(
-            "SELECT ingest_time_utc FROM source_frames WHERE session_id = ? "
-            "ORDER BY frame_index DESC LIMIT 1",
-            (session_id,),
-        ).fetchone()
-        if latest is None:
+        if replay.frame_count < 1:
             raise ValueError("Canonical source replay has no committed frame prefix")
-        started = self.journal.session_started_at(session_id)
-        if started is None:
-            raise ValueError("Canonical source replay session is not registered")
-        connections = [
-            {"connection_id": row["connection_id"]}
-            for row in self.journal._connection.execute(
-                "SELECT connection_id FROM source_connections WHERE session_id = ? "
-                "ORDER BY reconnect_epoch",
-                (session_id,),
-            ).fetchall()
+        observations = [
+            replay.boundary_observation(
+                watermark,
+                derived_at_utc=watermark + timedelta(minutes=15),
+                connections=[
+                    {"connection_id": connection_id}
+                    for connection_id in replay._connections
+                ],
+            )
         ]
-        observations = replay.finalize(
-            session_started_at_utc=started,
-            session_completed_at_utc=_parse_utc(
-                latest["ingest_time_utc"], field="frame receive timestamp"
-            ),
-            derived_at_utc=_parse_utc(
-                latest["ingest_time_utc"], field="frame receive timestamp"
-            ),
-            connections=connections,
-        )
         observation = next(
             (item for item in observations if item.boundary_time_utc == watermark),
             None,
@@ -798,24 +829,47 @@ class ProspectiveSourceReceiver:
             connection_id=connection_id,
             first_frame_index=first_frame,
         )
-        write_started = time.perf_counter_ns()
-        self.journal.append_frame(
-            session_id=session_id,
-            connection_id=connection_id,
-            frame_index=frame_index,
-            ingest_time_utc=ingest,
-            raw_bytes=raw_bytes,
-            reconnect_epoch=reconnect_epoch,
-            producer_health=producer_health,
+        replay = self._canonical_replay(
+            session_id,
+            producer_health["post_frame_health"]["heartbeat_timeout_seconds"],
         )
+        if replay.frame_count != frame_index:
+            raise ValueError("Canonical replay checkpoint frame index is discontinuous")
+        try:
+            replay.consume(
+                raw_bytes,
+                connection_id,
+                frame_index,
+                ingest,
+                enforce_live_limits=True,
+            )
+            replay._require_bounded_live_state()
+            canonical_checkpoint = replay.to_checkpoint()
+        except Exception:
+            self._canonical_replays.pop(session_id, None)
+            self._canonical_timeouts.pop(session_id, None)
+            raise
+        write_started = time.perf_counter_ns()
+        try:
+            self.journal.append_frame(
+                session_id=session_id,
+                connection_id=connection_id,
+                frame_index=frame_index,
+                ingest_time_utc=ingest,
+                raw_bytes=raw_bytes,
+                reconnect_epoch=reconnect_epoch,
+                producer_health=producer_health,
+                canonical_replay_checkpoint=canonical_checkpoint,
+            )
+        except Exception:
+            self._canonical_replays.pop(session_id, None)
+            self._canonical_timeouts.pop(session_id, None)
+            raise
         write_latency = (time.perf_counter_ns() - write_started) / 1_000_000
         self.frame_write_latency_max_ms = max(
             self.frame_write_latency_max_ms, write_latency
         )
         self.frames_committed += 1
-        replay = self._canonical_replays.get(session_id)
-        if replay is not None:
-            replay.consume(raw_bytes, connection_id, frame_index, ingest)
         return {
             "durable": True,
             "kind": "frame",
@@ -864,6 +918,12 @@ class ProspectiveSourceReceiver:
             watermark=watermark,
             frame_health=validated_health,
         )
+        replay = self._canonical_replays[session_id]
+        pruned_replay = CanonicalReplayAccumulator.from_checkpoint(
+            replay.to_checkpoint()
+        )
+        pruned_replay.prune_for_next_boundary(watermark)
+        canonical_checkpoint = pruned_replay.to_checkpoint()
         clock = self.clock_health_provider()
         if not isinstance(clock, ClockHealthEvidence):
             raise TypeError("Clock-health provider returned invalid evidence")
@@ -877,7 +937,9 @@ class ProspectiveSourceReceiver:
             clock_health_verified=clock.verified,
             clock_evidence=clock.as_dict(),
             producer_health=health,
+            canonical_replay_checkpoint=canonical_checkpoint,
         )
+        self._canonical_replays[session_id] = pruned_replay
         fence_latency = (time.perf_counter_ns() - fence_started) / 1_000_000
         self.watermark_latency_max_ms = max(
             self.watermark_latency_max_ms, fence_latency
@@ -901,6 +963,8 @@ class ProspectiveSourceReceiver:
             "frame_write_latency_max_ms": self.frame_write_latency_max_ms,
             "durable_ack_latency_max_ms": self.durable_ack_latency_max_ms,
             "watermark_certification_latency_max_ms": self.watermark_latency_max_ms,
+            "canonical_checkpoint_load_latency_max_ms": self.canonical_checkpoint_load_latency_max_ms,
+            "canonical_checkpoint_bytes_max": self.canonical_checkpoint_bytes_max,
         }
 
     def note_rejection(self, *, gap: bool = False) -> None:

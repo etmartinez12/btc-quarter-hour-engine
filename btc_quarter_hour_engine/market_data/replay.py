@@ -24,7 +24,12 @@ from ._checkpoint import (
 )
 
 
-CANONICAL_REPLAY_CHECKPOINT_VERSION = 1
+CANONICAL_REPLAY_CHECKPOINT_VERSION = 2
+MAX_CANONICAL_LIVE_CONNECTIONS = 128
+MAX_CANONICAL_BOUNDARY_CANDIDATES = 64
+MAX_CANONICAL_HEARTBEAT_BUCKETS = 4096
+MAX_CANONICAL_LIVE_BOOK_LEVELS = 100_000
+MAX_CANONICAL_CHECKPOINT_BYTES = 8 * 1024 * 1024
 
 
 def floor_to_quarter_hour(timestamp: datetime) -> datetime:
@@ -925,12 +930,18 @@ class _StreamingConnectionState:
         if self.earliest_control is None or control[:2] < self.earliest_control[:2]:
             self.earliest_control = control
 
-    def freeze_before(self, effective_time: datetime) -> None:
+    def freeze_before(
+        self, effective_time: datetime, *, max_new_candidates: int | None
+    ) -> None:
         if self.candidate_cursor_utc is None:
             self.candidate_cursor_utc = floor_to_quarter_hour(effective_time)
+        frozen = 0
         while self.candidate_cursor_utc < effective_time:
+            if max_new_candidates is not None and frozen >= max_new_candidates:
+                raise ValueError("Canonical live replay boundary limit exceeded")
             self.boundary_candidates.setdefault(self.candidate_cursor_utc, self.compact_book())
             self.candidate_cursor_utc += timedelta(minutes=15)
+            frozen += 1
 
     def record_heartbeat(self, heartbeat_time: datetime) -> None:
         bucket = floor_to_quarter_hour(heartbeat_time)
@@ -1123,6 +1134,7 @@ class CanonicalReplayAccumulator:
     session_id: str
     heartbeat_timeout_seconds: float
     frame_count: int = 0
+    pruned_delivery_count: int = 0
     first_source_sample: tuple[datetime, datetime] | None = None
     last_source_sample: tuple[datetime, datetime] | None = None
     observed_min: datetime | None = None
@@ -1190,6 +1202,7 @@ class CanonicalReplayAccumulator:
             "session_id": self.session_id,
             "heartbeat_timeout_seconds": _float_to_checkpoint(self.heartbeat_timeout_seconds),
             "frame_count": self.frame_count,
+            "pruned_delivery_count": self.pruned_delivery_count,
             "first_source_sample": (
                 [_utc_to_checkpoint(value) for value in self.first_source_sample]
                 if self.first_source_sample is not None else None
@@ -1215,7 +1228,7 @@ class CanonicalReplayAccumulator:
             version=CANONICAL_REPLAY_CHECKPOINT_VERSION,
             required={
                 "version", "product_id", "session_id", "heartbeat_timeout_seconds",
-                "frame_count", "first_source_sample", "last_source_sample",
+                "frame_count", "pruned_delivery_count", "first_source_sample", "last_source_sample",
                 "observed_min", "observed_max", "has_frames",
                 "_active_connection_id", "_has_active_connection", "connections",
             },
@@ -1231,6 +1244,9 @@ class CanonicalReplayAccumulator:
         if not math.isfinite(timeout) or timeout < 0:
             raise ValueError("Checkpoint heartbeat timeout must be nonnegative")
         frame_count = _require_nonnegative_int(data["frame_count"], field="frame_count")
+        pruned_delivery_count = _require_nonnegative_int(
+            data["pruned_delivery_count"], field="pruned_delivery_count"
+        )
         for name in ("has_frames", "_has_active_connection"):
             if type(data[name]) is not bool:
                 raise ValueError(f"Checkpoint {name} must be boolean")
@@ -1264,6 +1280,7 @@ class CanonicalReplayAccumulator:
             session_id=session_id,
             heartbeat_timeout_seconds=timeout,
             frame_count=frame_count,
+            pruned_delivery_count=pruned_delivery_count,
             first_source_sample=first_sample,
             last_source_sample=last_sample,
             observed_min=observed_min,
@@ -1429,7 +1446,11 @@ class CanonicalReplayAccumulator:
             active_state = result._connections[active_id]
             if active_state.book is None:
                 raise ValueError("Checkpoint active connection has no live order book")
-        if sum(state.delivery_count for state in result._connections.values()) != frame_count:
+        if (
+            sum(state.delivery_count for state in result._connections.values())
+            + pruned_delivery_count
+            != frame_count
+        ):
             raise ValueError("Checkpoint delivery counts do not match frame_count")
         if data["has_frames"] != (frame_count > 0):
             raise ValueError("Checkpoint has_frames does not match frame_count")
@@ -1466,6 +1487,8 @@ class CanonicalReplayAccumulator:
         connection_id: str | None,
         frame_index: int,
         ingest_time_utc: datetime,
+        *,
+        enforce_live_limits: bool = False,
     ) -> None:
         if not isinstance(raw, bytes):
             raise TypeError("Recorded frames must retain their original bytes")
@@ -1474,6 +1497,12 @@ class CanonicalReplayAccumulator:
         ingest = require_utc(ingest_time_utc)
         from btc_quarter_hour_engine.acquisition.coinbase_websocket import parse_coinbase_ws_message
 
+        if (
+            enforce_live_limits
+            and connection_id not in self._connections
+            and len(self._connections) >= MAX_CANONICAL_LIVE_CONNECTIONS
+        ):
+            raise ValueError("Canonical live replay connection limit exceeded")
         state = self._activate_connection(connection_id)
         self.frame_count += 1
         self.has_frames = True
@@ -1552,6 +1581,19 @@ class CanonicalReplayAccumulator:
                 if state.malformed_control_time_utc is not None else timestamp
             )
         if kind == "heartbeat":
+            state.freeze_before(
+                event_time,
+                max_new_candidates=(
+                    MAX_CANONICAL_BOUNDARY_CANDIDATES
+                    - sum(
+                        len(other.boundary_candidates)
+                        for other_id, other in self._connections.items()
+                        if other_id != connection_id
+                    )
+                    if enforce_live_limits
+                    else None
+                ),
+            )
             if not state.source_invalid:
                 state.record_heartbeat(event_time)
             return
@@ -1570,7 +1612,19 @@ class CanonicalReplayAccumulator:
                 state.candidate_cursor_utc,
                 floor_to_quarter_hour(event_time),
             )
-        state.freeze_before(event_time)
+        state.freeze_before(
+            event_time,
+            max_new_candidates=(
+                MAX_CANONICAL_BOUNDARY_CANDIDATES
+                - sum(
+                    len(other.boundary_candidates)
+                    for other_id, other in self._connections.items()
+                    if other_id != connection_id
+                )
+                if enforce_live_limits
+                else None
+            ),
+        )
 
         if kind == "snapshot":
             try:
@@ -1616,10 +1670,163 @@ class CanonicalReplayAccumulator:
         boundary = require_utc(boundary_utc)
         if boundary != floor_to_quarter_hour(boundary):
             raise ValueError("Boundary must be an exact UTC quarter-hour")
+        self._require_bounded_live_state()
         return any(
             boundary in state.boundary_candidates
             for state in self._connections.values()
         )
+
+    def _require_bounded_live_state(self) -> None:
+        if len(self._connections) > MAX_CANONICAL_LIVE_CONNECTIONS:
+            raise ValueError("Canonical live replay connection limit exceeded")
+        if sum(
+            len(state.book.bids) + len(state.book.asks)
+            for state in self._connections.values()
+            if state.book is not None
+        ) > MAX_CANONICAL_LIVE_BOOK_LEVELS:
+            raise ValueError("Canonical live replay order-book level limit exceeded")
+        if sum(
+            len(state.boundary_candidates) for state in self._connections.values()
+        ) > MAX_CANONICAL_BOUNDARY_CANDIDATES:
+            raise ValueError("Canonical live replay boundary limit exceeded")
+        if sum(
+            len(state.heartbeat_buckets) for state in self._connections.values()
+        ) > MAX_CANONICAL_HEARTBEAT_BUCKETS:
+            raise ValueError("Canonical live replay heartbeat limit exceeded")
+
+    def boundary_observation(
+        self,
+        boundary_utc: datetime,
+        *,
+        derived_at_utc: datetime,
+        connections: Iterable[Any] | None = None,
+    ) -> QuarterHourObservation:
+        """Derive one finalized boundary with explicit live-state work limits."""
+        boundary = require_utc(boundary_utc)
+        if boundary != floor_to_quarter_hour(boundary):
+            raise ValueError("Boundary must be an exact UTC quarter-hour")
+        self._require_bounded_live_state()
+        derived = require_utc(derived_at_utc)
+        metadata = {
+            _connection_field(connection, "connection_id"): connection
+            for connection in (connections or ())
+        }
+        ids = list(metadata)
+        ids.extend(connection_id for connection_id in self._connections if connection_id not in metadata)
+        ordered_ids = sorted(
+            ids,
+            key=lambda connection_id: (
+                self._connections.get(
+                    connection_id,
+                    _StreamingConnectionState(connection_id=connection_id),
+                ).first_source_time_utc
+                or datetime.max.replace(tzinfo=timezone.utc),
+                ids.index(connection_id),
+            ),
+        )
+        source_bounds: dict[str | None, tuple[datetime | None, datetime | None]] = {}
+        for connection_id in ids:
+            state = self._connections.get(connection_id)
+            if state is None:
+                source_bounds[connection_id] = (None, None)
+                continue
+            disconnected = _connection_field(
+                metadata.get(connection_id), "source_disconnected_at_utc"
+            )
+            disconnected = require_utc(disconnected) if disconnected is not None else None
+            source_bounds[connection_id] = (state.first_source_time_utc, disconnected)
+        for connection_id in ordered_ids[:-1]:
+            state = self._connections[connection_id]
+            source_bounds[connection_id] = (
+                source_bounds[connection_id][0],
+                state.last_source_time_utc or source_bounds[connection_id][0],
+            )
+        active: str | None = None
+        active_found = False
+        for connection_id in ordered_ids:
+            connected, _disconnected = source_bounds[connection_id]
+            if connected is not None and connected <= boundary:
+                active = connection_id
+                active_found = True
+        if active_found and active is not None:
+            connected, disconnected = source_bounds[active]
+            if disconnected is not None and disconnected < boundary:
+                active_found = False
+        if not active_found or active is None:
+            reason = (
+                "connection_unhealthy"
+                if self.has_frames and ids
+                else "no_synced_snapshot"
+            )
+            return derive_quarter_hour_observation(
+                book=Level2OrderBook(product_id=self.product_id),
+                timestamp_utc=boundary,
+                product_id=self.product_id,
+                session_id=self.session_id,
+                derived_at_utc=derived,
+                heartbeat_timeout_seconds=self.heartbeat_timeout_seconds,
+                integrity_reason=reason,
+            )
+        state = self._connections[active]
+        heartbeat = max(
+            (value for value in state.heartbeat_buckets.values() if value <= boundary),
+            default=None,
+        )
+        return _freeze_boundary_observation(
+            connection_id=active,
+            boundary=boundary,
+            state=state.state_at(boundary),
+            heartbeat=heartbeat,
+            control=state.earliest_control,
+            product_id=self.product_id,
+            session_id=self.session_id,
+            derived_at=derived,
+            heartbeat_timeout_seconds=self.heartbeat_timeout_seconds,
+        )
+
+    def prune_for_next_boundary(self, completed_boundary_utc: datetime) -> None:
+        """Retain only continuation state needed to certify the next boundary."""
+        boundary = require_utc(completed_boundary_utc)
+        if boundary != floor_to_quarter_hour(boundary):
+            raise ValueError("Boundary must be an exact UTC quarter-hour")
+        next_boundary = boundary + timedelta(minutes=15)
+        for state in self._connections.values():
+            state.boundary_candidates = {
+                candidate_time: candidate
+                for candidate_time, candidate in state.boundary_candidates.items()
+                if candidate_time >= next_boundary
+            }
+            prior = [
+                (bucket, heartbeat)
+                for bucket, heartbeat in state.heartbeat_buckets.items()
+                if bucket <= next_boundary
+            ]
+            future = {
+                bucket: heartbeat
+                for bucket, heartbeat in state.heartbeat_buckets.items()
+                if bucket > next_boundary
+            }
+            if prior:
+                bucket, heartbeat = max(prior, key=lambda item: item[1])
+                future[bucket] = heartbeat
+            state.heartbeat_buckets = future
+        if len(self._connections) > 1:
+            newest_connection = max(
+                self._connections,
+                key=lambda connection_id: (
+                    self._connections[connection_id].first_source_time_utc
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                ),
+            )
+            for connection_id in tuple(self._connections):
+                if connection_id != newest_connection:
+                    self.pruned_delivery_count += self._connections[
+                        connection_id
+                    ].delivery_count
+                    del self._connections[connection_id]
+            self._active_connection_id = newest_connection
+            self._has_active_connection = True
+        self._require_bounded_live_state()
 
     def finalize(
         self,

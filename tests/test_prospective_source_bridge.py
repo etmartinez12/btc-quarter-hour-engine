@@ -30,6 +30,7 @@ from btc_quarter_hour_engine.research.prospective_source import (
     _validate_bridge_health,
     _require_bridge_prediction_health,
 )
+from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
 
 
 UTC = timezone.utc
@@ -109,6 +110,98 @@ def _boundary_health(
         sequence_gap_count=0 if synced else 1,
     )
     return health
+
+
+def _wire_frame(sequence, timestamp, *, snapshot=False, heartbeat=False):
+    event_time = timestamp.isoformat().replace("+00:00", "Z")
+    if heartbeat:
+        channel = "heartbeats"
+        events = [{"current_time": event_time, "heartbeat_counter": str(sequence)}]
+    else:
+        channel = "l2_data"
+        updates = (
+            [
+                {"side": "bid", "price_level": "100", "new_quantity": "1", "event_time": event_time},
+                {"side": "offer", "price_level": "101", "new_quantity": "2", "event_time": event_time},
+            ]
+            if snapshot
+            else [
+                {"side": "bid", "price_level": "100", "new_quantity": "1.5", "event_time": event_time},
+            ]
+        )
+        events = [{
+            "type": "snapshot" if snapshot else "update",
+            "product_id": "BTC-USD",
+            "updates": updates,
+        }]
+    return json.dumps(
+        {
+            "channel": channel,
+            "timestamp": event_time,
+            "sequence_num": sequence,
+            "events": events,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _frame_header(raw, *, index, received, health, session_id="session-1"):
+    return {
+        "version": 1,
+        "kind": "frame",
+        "session_id": session_id,
+        "session_started_at_utc": START.isoformat().replace("+00:00", "Z"),
+        "connection_id": "connection-0",
+        "reconnect_epoch": 0,
+        "connection_first_frame_index": 0,
+        "frame_index": index,
+        "ingest_time_utc": received.isoformat().replace("+00:00", "Z"),
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "raw_length": len(raw),
+        "producer_health": health,
+    }
+
+
+def _canonical_boundary_health(raw_frames, ingest_times):
+    replay = CanonicalReplayAccumulator(
+        product_id="BTC-USD", session_id="session-1", heartbeat_timeout_seconds=5
+    )
+    for index, (raw, ingest) in enumerate(zip(raw_frames, ingest_times)):
+        replay.consume(raw, "connection-0", index, ingest)
+    observation = replay.boundary_observation(
+        BOUNDARY,
+        derived_at_utc=BOUNDARY + timedelta(minutes=15),
+        connections=[{"connection_id": "connection-0"}],
+    )
+    health = _boundary_health(
+        "connection-0",
+        BOUNDARY,
+        eligible=observation.canonical_target_eligible,
+        reason=observation.eligibility_reason,
+        synced=observation.book_synced,
+        heartbeat_at=observation.last_heartbeat_at_utc,
+        sequence=observation.source_sequence_num or 0,
+    )
+    health["canonical_boundary"]["last_heartbeat_at_utc"] = (
+        observation.last_heartbeat_at_utc.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+        if observation.last_heartbeat_at_utc is not None
+        else None
+    )
+    health["post_frame_health"].update(
+        heartbeat_seen=True,
+        heartbeat_last_at_utc=(
+            observation.last_heartbeat_at_utc.isoformat().replace("+00:00", "Z")
+            if observation.last_heartbeat_at_utc is not None
+            else None
+        ),
+        heartbeat_healthy=observation.canonical_target_eligible,
+        order_book_synchronized=True,
+        connection_last_sequence_num=3,
+        last_l2_sequence_num=3,
+    )
+    return replay, health
 
 
 def _clock_at(boundary, *, verified=True):
@@ -427,9 +520,101 @@ def test_unix_receiver_acknowledges_only_committed_frames(tmp_path):
     assert not any(isinstance(error, Exception) for error in errors[1:])
 
     journal = ProspectiveRawFrameJournal(journal_path)
+    assert journal._connection.execute(
+        "SELECT raw_bytes FROM source_frames WHERE session_id = 'session-1'"
+    ).fetchone()["raw_bytes"] == b"socket-frame"
+    assert journal._connection.execute(
+        "SELECT COUNT(*) FROM source_prefix_commitments WHERE session_id = 'session-1'"
+    ).fetchone()[0] == 1
+    with pytest.raises(ValueError, match="no committed producer fence"):
+        journal.snapshot("session-1")
+    journal.close()
+
+
+def test_ordered_verified_fence_certifies_durable_snapshot(tmp_path):
+    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+
+    clock = _clock_at(BOUNDARY)
+    receiver = ProspectiveSourceReceiver(
+        journal, clock_health_provider=lambda: clock
+    )
+    ingest_times = (
+        BOUNDARY - timedelta(seconds=2),
+        BOUNDARY - timedelta(seconds=1),
+        BOUNDARY + timedelta(seconds=1),
+    )
+    raw_frames = (
+        _wire_frame(1, ingest_times[0], snapshot=True),
+        _wire_frame(2, ingest_times[1], heartbeat=True),
+        _wire_frame(3, ingest_times[2]),
+    )
+    _replay, final_health = _canonical_boundary_health(raw_frames, ingest_times)
+    publisher = NonBlockingSourcePublisher(
+        tmp_path / "unused.sock",
+        session_id="session-1",
+        session_started_at_utc=START,
+        transport=JournalTransport(),
+    )
+    for index, (raw, received) in enumerate(zip(raw_frames, ingest_times)):
+        assert publisher.publish_frame(
+            connection_id="connection-0",
+            reconnect_epoch=0,
+            frame_index=index,
+            raw_bytes=raw,
+            received_at_utc=received,
+            producer_health=(
+                final_health if index == len(raw_frames) - 1 else _producer_health()
+            ),
+        )
+    publisher._queue.join()
+    assert publisher.valid, publisher.failure_reason
+    publisher.close()
+    for header, raw_bytes in publisher.transport.events:
+        receiver.process(header, raw_bytes)
+
     snapshot = journal.snapshot("session-1")
-    assert snapshot.frames[0].raw_bytes == b"socket-frame"
+    assert snapshot.source_certified is True
     assert snapshot.watermark_utc == BOUNDARY
+    assert [frame.raw_bytes for frame in snapshot.frames] == list(raw_frames)
+    assert snapshot.producer_health["canonical_boundary"]["boundary_utc"] == (
+        BOUNDARY.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    )
+    assert journal._connection.execute(
+        "SELECT COUNT(*) FROM source_fences WHERE session_id = 'session-1'"
+    ).fetchone()[0] == 1
+    journal.close()
+
+    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+    restarted = ProspectiveSourceReceiver(
+        journal, clock_health_provider=lambda: clock
+    )
+    after_fence = _wire_frame(
+        4, BOUNDARY + timedelta(seconds=2)
+    )
+    restarted.process(
+        _frame_header(
+            after_fence,
+            index=3,
+            received=BOUNDARY + timedelta(seconds=2),
+            health=_producer_health(),
+        ),
+        after_fence,
+    )
+    checkpoint = journal._connection.execute(
+        "SELECT frame_index FROM source_canonical_checkpoints "
+        "WHERE session_id = 'session-1'"
+    ).fetchone()
+    assert checkpoint["frame_index"] == 3
+    assert journal._connection.execute(
+        "SELECT COUNT(*) FROM source_fences WHERE session_id = 'session-1'"
+    ).fetchone()[0] == 1
+    assert journal.snapshot("session-1").source_certified
+    journal._connection.execute(
+        "UPDATE source_canonical_checkpoints SET checkpoint_json = '{}' "
+        "WHERE session_id = 'session-1'"
+    )
+    with pytest.raises(ValueError, match="checkpoint"):
+        journal.snapshot("session-1")
     journal.close()
 
 
@@ -669,6 +854,12 @@ def test_receiver_restart_and_reconnect_preserve_global_frame_order_without_fenc
     ]
     assert journal._connection.execute("SELECT COUNT(*) FROM source_fences").fetchone()[0] == 0
     assert journal.session_mode("session-1") == "bridge"
+    checkpoint = journal._connection.execute(
+        "SELECT frame_index, prefix_commitment_sha256 FROM source_canonical_checkpoints "
+        "WHERE session_id = 'session-1'"
+    ).fetchone()
+    assert checkpoint["frame_index"] == 2
+    assert checkpoint["prefix_commitment_sha256"]
     journal.close()
 
 
@@ -754,6 +945,63 @@ def test_later_healthy_reconnection_does_not_rewrite_unhealthy_frame_evidence(tm
         "canonical_target_eligible"
     ] is True
     assert journal._connection.execute("SELECT COUNT(*) FROM source_fences").fetchone()[0] == 0
+    journal.close()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "altered", "discontinuous"])
+def test_receiver_fails_closed_on_invalid_canonical_recovery_checkpoint(
+    tmp_path, corruption
+):
+    path = tmp_path / "source.sqlite"
+    journal = ProspectiveRawFrameJournal(path)
+    receiver = ProspectiveSourceReceiver(journal, clock_health_provider=_clock)
+    receiver.process(
+        _header(timestamp=BOUNDARY - timedelta(seconds=1)), b"fixture-frame"
+    )
+    checkpoint = journal._connection.execute(
+        "SELECT frame_index, prefix_commitment_sha256, checkpoint_json, "
+        "checkpoint_sha256 FROM source_canonical_checkpoints "
+        "WHERE session_id = 'session-1'"
+    ).fetchone()
+    assert checkpoint["frame_index"] == 0
+    if corruption == "missing":
+        journal._connection.execute(
+            "DROP TRIGGER source_canonical_checkpoints_no_delete"
+        )
+        journal._connection.execute(
+            "DELETE FROM source_canonical_checkpoints WHERE session_id = 'session-1'"
+        )
+    elif corruption == "altered":
+        journal._connection.execute(
+            "UPDATE source_canonical_checkpoints SET checkpoint_json = '{}' "
+            "WHERE session_id = 'session-1'"
+        )
+    else:
+        payload = json.loads(checkpoint["checkpoint_json"])
+        payload["state"]["frame_count"] += 1
+        checkpoint_json, checkpoint_sha256 = (
+            journal._canonical_checkpoint_payload(
+                session_id="session-1",
+                frame_index=checkpoint["frame_index"],
+                prefix_commitment_sha256=checkpoint["prefix_commitment_sha256"],
+                state=payload["state"],
+            )
+        )
+        journal._connection.execute(
+            "UPDATE source_canonical_checkpoints SET checkpoint_json = ?, "
+            "checkpoint_sha256 = ? WHERE session_id = 'session-1'",
+            (checkpoint_json, checkpoint_sha256),
+        )
+    journal.close()
+
+    journal = ProspectiveRawFrameJournal(path)
+    restarted = ProspectiveSourceReceiver(journal, clock_health_provider=_clock)
+    second = _header(index=1, timestamp=BOUNDARY, connection="connection-0")
+    with pytest.raises(ValueError, match="(?i)checkpoint"):
+        restarted.process(second, b"fixture-frame")
+    assert journal._connection.execute(
+        "SELECT COUNT(*) FROM source_frames WHERE session_id = 'session-1'"
+    ).fetchone()[0] == 1
     journal.close()
 
 
