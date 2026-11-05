@@ -409,6 +409,31 @@ class CausalInputError(ValueError):
 class ProspectiveRawFrameJournal:
     """Isolated durable append-only feed adapter; not connected to the collector."""
 
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> "ProspectiveRawFrameJournal":
+        """Open an existing source journal without running schema or migration writes.
+
+        This consumer handle exposes the same snapshot APIs as a receiver-owned
+        journal instance while SQLite itself enforces read-only access.  It is
+        deliberately unsuitable for creating a journal or performing legacy
+        prefix migrations.
+        """
+        journal = cls.__new__(cls)
+        journal.path = Path(path)
+        if not journal.path.is_file():
+            raise FileNotFoundError(journal.path)
+        uri = journal.path.resolve().as_uri() + "?mode=ro"
+        journal._connection = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        journal._connection.row_factory = sqlite3.Row
+        journal._connection.execute("PRAGMA query_only = ON")
+        journal._connection.execute("PRAGMA busy_timeout = 1000")
+        return journal
+
     def __init__(self, path: str | Path, *, migrate_legacy_prefixes: bool = False) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -724,6 +749,17 @@ class ProspectiveRawFrameJournal:
             (session_id,),
         ).fetchone()
         return "offline" if row is None else row["source_mode"]
+
+    def has_fence_record(self, session_id: str, boundary_utc: datetime) -> bool:
+        """Return whether the exact bridge-fence row exists; callers must still validate it."""
+        boundary = _utc(boundary_utc, field="fence boundary")
+        if not _is_boundary(boundary):
+            raise ValueError("Fence lookup requires an exact UTC quarter-hour")
+        with self._read_transaction():
+            return self._connection.execute(
+                "SELECT 1 FROM source_fences WHERE session_id = ? AND watermark_utc = ?",
+                (session_id, _iso(boundary)),
+            ).fetchone() is not None
 
     def register_connection_epoch(
         self,

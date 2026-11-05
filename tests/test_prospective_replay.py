@@ -1161,7 +1161,7 @@ def test_offline_benchmark_reports_stage_percentiles_work_memory_and_failures(pu
         "ledger_commit_attestation_ms",
         "checkpoint_advance_and_write_ms",
     ):
-        assert set(result["stage_ms"][stage]) == {"median", "p95", "max"}
+        assert set(result["stage_ms"][stage]) == {"median", "p95", "p99", "max"}
 
 
 class _DeterministicPipeline:
