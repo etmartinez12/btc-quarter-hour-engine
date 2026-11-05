@@ -167,6 +167,27 @@ overflow, consumer failure, stale connection epoch, malformed message,
 journal error, or missing fence therefore cannot advance completeness. The
 watermark is a durable contiguous-prefix claim, not a wall-clock timer.
 
+Bridge-backed sessions persist an explicit source mode. Their read APIs require
+the exact committed producer fence for each requested quarter-hour; the legacy
+`advance_watermark()` API remains available only to offline sessions. Fence
+reads recheck the session mode, reconnect epoch and connection, committed
+prefix commitment, witness frame identity and timestamp, immutable frame-health
+record, and clock-evidence digest and flags. A fence is considered only when
+its witness arrives within 60 seconds of the boundary. An unhealthy fence for
+one boundary remains unhealthy even if a later boundary or reconnect is
+healthy; later evidence cannot replace the earlier boundary's certificate.
+
+Completeness and market-data eligibility are separate. The receiver persists
+connection-scoped heartbeat, sequence, and synchronized-book diagnostics, plus
+the canonical boundary observation produced while processing the witness.
+Prediction eligibility uses that exact observation's canonical rules, including
+heartbeat freshness, book synchronization, boundary connection identity, and
+sequence evidence; a complete source prefix alone never makes a prediction
+eligible. Reconnects begin a new diagnostics epoch, so a legitimately recovered
+book is not disqualified by an earlier connection's counters, and later
+recovery cannot make an earlier unhealthy boundary appear healthy. Missing or
+internally inconsistent producer evidence fails closed.
+
 Clock synchronization is a separate receiver-side check using read-only
 `chronyc tracking` evidence. By default it requires a `Normal` leap status,
 absolute system offset no greater than 50 ms, and a reference observation no
@@ -177,6 +198,15 @@ alone. Completeness, clock status, heartbeat health, sequence integrity, and
 order-book synchronization remain separate signals. The bounded replay still
 enforces its own sequence, timestamp, snapshot, and synchronized-book
 requirements before feature readiness.
+
+Unix receiver startup is serialized by an owner-only advisory lock. If the
+socket pathname exists, startup refuses non-socket paths, sockets owned by a
+different user, active receivers, and probes whose result is ambiguous. It
+removes a stale same-owner socket only after an `ECONNREFUSED` probe and a
+second inode/owner/type check. Lock contention prevents competing receiver
+starts from unlinking one another's socket. The recovery path fails closed on
+platforms without the required POSIX primitives; Linux process-kill and restart
+tests are required in addition to the portable collector/replay tests.
 
 The bridge exposes enqueue, queue high-water, delivery, durable-ack,
 receiver-write, rejection, gap, and fence-latency counters. These are local
@@ -233,12 +263,17 @@ validation must not activate the collector hook:
 Offline checks:
 
 ```powershell
+python -m pytest tests/test_prospective_source_bridge.py tests/test_websocket_collector.py tests/test_prospective_replay.py
 python -m pytest tests/test_prospective_replay.py tests/test_prospective_inference.py
 python -m pytest
 python benchmarks/benchmark_prospective_replay.py --frame-counts 256,1024,4096 --boundaries 12
 python benchmarks/benchmark_prospective_replay.py --frame-counts 100001,200001 --history-hours 24 --warmup-chunk-frames 10000 --boundaries 3 --verify-full-replay
 git diff --check
 ```
+
+Run the source bridge test module on Linux to execute its process-level
+active-receiver and forced-termination/restart cases; they are skipped on
+Windows and other unsupported platforms.
 
 On Windows, the benchmark requires the explicit
 `--simulate-checkpoint-publication` option. Its output labels publication as

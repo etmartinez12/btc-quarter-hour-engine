@@ -110,6 +110,9 @@ class RawFrameSnapshot:
     watermark_utc: datetime
     clock_health_verified: bool
     frames: tuple[RawFrameRecord, ...]
+    source_mode: str = "offline"
+    source_certified: bool = False
+    producer_health: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +134,244 @@ class CausalFeatureVector:
     data_ready: bool
     feature_ready: bool
     clock_health_verified: bool
+    source_mode: str = "offline"
+    source_certified: bool = False
+    producer_health: dict[str, Any] | None = None
+
+
+SOURCE_CERTIFICATION_WINDOW = timedelta(seconds=60)
+
+
+def _validate_bridge_health(
+    health: Any,
+    *,
+    boundary: datetime,
+    connection_id: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(health, dict):
+        raise ValueError("Bridge source producer-health evidence is missing")
+    expected = {
+        "publisher_valid",
+        "heartbeat_seen",
+        "heartbeat_last_at_utc",
+        "heartbeat_healthy",
+        "order_book_synchronized",
+        "connection_id",
+        "connection_last_sequence_num",
+        "last_l2_sequence_num",
+        "sequence_gap_count",
+        "stale_sequence_count",
+        "heartbeat_timeout_count",
+        "heartbeat_discontinuity_count",
+        "malformed_frame_count",
+        "malformed_level2_count",
+        "crossed_book_count",
+        "canonical_boundary",
+    }
+    if not expected.issubset(health):
+        raise ValueError("Bridge source producer-health evidence is incomplete")
+    if health["publisher_valid"] is not True:
+        raise ValueError("Bridge source publisher-health evidence is invalid")
+    if not isinstance(health["connection_id"], str) or not health["connection_id"]:
+        raise ValueError("Bridge source connection-health identity is invalid")
+    if connection_id is not None and health["connection_id"] != connection_id:
+        raise ValueError("Bridge source connection-health identity does not match")
+    if type(health["heartbeat_seen"]) is not bool:
+        raise ValueError("Bridge heartbeat-health evidence is invalid")
+    heartbeat = health["heartbeat_last_at_utc"]
+    if health["heartbeat_seen"] != isinstance(heartbeat, str):
+        raise ValueError("Bridge heartbeat-health timestamp is inconsistent")
+    if heartbeat is not None:
+        try:
+            _parse_utc(heartbeat)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bridge heartbeat-health timestamp is malformed") from exc
+    if type(health["order_book_synchronized"]) is not bool:
+        raise ValueError("Bridge order-book health evidence is invalid")
+    if type(health["heartbeat_healthy"]) is not bool:
+        raise ValueError("Bridge heartbeat-health status is invalid")
+    for field in (
+        "sequence_gap_count",
+        "stale_sequence_count",
+        "heartbeat_timeout_count",
+        "heartbeat_discontinuity_count",
+        "malformed_frame_count",
+        "malformed_level2_count",
+        "crossed_book_count",
+    ):
+        if type(health[field]) is not int or health[field] < 0:
+            raise ValueError(f"Bridge producer-health counter {field} is invalid")
+    for field in ("connection_last_sequence_num", "last_l2_sequence_num"):
+        sequence = health[field]
+        if sequence is not None and (type(sequence) is not int or sequence < 0):
+            raise ValueError("Bridge connection sequence-health evidence is invalid")
+
+    canonical = health["canonical_boundary"]
+    if canonical is None:
+        return health
+    if not isinstance(canonical, dict):
+        raise ValueError("Bridge canonical boundary-health evidence is missing")
+    if set(canonical) != {
+        "boundary_utc",
+        "canonical_target_eligible",
+        "eligibility_reason",
+        "book_synced",
+        "last_heartbeat_at_utc",
+        "heartbeat_timeout_seconds",
+        "connection_id",
+        "source_sequence_num",
+    }:
+        raise ValueError("Bridge canonical boundary-health evidence has invalid fields")
+    if canonical["boundary_utc"] != _iso(boundary):
+        raise ValueError("Bridge canonical health evidence is for a different boundary")
+    eligible = canonical["canonical_target_eligible"]
+    reason = canonical["eligibility_reason"]
+    synced = canonical["book_synced"]
+    if type(eligible) is not bool or type(synced) is not bool or not isinstance(reason, str):
+        raise ValueError("Bridge canonical boundary-health values are invalid")
+    if eligible != (reason == "eligible"):
+        raise ValueError("Bridge canonical boundary-health decision is inconsistent")
+    if type(canonical["heartbeat_timeout_seconds"]) not in (int, float):
+        raise ValueError("Bridge canonical heartbeat tolerance is invalid")
+    timeout = float(canonical["heartbeat_timeout_seconds"])
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("Bridge canonical heartbeat tolerance is invalid")
+    canonical_connection = canonical["connection_id"]
+    if canonical_connection is not None and (
+        not isinstance(canonical_connection, str) or not canonical_connection
+    ):
+        raise ValueError("Bridge canonical connection-health identity is invalid")
+    if canonical_connection is not None and canonical_connection != health["connection_id"]:
+        raise ValueError("Bridge canonical and producer connection identities disagree")
+    canonical_heartbeat = canonical["last_heartbeat_at_utc"]
+    if canonical_heartbeat is not None:
+        if not isinstance(canonical_heartbeat, str):
+            raise ValueError("Bridge canonical heartbeat timestamp is invalid")
+        try:
+            _parse_utc(canonical_heartbeat)
+        except ValueError as exc:
+            raise ValueError("Bridge canonical heartbeat timestamp is malformed") from exc
+    canonical_sequence = canonical["source_sequence_num"]
+    if canonical_sequence is not None and (
+        type(canonical_sequence) is not int or canonical_sequence < 0
+    ):
+        raise ValueError("Bridge canonical source sequence is invalid")
+    if eligible:
+        last_heartbeat = canonical_heartbeat
+        if not isinstance(last_heartbeat, str):
+            raise ValueError("Eligible bridge boundary lacks heartbeat evidence")
+        try:
+            heartbeat_at = _parse_utc(last_heartbeat)
+        except ValueError as exc:
+            raise ValueError("Eligible bridge heartbeat evidence is malformed") from exc
+        if not synced or heartbeat_at > boundary or (
+            boundary - heartbeat_at
+        ).total_seconds() > timeout:
+            raise ValueError("Bridge canonical health decision contradicts its evidence")
+        if canonical_connection is None:
+            raise ValueError("Eligible bridge boundary lacks connection identity")
+        if connection_id is not None and canonical_connection != connection_id:
+            raise ValueError("Eligible bridge boundary connection does not match")
+        if (
+            health["heartbeat_healthy"] is not True
+            or health["order_book_synchronized"] is not True
+            or synced is not True
+            or health["heartbeat_last_at_utc"] != last_heartbeat
+            or canonical["source_sequence_num"] is None
+            or canonical["source_sequence_num"] != health["last_l2_sequence_num"]
+        ):
+            raise ValueError("Bridge canonical eligibility contradicts producer health")
+    elif synced != health["order_book_synchronized"]:
+        raise ValueError("Bridge boundary book-health evidence is inconsistent")
+    return health
+
+
+def _validate_bridge_clock_evidence(
+    evidence: Any,
+    *,
+    watermark: datetime,
+    witness_time: datetime,
+) -> bool:
+    if not isinstance(evidence, dict):
+        raise ValueError("Bridge clock evidence is missing")
+    required = {
+        "observed_at_utc",
+        "synchronized",
+        "verified",
+        "offset_seconds",
+        "reference_time_utc",
+        "leap_status",
+        "source",
+        "reason",
+    }
+    if not required.issubset(evidence):
+        raise ValueError("Bridge clock evidence is incomplete")
+    observed_value = evidence["observed_at_utc"]
+    if not isinstance(observed_value, str):
+        raise ValueError("Bridge clock observation time is missing")
+    observed = _parse_utc(observed_value)
+    if observed < witness_time or observed > watermark + SOURCE_CERTIFICATION_WINDOW:
+        raise ValueError("Bridge clock evidence falls outside the prospective window")
+    reference_value = evidence["reference_time_utc"]
+    reference = _parse_utc(reference_value) if isinstance(reference_value, str) else None
+    age = (observed - reference).total_seconds() if reference is not None else None
+    offset = evidence["offset_seconds"]
+    finite_offset = (
+        isinstance(offset, (int, float))
+        and not isinstance(offset, bool)
+        and math.isfinite(offset)
+    )
+    expected = bool(
+        evidence["leap_status"] == "Normal"
+        and finite_offset
+        and abs(float(offset)) <= 0.050
+        and age is not None
+        and 0 <= age <= 120.0
+    )
+    if type(evidence["verified"]) is not bool or evidence["verified"] != expected:
+        raise ValueError("Bridge clock verification flag contradicts its evidence")
+    if (
+        type(evidence["synchronized"]) is not bool
+        or evidence["synchronized"] != expected
+    ):
+        raise ValueError("Bridge clock synchronization flag contradicts its evidence")
+    return expected
+
+
+def _require_bridge_prediction_health(
+    *,
+    source_mode: str,
+    source_certified: bool,
+    producer_health: Any,
+    boundary: datetime,
+    session_id: str,
+) -> None:
+    if source_mode != "bridge":
+        return
+    if source_certified is not True:
+        raise CausalInputError(
+            "bridge_source_fence_not_certified",
+            source_session_id=session_id,
+        )
+    try:
+        health = _validate_bridge_health(producer_health, boundary=boundary)
+    except ValueError as exc:
+        raise CausalInputError(
+            "bridge_source_health_evidence_invalid",
+            source_session_id=session_id,
+        ) from exc
+    canonical = health["canonical_boundary"]
+    if canonical is None:
+        raise CausalInputError(
+            "bridge_boundary_health_missing",
+            source_session_id=session_id,
+        )
+    if canonical["canonical_target_eligible"] is not True:
+        raise CausalInputError(
+            "canonical_target_ineligible_at_boundary:"
+            + canonical["eligibility_reason"],
+            source_session_id=session_id,
+        )
 
 
 class CausalInputError(ValueError):
@@ -167,6 +408,10 @@ class ProspectiveRawFrameJournal:
             CREATE TABLE IF NOT EXISTS source_sessions (
                 session_id TEXT PRIMARY KEY,
                 session_started_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS source_session_modes (
+                session_id TEXT PRIMARY KEY REFERENCES source_sessions(session_id),
+                source_mode TEXT NOT NULL CHECK (source_mode IN ('offline', 'bridge'))
             );
             CREATE TABLE IF NOT EXISTS source_frames (
                 session_id TEXT NOT NULL REFERENCES source_sessions(session_id),
@@ -214,6 +459,7 @@ class ProspectiveRawFrameJournal:
                 clock_evidence_sha256 TEXT NOT NULL,
                 producer_health_json TEXT NOT NULL,
                 producer_health_sha256 TEXT NOT NULL,
+                prefix_commitment_sha256 TEXT,
                 PRIMARY KEY (session_id, watermark_utc)
             );
             CREATE TABLE IF NOT EXISTS source_frame_health (
@@ -231,6 +477,7 @@ class ProspectiveRawFrameJournal:
         )
         for table in (
             "source_sessions",
+            "source_session_modes",
             "source_frames",
             "source_watermarks",
             "source_prefix_commitments",
@@ -249,6 +496,14 @@ class ProspectiveRawFrameJournal:
                     END
                     """
                 )
+        fence_columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(source_fences)")
+        }
+        if "prefix_commitment_sha256" not in fence_columns:
+            self._connection.execute(
+                "ALTER TABLE source_fences ADD COLUMN prefix_commitment_sha256 TEXT"
+            )
         try:
             self._backfill_prefix_commitments(migrate_legacy=migrate_legacy_prefixes)
         except BaseException:
@@ -376,9 +631,17 @@ class ProspectiveRawFrameJournal:
         ).fetchone()
         return _parse_utc(row["session_started_at_utc"]) if row is not None else None
 
-    def start_session(self, session_id: str, started_at_utc: datetime) -> None:
+    def start_session(
+        self,
+        session_id: str,
+        started_at_utc: datetime,
+        *,
+        source_mode: str = "offline",
+    ) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("Source session ID must be nonempty")
+        if source_mode not in {"offline", "bridge"}:
+            raise ValueError("Source mode must be 'offline' or 'bridge'")
         started = _utc(started_at_utc, field="source session start")
         with self._transaction():
             self._connection.execute(
@@ -386,6 +649,17 @@ class ProspectiveRawFrameJournal:
                 "VALUES (?, ?)",
                 (session_id, _iso(started)),
             )
+            self._connection.execute(
+                "INSERT INTO source_session_modes(session_id, source_mode) VALUES (?, ?)",
+                (session_id, source_mode),
+            )
+
+    def session_mode(self, session_id: str) -> str:
+        row = self._connection.execute(
+            "SELECT source_mode FROM source_session_modes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return "offline" if row is None else row["source_mode"]
 
     def register_connection_epoch(
         self,
@@ -586,6 +860,10 @@ class ProspectiveRawFrameJournal:
             ).fetchone()
             if session is None:
                 raise ValueError("Source session has not been registered")
+            if self.session_mode(session_id) == "bridge":
+                raise ValueError(
+                    "Bridge-backed sessions require a committed producer fence"
+                )
             if watermark < _parse_utc(session["session_started_at_utc"]):
                 raise ValueError("Source watermark precedes the session start")
             latest_frame = self._connection.execute(
@@ -672,6 +950,13 @@ class ProspectiveRawFrameJournal:
             producer_health_json.encode("utf-8")
         ).hexdigest()
         watermark = _utc(watermark_utc, field="source watermark")
+        if not _is_boundary(watermark):
+            raise ValueError("Producer fence timestamp must be an exact UTC quarter-hour")
+        _validate_bridge_health(
+            producer_health,
+            boundary=watermark,
+            connection_id=connection_id,
+        )
         with self._transaction():
             session = self._connection.execute(
                 "SELECT session_started_at_utc FROM source_sessions WHERE session_id = ?",
@@ -679,6 +964,8 @@ class ProspectiveRawFrameJournal:
             ).fetchone()
             if session is None:
                 raise ValueError("Source session has not been registered")
+            if self.session_mode(session_id) != "bridge":
+                raise ValueError("Producer fences require an explicitly bridge-backed session")
             if watermark < _parse_utc(session["session_started_at_utc"]):
                 raise ValueError("Source watermark precedes the session start")
             frame = self._connection.execute(
@@ -691,8 +978,19 @@ class ProspectiveRawFrameJournal:
                 or frame["frame_index"] != through_frame_index
                 or frame["connection_id"] != connection_id
                 or _parse_utc(frame["ingest_time_utc"]) <= watermark
+                or _parse_utc(frame["ingest_time_utc"])
+                > watermark + SOURCE_CERTIFICATION_WINDOW
             ):
-                raise ValueError("Fence lacks a committed post-cutoff witness frame")
+                raise ValueError(
+                    "Fence lacks a timely committed post-cutoff witness frame"
+                )
+            clock_verified = _validate_bridge_clock_evidence(
+                clock_evidence,
+                watermark=watermark,
+                witness_time=_parse_utc(frame["ingest_time_utc"]),
+            )
+            if clock_verified is not clock_health_verified:
+                raise ValueError("Clock-health flag contradicts independent evidence")
             epoch = self._connection.execute(
                 "SELECT first_frame_index FROM source_connections "
                 "WHERE session_id = ? AND reconnect_epoch = ? AND connection_id = ?",
@@ -718,8 +1016,16 @@ class ProspectiveRawFrameJournal:
                     "publisher_valid"
                 )
                 is not True
+                or frame_health["producer_health_json"] != producer_health_json
             ):
                 raise ValueError("Fence producer diagnostics are missing or inconsistent")
+            prefix = self._connection.execute(
+                "SELECT commitment_sha256 FROM source_prefix_commitments "
+                "WHERE session_id = ? AND frame_index = ?",
+                (session_id, through_frame_index),
+            ).fetchone()
+            if prefix is None:
+                raise ValueError("Fence source prefix commitment is missing")
             latest_watermark = self._connection.execute(
                 "SELECT MAX(watermark_utc) AS latest FROM source_watermarks WHERE session_id = ?",
                 (session_id,),
@@ -735,8 +1041,9 @@ class ProspectiveRawFrameJournal:
                 "INSERT INTO source_fences "
                 "(session_id, watermark_utc, through_frame_index, connection_id, "
                 "reconnect_epoch, clock_health_verified, clock_evidence_json, "
-                "clock_evidence_sha256, producer_health_json, producer_health_sha256) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "clock_evidence_sha256, producer_health_json, producer_health_sha256, "
+                "prefix_commitment_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     _iso(watermark),
@@ -748,8 +1055,93 @@ class ProspectiveRawFrameJournal:
                     evidence_digest,
                     producer_health_json,
                     producer_health_digest,
+                    prefix["commitment_sha256"],
                 ),
             )
+
+    def _certified_bridge_fence(
+        self,
+        session_id: str,
+        boundary: datetime,
+    ) -> tuple[sqlite3.Row, dict[str, Any]]:
+        boundary = _utc(boundary, field="certified source boundary")
+        if not _is_boundary(boundary):
+            raise ValueError("Bridge certification requires an exact UTC quarter-hour")
+        fence = self._connection.execute(
+            "SELECT f.*, w.clock_health_verified AS watermark_clock_verified, "
+            "r.connection_id AS frame_connection_id, r.ingest_time_utc, "
+            "r.raw_frame_sha256, r.raw_bytes, c.commitment_sha256 AS stored_prefix, "
+            "e.first_frame_index AS connection_first_frame_index, "
+            "h.connection_id AS frame_health_connection_id, "
+            "h.reconnect_epoch AS frame_health_reconnect_epoch, "
+            "h.producer_health_json AS frame_health_json, "
+            "h.producer_health_sha256 AS frame_health_sha256 "
+            "FROM source_fences f "
+            "JOIN source_watermarks w ON w.session_id = f.session_id "
+            "AND w.watermark_utc = f.watermark_utc "
+            "JOIN source_connections e ON e.session_id = f.session_id "
+            "AND e.reconnect_epoch = f.reconnect_epoch "
+            "AND e.connection_id = f.connection_id "
+            "JOIN source_frames r ON r.session_id = f.session_id "
+            "AND r.frame_index = f.through_frame_index "
+            "LEFT JOIN source_prefix_commitments c ON c.session_id = f.session_id "
+            "AND c.frame_index = f.through_frame_index "
+            "LEFT JOIN source_frame_health h ON h.session_id = f.session_id "
+            "AND h.frame_index = f.through_frame_index "
+            "WHERE f.session_id = ? AND f.watermark_utc = ?",
+            (session_id, _iso(boundary)),
+        ).fetchone()
+        if fence is None:
+            raise ValueError("Bridge source boundary lacks its exact producer fence")
+        if self.session_mode(session_id) != "bridge":
+            raise ValueError("Producer fence is not attached to a bridge-backed session")
+        if (
+            fence["clock_health_verified"] != fence["watermark_clock_verified"]
+            or fence["prefix_commitment_sha256"] is None
+            or fence["prefix_commitment_sha256"] != fence["stored_prefix"]
+            or fence["through_frame_index"] < 0
+            or fence["connection_id"] != fence["frame_connection_id"]
+            or fence["frame_health_connection_id"] != fence["connection_id"]
+            or fence["frame_health_reconnect_epoch"] != fence["reconnect_epoch"]
+            or fence["connection_first_frame_index"] > fence["through_frame_index"]
+            or _parse_utc(fence["ingest_time_utc"]) <= boundary
+            or _parse_utc(fence["ingest_time_utc"])
+            > boundary + SOURCE_CERTIFICATION_WINDOW
+            or hashlib.sha256(bytes(fence["raw_bytes"])).hexdigest()
+            != fence["raw_frame_sha256"]
+        ):
+            raise ValueError("Bridge producer fence identity or committed prefix is inconsistent")
+        try:
+            clock_evidence = json.loads(fence["clock_evidence_json"])
+            health = json.loads(fence["producer_health_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Bridge producer fence evidence is malformed") from exc
+        if (
+            hashlib.sha256(fence["clock_evidence_json"].encode("utf-8")).hexdigest()
+            != fence["clock_evidence_sha256"]
+            or hashlib.sha256(fence["producer_health_json"].encode("utf-8")).hexdigest()
+            != fence["producer_health_sha256"]
+            or fence["frame_health_json"] != fence["producer_health_json"]
+            or fence["frame_health_sha256"] is None
+            or hashlib.sha256(fence["frame_health_json"].encode("utf-8")).hexdigest()
+            != fence["frame_health_sha256"]
+        ):
+            raise ValueError("Bridge producer fence evidence digest is inconsistent")
+        if not _validate_bridge_clock_evidence(
+            clock_evidence,
+            watermark=boundary,
+            witness_time=_parse_utc(fence["ingest_time_utc"]),
+        ):
+            if fence["clock_health_verified"] != 0:
+                raise ValueError("Bridge fence forges its clock verification flag")
+        elif fence["clock_health_verified"] != 1:
+            raise ValueError("Bridge fence discards verified clock evidence")
+        _validate_bridge_health(
+            health,
+            boundary=boundary,
+            connection_id=fence["connection_id"],
+        )
+        return fence, health
 
     def snapshot(self, session_id: str) -> RawFrameSnapshot:
         with self._read_transaction():
@@ -759,13 +1151,49 @@ class ProspectiveRawFrameJournal:
             ).fetchone()
             if session is None:
                 raise ValueError("Source session has not been registered")
-            watermark = self._connection.execute(
-                "SELECT watermark_utc, clock_health_verified FROM source_watermarks "
-                "WHERE session_id = ? ORDER BY watermark_id DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-            if watermark is None:
-                raise ValueError("Source session has no completeness watermark")
+            source_mode = self.session_mode(session_id)
+            if source_mode == "bridge":
+                row = self._connection.execute(
+                    "SELECT watermark_utc FROM source_fences WHERE session_id = ? "
+                    "ORDER BY watermark_utc DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("Bridge source session has no committed producer fence")
+                fence, producer_health = self._certified_bridge_fence(
+                    session_id, _parse_utc(row["watermark_utc"])
+                )
+                watermark = {
+                    "watermark_utc": fence["watermark_utc"],
+                    "clock_health_verified": fence["clock_health_verified"],
+                }
+                through_frame_index = fence["through_frame_index"]
+                source_certified = True
+            else:
+                watermark = self._connection.execute(
+                    "SELECT watermark_utc, clock_health_verified FROM source_watermarks "
+                    "WHERE session_id = ? ORDER BY watermark_id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if watermark is None:
+                    raise ValueError("Source session has no completeness watermark")
+                producer_health = None
+                through_frame_index = None
+                source_certified = False
+            frame_query = (
+                "SELECT * FROM source_frames WHERE session_id = ? "
+                + (
+                    "AND frame_index <= ? "
+                    if through_frame_index is not None
+                    else ""
+                )
+                + "ORDER BY frame_index"
+            )
+            frame_params = (
+                (session_id, through_frame_index)
+                if through_frame_index is not None
+                else (session_id,)
+            )
             frames = tuple(
                 RawFrameRecord(
                     raw_bytes=bytes(row["raw_bytes"]),
@@ -775,10 +1203,7 @@ class ProspectiveRawFrameJournal:
                     ingest_time_utc=_parse_utc(row["ingest_time_utc"]),
                     raw_frame_sha256=row["raw_frame_sha256"],
                 )
-                for row in self._connection.execute(
-                    "SELECT * FROM source_frames WHERE session_id = ? ORDER BY frame_index",
-                    (session_id,),
-                ).fetchall()
+                for row in self._connection.execute(frame_query, frame_params).fetchall()
             )
             return RawFrameSnapshot(
                 session_id=session_id,
@@ -786,6 +1211,9 @@ class ProspectiveRawFrameJournal:
                 watermark_utc=_parse_utc(watermark["watermark_utc"]),
                 clock_health_verified=bool(watermark["clock_health_verified"]),
                 frames=frames,
+                source_mode=source_mode,
+                source_certified=source_certified,
+                producer_health=producer_health,
             )
 
     def snapshot_through(
@@ -824,6 +1252,9 @@ class ProspectiveRawFrameJournal:
             watermark_utc=tail.watermark_utc,
             clock_health_verified=tail.clock_health_verified,
             frames=tail.frames,
+            source_mode=tail.source_mode,
+            source_certified=tail.source_certified,
+            producer_health=tail.producer_health,
         )
 
     def tail_snapshot(
@@ -901,20 +1332,33 @@ class ProspectiveRawFrameJournal:
             ).fetchone()
             if session is None:
                 raise ValueError("Source session has not been registered")
-            watermark = self._connection.execute(
-                "SELECT watermark_utc, clock_health_verified FROM source_watermarks "
-                "WHERE session_id = ? AND watermark_utc >= ? "
-                "AND clock_health_verified = 1 ORDER BY watermark_utc LIMIT 1",
-                (session_id, _iso(boundary)),
-            ).fetchone()
-            if watermark is None:
+            source_mode = self.session_mode(session_id)
+            if source_mode == "bridge":
+                fence, producer_health = self._certified_bridge_fence(
+                    session_id, boundary
+                )
+                watermark = {
+                    "watermark_utc": fence["watermark_utc"],
+                    "clock_health_verified": fence["clock_health_verified"],
+                }
+                source_certified = True
+            else:
                 watermark = self._connection.execute(
                     "SELECT watermark_utc, clock_health_verified FROM source_watermarks "
-                    "WHERE session_id = ? ORDER BY watermark_id DESC LIMIT 1",
-                    (session_id,),
+                    "WHERE session_id = ? AND watermark_utc >= ? "
+                    "AND clock_health_verified = 1 ORDER BY watermark_utc LIMIT 1",
+                    (session_id, _iso(boundary)),
                 ).fetchone()
-            if watermark is None:
-                raise ValueError("Source session has no completeness watermark")
+                if watermark is None:
+                    watermark = self._connection.execute(
+                        "SELECT watermark_utc, clock_health_verified FROM source_watermarks "
+                        "WHERE session_id = ? ORDER BY watermark_id DESC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                if watermark is None:
+                    raise ValueError("Source session has no completeness watermark")
+                producer_health = None
+                source_certified = False
             if _parse_utc(watermark["watermark_utc"]) < boundary:
                 raise ValueError("Source watermark does not cover requested tail boundary")
             if after_frame_index == -1:
@@ -996,6 +1440,9 @@ class ProspectiveRawFrameJournal:
                 frame_commitments=tuple(frame_commitments),
                 has_more=has_more,
                 through_boundary_utc=boundary,
+                source_mode=source_mode,
+                source_certified=source_certified,
+                producer_health=producer_health,
             )
 
 
@@ -1034,6 +1481,13 @@ def build_causal_feature_vector(
         )
     if not isinstance(snapshot.session_id, str) or not snapshot.session_id:
         raise CausalInputError("missing_source_session_id")
+    _require_bridge_prediction_health(
+        source_mode=snapshot.source_mode,
+        source_certified=snapshot.source_certified,
+        producer_health=snapshot.producer_health,
+        boundary=boundary,
+        session_id=snapshot.session_id,
+    )
     if snapshot.clock_health_verified is not True:
         raise CausalInputError(
             "source_clock_health_unverified",
@@ -1290,4 +1744,7 @@ def build_causal_feature_vector(
         data_ready=True,
         feature_ready=True,
         clock_health_verified=snapshot.clock_health_verified,
+        source_mode=snapshot.source_mode,
+        source_certified=snapshot.source_certified,
+        producer_health=snapshot.producer_health,
     )

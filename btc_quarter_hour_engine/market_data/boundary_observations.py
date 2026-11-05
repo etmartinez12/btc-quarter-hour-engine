@@ -33,6 +33,8 @@ class QuarterHourObservation:
     canonical_target_eligible: bool
     eligibility_reason: str
     boundary_schema_version: str = COINBASE_BOUNDARY_BBO_SCHEMA_VERSION
+    last_heartbeat_at_utc: datetime | None = None
+    heartbeat_timeout_seconds: float = 5.0
 
     @property
     def timestamp_utc(self) -> datetime:
@@ -119,6 +121,8 @@ def derive_quarter_hour_observation(
         book_synced=synced,
         canonical_target_eligible=reason == "eligible",
         eligibility_reason=reason,
+        last_heartbeat_at_utc=heartbeat,
+        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
     )
 
 

@@ -39,6 +39,7 @@ from btc_quarter_hour_engine.research.prospective_source import (
     _iso,
     _utc,
     _is_boundary,
+    _require_bridge_prediction_health,
     compute_feature_fingerprint,
 )
 
@@ -366,6 +367,9 @@ class IncrementalRawFrameSnapshot:
     frame_commitments: tuple[tuple[int, str], ...] = ()
     has_more: bool = False
     through_boundary_utc: datetime | None = None
+    source_mode: str = "offline"
+    source_certified: bool = False
+    producer_health: dict[str, Any] | None = None
 
 
 def _validate_checkpoint_book(replay: _IngestFeatureReplay) -> None:
@@ -465,6 +469,10 @@ def create_feature_replay_checkpoint(
     watermark = _utc(snapshot.watermark_utc, field="source watermark")
     if snapshot.clock_health_verified is not True or watermark < cutoff:
         raise CausalInputError("checkpoint_source_completeness_unverified", source_session_id=snapshot.session_id)
+    if snapshot.source_mode == "bridge" and snapshot.source_certified is not True:
+        raise CausalInputError(
+            "bridge_source_fence_not_certified", source_session_id=snapshot.session_id
+        )
     if started > cutoff - _BUCKET_HISTORY:
         raise CausalInputError("insufficient_240_minute_session_history", source_session_id=snapshot.session_id)
     if not isinstance(snapshot.frames, tuple):
@@ -542,6 +550,8 @@ def accumulate_feature_replay_warmup(
         raise ValueError("Warm-up chunk completeness cutoff mismatch")
     if chunk.clock_health_verified is not True or _utc(chunk.watermark_utc, field="watermark") < cutoff:
         raise ValueError("Warm-up source completeness unverified")
+    if chunk.source_mode == "bridge" and chunk.source_certified is not True:
+        raise ValueError("Bridge warm-up requires a producer-fenced source certificate")
     if not isinstance(chunk.frames, tuple) or not 1 <= len(chunk.frames) <= MAX_CHECKPOINT_BOOTSTRAP_FRAMES:
         raise ValueError("Warm-up requires a nonempty bounded immutable chunk")
     if warmup is None:
@@ -632,6 +642,9 @@ def _make_vector(
     source_frame_count: int,
     excluded_ingest_future_count: int,
     excluded_event_future_count: int,
+    source_mode: str = "offline",
+    source_certified: bool = False,
+    producer_health: dict[str, Any] | None = None,
 ) -> CausalFeatureVector:
     buckets = _feature_buckets_frame(replay, latest_boundary=pd.Timestamp(boundary))
     if buckets.empty or pd.Timestamp(boundary) not in buckets.index:
@@ -709,6 +722,9 @@ def _make_vector(
         data_ready=True,
         feature_ready=True,
         clock_health_verified=True,
+        source_mode=source_mode,
+        source_certified=source_certified,
+        producer_health=producer_health,
     )
 
 
@@ -736,6 +752,13 @@ def build_incremental_causal_feature_vector(
     watermark = _utc(tail.watermark_utc, field="source watermark")
     if watermark < boundary:
         raise CausalInputError("source_watermark_before_boundary", source_session_id=tail.session_id)
+    _require_bridge_prediction_health(
+        source_mode=tail.source_mode,
+        source_certified=tail.source_certified,
+        producer_health=tail.producer_health,
+        boundary=boundary,
+        session_id=tail.session_id,
+    )
     if tail.session_id != data["session_id"] or started != _utc(
         datetime.fromisoformat(data["session_started_at_utc"].replace("Z", "+00:00")),
         field="checkpoint session start",
@@ -826,6 +849,9 @@ def build_incremental_causal_feature_vector(
         source_frame_count=replay.frames_seen,
         excluded_ingest_future_count=0,
         excluded_event_future_count=0,
+        source_mode=tail.source_mode,
+        source_certified=tail.source_certified,
+        producer_health=tail.producer_health,
     )
     if timings is not None:
         timings["feature_generation_ms"] = (time.perf_counter() - feature_started) * 1000
@@ -851,6 +877,10 @@ def advance_feature_replay_checkpoint(
     watermark = _utc(tail.watermark_utc, field="source watermark")
     if watermark < cutoff or tail.clock_health_verified is not True:
         raise CausalInputError("checkpoint_source_completeness_unverified", source_session_id=tail.session_id)
+    if tail.source_mode == "bridge" and tail.source_certified is not True:
+        raise CausalInputError(
+            "bridge_source_fence_not_certified", source_session_id=tail.session_id
+        )
     if tail.session_id != data["session_id"] or started != _utc(
         datetime.fromisoformat(data["session_started_at_utc"].replace("Z", "+00:00")),
         field="checkpoint session start",
@@ -979,6 +1009,9 @@ def tail_from_snapshot(
                 data["last_frame_index"],
             )
         ),
+        source_mode=snapshot.source_mode,
+        source_certified=snapshot.source_certified,
+        producer_health=snapshot.producer_health,
     )
 
 

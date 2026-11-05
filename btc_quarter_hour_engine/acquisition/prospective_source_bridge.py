@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -7,6 +8,7 @@ import os
 import queue
 import re
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -17,8 +19,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from btc_quarter_hour_engine.research.prospective_source import (
+    SOURCE_CERTIFICATION_WINDOW,
     ProspectiveRawFrameJournal,
+    _validate_bridge_health,
 )
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - unavailable on Windows
+    fcntl = None
 
 
 PROTOCOL_VERSION = 1
@@ -423,7 +432,8 @@ class NonBlockingSourcePublisher:
             )
             if cutoff > self.session_started_at_utc and received > cutoff:
                 if self._last_fence_utc is None or cutoff > self._last_fence_utc:
-                    self.publish_fence(cutoff, producer_health=producer_health)
+                    if received <= cutoff + SOURCE_CERTIFICATION_WINDOW:
+                        self.publish_fence(cutoff, producer_health=producer_health)
         return enqueued
 
     def publish_fence(
@@ -622,6 +632,23 @@ class ProspectiveSourceReceiver:
         ):
             raise ValueError("Source frame sequence metadata is invalid")
         ingest = _parse_utc(header.get("ingest_time_utc"), field="frame receive timestamp")
+        canonical_boundary = producer_health.get("canonical_boundary")
+        health_boundary = (
+            _parse_utc(
+                canonical_boundary["boundary_utc"],
+                field="canonical producer-health boundary",
+            )
+            if isinstance(canonical_boundary, dict)
+            and isinstance(canonical_boundary.get("boundary_utc"), str)
+            else ingest.replace(
+                minute=ingest.minute - ingest.minute % 15, second=0, microsecond=0
+            )
+        )
+        _validate_bridge_health(
+            producer_health,
+            boundary=health_boundary,
+            connection_id=connection_id,
+        )
         started = _parse_utc(
             header.get("session_started_at_utc"), field="source session start"
         )
@@ -631,13 +658,20 @@ class ProspectiveSourceReceiver:
         if session_id not in self._session_started:
             persisted_start = self.journal.session_started_at(session_id)
             if persisted_start is None:
-                self.journal.start_session(session_id, started)
+                self.journal.start_session(
+                    session_id, started, source_mode="bridge"
+                )
                 persisted_start = started
             if persisted_start != started:
                 raise ValueError("Source session start identity changed")
+            if self.journal.session_mode(session_id) != "bridge":
+                raise ValueError("Source session was not registered as bridge-backed")
             self._session_started[session_id] = persisted_start
-        elif self._session_started[session_id] != started:
-            raise ValueError("Source session start identity changed")
+        elif (
+            self._session_started[session_id] != started
+            or self.journal.session_mode(session_id) != "bridge"
+        ):
+            raise ValueError("Source session identity or mode changed")
         self.journal.register_connection_epoch(
             session_id=session_id,
             reconnect_epoch=reconnect_epoch,
@@ -684,6 +718,11 @@ class ProspectiveSourceReceiver:
             or health.get("publisher_valid") is not True
         ):
             raise ValueError("Producer fence metadata is invalid or unhealthy")
+        _validate_bridge_health(
+            health,
+            boundary=watermark,
+            connection_id=connection_id,
+        )
         latest = self.journal._connection.execute(
             "SELECT frame_index FROM source_frames WHERE session_id = ? "
             "ORDER BY frame_index DESC LIMIT 1",
@@ -752,18 +791,102 @@ class ProspectiveSourceSocketServer:
         self.backlog = backlog
         self._listener: socket.socket | None = None
         self._stop = threading.Event()
+        self._lock_fd: int | None = None
+        self._bound_socket_identity: tuple[int, int] | None = None
+
+    def _acquire_startup_lock(self) -> None:
+        if os.name != "posix" or fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            raise OSError("Safe Unix socket recovery is unsupported on this platform")
+        lock_path = self.socket_path.with_name(self.socket_path.name + ".lock")
+        flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise OSError("Unable to safely open receiver startup lock") from exc
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+            ):
+                raise PermissionError("Receiver startup lock has an untrusted owner or type")
+            os.fchmod(fd, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    "Another receiver startup or active receiver owns the socket lock"
+                ) from exc
+            self._lock_fd = fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _remove_stale_socket_if_safe(self) -> None:
+        try:
+            before = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(before.st_mode):
+            raise FileExistsError(
+                f"Refusing to replace non-socket receiver path: {self.socket_path}"
+            )
+        if before.st_uid != os.geteuid():
+            raise PermissionError(
+                f"Refusing to replace socket owned by another user: {self.socket_path}"
+            )
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(1.0)
+            probe.connect(str(self.socket_path))
+        except OSError as exc:
+            if exc.errno != errno.ECONNREFUSED:
+                raise RuntimeError(
+                    "Unable to establish whether the existing receiver socket is stale"
+                ) from exc
+        else:
+            raise RuntimeError(
+                f"Refusing to replace active receiver socket: {self.socket_path}"
+            )
+        finally:
+            probe.close()
+        try:
+            after = self.socket_path.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Receiver socket changed during stale-path verification"
+            ) from exc
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or not stat.S_ISSOCK(after.st_mode)
+            or after.st_uid != os.geteuid()
+        ):
+            raise RuntimeError(
+                "Receiver socket changed during stale-path verification"
+            )
+        self.socket_path.unlink()
 
     def serve_forever(self) -> None:
         if self._listener is not None:
             raise RuntimeError("Source bridge server is already running")
-        if self.socket_path.exists():
-            raise FileExistsError(f"Refusing to replace existing socket path: {self.socket_path}")
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._listener = listener
+        self._acquire_startup_lock()
+        listener: socket.socket | None = None
         try:
+            self._remove_stale_socket_if_safe()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(str(self.socket_path))
             os.chmod(self.socket_path, 0o600)
+            metadata = self.socket_path.lstat()
+            if (
+                not stat.S_ISSOCK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise PermissionError("Bound receiver socket has unexpected owner or permissions")
+            self._bound_socket_identity = (metadata.st_dev, metadata.st_ino)
+            self._listener = listener
             listener.listen(self.backlog)
             listener.settimeout(0.5)
             while not self._stop.is_set():
@@ -786,12 +909,26 @@ class ProspectiveSourceSocketServer:
                     except (ConnectionError, OSError, ValueError, TypeError):
                         self.receiver.note_rejection()
         finally:
-            listener.close()
+            if listener is not None:
+                listener.close()
             self._listener = None
+            identity = self._bound_socket_identity
+            self._bound_socket_identity = None
             try:
-                self.socket_path.unlink()
+                metadata = self.socket_path.lstat()
             except FileNotFoundError:
-                pass
+                metadata = None
+            if (
+                identity is not None
+                and metadata is not None
+                and (metadata.st_dev, metadata.st_ino) == identity
+                and stat.S_ISSOCK(metadata.st_mode)
+                and metadata.st_uid == os.geteuid()
+            ):
+                self.socket_path.unlink()
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
+                self._lock_fd = None
 
     def stop(self) -> None:
         self._stop.set()
