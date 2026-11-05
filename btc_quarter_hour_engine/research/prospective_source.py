@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
+    from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
     from btc_quarter_hour_engine.research.prospective_replay import (
         IncrementalRawFrameSnapshot,
     )
@@ -140,6 +141,8 @@ class CausalFeatureVector:
 
 
 SOURCE_CERTIFICATION_WINDOW = timedelta(seconds=60)
+MAX_CANONICAL_CHECKPOINT_TAIL_FRAMES = 128
+MAX_CANONICAL_CHECKPOINT_TAIL_BYTES = 8 * 1024 * 1024
 
 
 def _validate_bridge_health(
@@ -497,7 +500,7 @@ class ProspectiveRawFrameJournal:
             """
         )
         self._connection.executescript(
-            """
+            f"""
             CREATE TRIGGER IF NOT EXISTS source_canonical_checkpoints_no_delete
             BEFORE DELETE ON source_canonical_checkpoints
             BEGIN
@@ -514,11 +517,12 @@ class ProspectiveRawFrameJournal:
             BEGIN
                 SELECT RAISE(ABORT, 'canonical checkpoint prefix mismatch');
             END;
-            CREATE TRIGGER IF NOT EXISTS source_canonical_checkpoints_update_prefix
+            DROP TRIGGER IF EXISTS source_canonical_checkpoints_update_prefix;
+            CREATE TRIGGER source_canonical_checkpoints_update_prefix
             BEFORE UPDATE ON source_canonical_checkpoints
             WHEN (
                 NEW.frame_index < OLD.frame_index
-                OR NEW.frame_index > OLD.frame_index + 1
+                OR NEW.frame_index > OLD.frame_index + {MAX_CANONICAL_CHECKPOINT_TAIL_FRAMES}
                 OR (
                     NEW.frame_index = OLD.frame_index
                     AND NEW.prefix_commitment_sha256 != OLD.prefix_commitment_sha256
@@ -786,6 +790,7 @@ class ProspectiveRawFrameJournal:
         reconnect_epoch: int | None = None,
         producer_health: dict[str, Any] | None = None,
         canonical_replay_checkpoint: dict[str, Any] | None = None,
+        canonical_checkpoint_tail: bool = False,
     ) -> str:
         from btc_quarter_hour_engine.research.prospective_replay import (
             advance_prefix_commitment,
@@ -890,6 +895,8 @@ class ProspectiveRawFrameJournal:
                     prefix_commitment_sha256=commitment,
                     state=canonical_replay_checkpoint,
                 )
+            elif canonical_checkpoint_tail:
+                self._canonical_tail_extent(session_id, frame_index)
             if health_json is not None and health_digest is not None:
                 connection = self._connection.execute(
                     "SELECT connection_id FROM source_connections "
@@ -961,9 +968,9 @@ class ProspectiveRawFrameJournal:
         ).fetchone()
         if current is None and frame_index != 0:
             raise ValueError("Canonical replay checkpoint is missing for source prefix")
-        if current is not None and frame_index not in (
-            current["frame_index"],
-            current["frame_index"] + 1,
+        if current is not None and not (
+            current["frame_index"] <= frame_index
+            <= current["frame_index"] + MAX_CANONICAL_CHECKPOINT_TAIL_FRAMES
         ):
             raise ValueError("Canonical replay checkpoint frame index is discontinuous")
         self._connection.execute(
@@ -984,7 +991,37 @@ class ProspectiveRawFrameJournal:
             ),
         )
 
-    def _validate_latest_canonical_checkpoint(self, session_id: str) -> None:
+    def _canonical_tail_extent(self, session_id: str, latest_index: int) -> tuple[int, int]:
+        checkpoint = self._connection.execute(
+            "SELECT frame_index, prefix_commitment_sha256 FROM source_canonical_checkpoints "
+            "WHERE session_id = ?", (session_id,),
+        ).fetchone()
+        if checkpoint is None:
+            raise ValueError("Canonical replay checkpoint is missing for committed source")
+        anchor = checkpoint["frame_index"]
+        if not 0 <= latest_index - anchor <= MAX_CANONICAL_CHECKPOINT_TAIL_FRAMES:
+            raise ValueError("Canonical replay checkpoint tail frame limit or continuity failed")
+        prefix = self._connection.execute(
+            "SELECT commitment_sha256 FROM source_prefix_commitments "
+            "WHERE session_id = ? AND frame_index = ?", (session_id, anchor),
+        ).fetchone()
+        if prefix is None or prefix[0] != checkpoint["prefix_commitment_sha256"]:
+            raise ValueError("Canonical replay checkpoint anchor prefix is invalid")
+        tail = self._connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(length(raw_bytes)), 0) FROM source_frames "
+            "WHERE session_id = ? AND frame_index > ? AND frame_index <= ?",
+            (session_id, anchor, latest_index),
+        ).fetchone()
+        if tail[0] != latest_index - anchor or tail[1] > MAX_CANONICAL_CHECKPOINT_TAIL_BYTES:
+            raise ValueError("Canonical replay checkpoint tail byte limit or continuity failed")
+        return anchor, tail[1]
+
+    def _validate_latest_canonical_checkpoint(self, session_id: str) -> CanonicalReplayAccumulator:
+        from btc_quarter_hour_engine.market_data.replay import (
+            CanonicalReplayAccumulator, MAX_CANONICAL_CHECKPOINT_BYTES,
+        )
+        from btc_quarter_hour_engine.research.prospective_replay import advance_prefix_commitment
+
         latest = self._connection.execute(
             "SELECT f.frame_index, c.commitment_sha256 "
             "FROM source_frames f LEFT JOIN source_prefix_commitments c "
@@ -994,6 +1031,7 @@ class ProspectiveRawFrameJournal:
         ).fetchone()
         if latest is None or latest["commitment_sha256"] is None:
             raise ValueError("Bridge source canonical checkpoint prefix is missing")
+        anchor_index, _tail_bytes = self._canonical_tail_extent(session_id, latest["frame_index"])
         checkpoint = self._connection.execute(
             "SELECT frame_index, prefix_commitment_sha256, checkpoint_json, "
             "checkpoint_sha256 FROM source_canonical_checkpoints WHERE session_id = ?",
@@ -1001,9 +1039,7 @@ class ProspectiveRawFrameJournal:
         ).fetchone()
         if (
             checkpoint is None
-            or checkpoint["frame_index"] != latest["frame_index"]
-            or checkpoint["prefix_commitment_sha256"]
-            != latest["commitment_sha256"]
+            or len(checkpoint["checkpoint_json"].encode("utf-8")) > MAX_CANONICAL_CHECKPOINT_BYTES
             or hashlib.sha256(checkpoint["checkpoint_json"].encode("utf-8")).hexdigest()
             != checkpoint["checkpoint_sha256"]
         ):
@@ -1024,20 +1060,92 @@ class ProspectiveRawFrameJournal:
             }
             or payload["version"] != 1
             or payload["session_id"] != session_id
-            or payload["frame_index"] != latest["frame_index"]
-            or payload["prefix_commitment_sha256"] != latest["commitment_sha256"]
+            or payload["frame_index"] != anchor_index
+            or payload["prefix_commitment_sha256"] != checkpoint["prefix_commitment_sha256"]
         ):
             raise ValueError("Bridge source canonical checkpoint provenance is invalid")
-        from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
-
         replay = CanonicalReplayAccumulator.from_checkpoint(payload["state"])
         if (
             replay.product_id != "BTC-USD"
             or replay.session_id != session_id
-            or replay.frame_count != latest["frame_index"] + 1
+            or replay.frame_count != anchor_index + 1
         ):
             raise ValueError("Bridge source canonical checkpoint state identity is invalid")
         replay._require_bounded_live_state()
+        anchor = self._connection.execute(
+            "SELECT ingest_time_utc, raw_bytes, raw_frame_sha256 FROM source_frames "
+            "WHERE session_id = ? AND frame_index = ?", (session_id, anchor_index),
+        ).fetchone()
+        if anchor is None or hashlib.sha256(anchor["raw_bytes"]).hexdigest() != anchor["raw_frame_sha256"]:
+            raise ValueError("Canonical replay checkpoint anchor raw digest is invalid")
+        from btc_quarter_hour_engine.research.prospective_replay import initial_prefix_commitment
+
+        previous_prefix = self._connection.execute(
+            "SELECT commitment_sha256 FROM source_prefix_commitments "
+            "WHERE session_id = ? AND frame_index = ?", (session_id, anchor_index - 1),
+        ).fetchone()
+        if anchor_index > 0 and previous_prefix is None:
+            raise ValueError("Canonical replay checkpoint anchor predecessor is missing")
+        seed = previous_prefix[0] if previous_prefix is not None else initial_prefix_commitment(
+            session_id, self.session_started_at(session_id),
+        )
+        anchor_identity = self._connection.execute(
+            "SELECT connection_id FROM source_frames WHERE session_id = ? AND frame_index = ?",
+            (session_id, anchor_index),
+        ).fetchone()[0]
+        if advance_prefix_commitment(seed, RawFrameRecord(
+            session_id=session_id, connection_id=anchor_identity, frame_index=anchor_index,
+            ingest_time_utc=_parse_utc(anchor["ingest_time_utc"]), raw_bytes=bytes(anchor["raw_bytes"]),
+            raw_frame_sha256=anchor["raw_frame_sha256"],
+        )) != checkpoint["prefix_commitment_sha256"]:
+            raise ValueError("Canonical replay checkpoint anchor provenance is invalid")
+        previous_ingest = _parse_utc(anchor["ingest_time_utc"])
+        commitment = checkpoint["prefix_commitment_sha256"]
+        rows = self._connection.execute(
+            "SELECT f.*, p.commitment_sha256, h.producer_health_json, h.producer_health_sha256, "
+            "h.connection_id AS health_connection, e.connection_id AS epoch_connection, e.first_frame_index "
+            "FROM source_frames f "
+            "LEFT JOIN source_prefix_commitments p ON p.session_id = f.session_id AND p.frame_index = f.frame_index "
+            "LEFT JOIN source_frame_health h ON h.session_id = f.session_id AND h.frame_index = f.frame_index "
+            "LEFT JOIN source_connections e ON e.session_id = h.session_id AND e.reconnect_epoch = h.reconnect_epoch "
+            "WHERE f.session_id = ? AND f.frame_index > ? AND f.frame_index <= ? ORDER BY f.frame_index",
+            (session_id, anchor_index, latest["frame_index"]),
+        )
+        for expected, row in enumerate(rows, start=anchor_index + 1):
+            raw = bytes(row["raw_bytes"])
+            ingest = _parse_utc(row["ingest_time_utc"])
+            if (
+                row["frame_index"] != expected or ingest < previous_ingest
+                or hashlib.sha256(raw).hexdigest() != row["raw_frame_sha256"]
+                or row["health_connection"] != row["connection_id"]
+                or row["epoch_connection"] != row["connection_id"]
+                or row["first_frame_index"] is None or row["first_frame_index"] > expected
+                or row["producer_health_json"] is None
+                or hashlib.sha256(row["producer_health_json"].encode()).hexdigest() != row["producer_health_sha256"]
+            ):
+                raise ValueError("Canonical replay checkpoint tail provenance or digest is invalid")
+            commitment = advance_prefix_commitment(commitment, RawFrameRecord(
+                session_id=session_id, connection_id=row["connection_id"], frame_index=expected,
+                ingest_time_utc=ingest, raw_bytes=raw, raw_frame_sha256=row["raw_frame_sha256"],
+            ))
+            if commitment != row["commitment_sha256"]:
+                raise ValueError("Canonical replay checkpoint tail prefix commitment is invalid")
+            health = json.loads(row["producer_health_json"])
+            if not isinstance(health, dict):
+                raise ValueError("Canonical replay checkpoint tail health is malformed")
+            canonical = health.get("canonical_boundary")
+            boundary = _parse_utc(canonical["boundary_utc"]) if isinstance(canonical, dict) else ingest.replace(
+                minute=ingest.minute - ingest.minute % 15, second=0, microsecond=0,
+            )
+            validated = _validate_bridge_health(health, boundary=boundary, connection_id=row["connection_id"])
+            if validated["post_frame_health"]["heartbeat_timeout_seconds"] != replay.heartbeat_timeout_seconds:
+                raise ValueError("Canonical replay checkpoint tail heartbeat tolerance changed")
+            replay.consume(raw, row["connection_id"], expected, ingest, enforce_live_limits=True)
+            previous_ingest = ingest
+        if replay.frame_count != latest["frame_index"] + 1 or commitment != latest["commitment_sha256"]:
+            raise ValueError("Canonical replay checkpoint tail does not reach committed head")
+        replay._require_bounded_live_state()
+        return replay
 
     def advance_watermark(
         self,

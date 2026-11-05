@@ -604,7 +604,8 @@ def test_ordered_verified_fence_certifies_durable_snapshot(tmp_path):
         "SELECT frame_index FROM source_canonical_checkpoints "
         "WHERE session_id = 'session-1'"
     ).fetchone()
-    assert checkpoint["frame_index"] == 3
+    assert checkpoint["frame_index"] == 2
+    assert journal._canonical_tail_extent("session-1", 3)[0] == 2
     assert journal._connection.execute(
         "SELECT COUNT(*) FROM source_fences WHERE session_id = 'session-1'"
     ).fetchone()[0] == 1
@@ -858,8 +859,11 @@ def test_receiver_restart_and_reconnect_preserve_global_frame_order_without_fenc
         "SELECT frame_index, prefix_commitment_sha256 FROM source_canonical_checkpoints "
         "WHERE session_id = 'session-1'"
     ).fetchone()
-    assert checkpoint["frame_index"] == 2
+    assert checkpoint["frame_index"] == 0
     assert checkpoint["prefix_commitment_sha256"]
+    recovered = ProspectiveSourceReceiver(journal)._canonical_replay("session-1", 5.0)
+    assert recovered.frame_count == 3
+    assert recovered.to_checkpoint() == receiver._canonical_replays["session-1"].to_checkpoint()
     journal.close()
 
 

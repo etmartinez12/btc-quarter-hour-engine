@@ -199,14 +199,20 @@ not disqualified by an earlier connection's counters, and later recovery cannot
 make an earlier unhealthy boundary appear healthy. Missing or internally
 inconsistent producer evidence fails closed.
 
-The receiver atomically persists a latest canonical replay checkpoint with
-each committed frame and updates that same checkpoint with the post-fence
-pruned state. Its schema, session identity, frame index, state counters, digest,
-and exact source-prefix commitment are checked before restart continuation.
-Normal receiver startup restores this one checkpoint and never scans or
-replays the complete historical raw journal. Missing, altered, oversized, or
-discontinuous checkpoints fail closed; cold reconstruction is not used to
-claim a timely prediction. Optional collector certification uses a separate
+The receiver persists a canonical replay checkpoint with the initial frame,
+at least every 128 frames, before its raw tail would exceed 8 MiB, and atomically
+with every producer fence's post-fence pruned state. Between checkpoints each
+raw frame, receive timestamp, connection identity, prefix commitment, and
+producer health record still commits atomically under SQLite FULL synchronization
+before its durable ACK. No frame acknowledgement waits for a later checkpoint.
+Normal receiver startup restores one verified checkpoint and streams only its
+bounded raw tail, not the complete historical journal. It checks checkpoint
+schema, session, state counters, digest, anchor/predecessor provenance, every
+tail frame and health digest, connection epoch, timestamp order, heartbeat
+tolerance, and the hash chain through the committed head. Missing, altered,
+oversized, or discontinuous checkpoints/tails fail closed; cold reconstruction
+is not used to claim a timely prediction. Existing per-frame checkpoints remain
+readable. Optional collector certification uses a separate
 accumulator with explicit bounds (128 connections, 64 retained boundary
 candidates, 4096 heartbeat buckets, 100,000 active book levels, and an 8 MiB
 checkpoint). Exceeding a bound invalidates certification but is isolated from
@@ -245,6 +251,41 @@ OS memory, production Coinbase traffic, frozen inference, or ledger commit
 latency.
 On platforms without Unix-domain sockets, the benchmark uses an in-memory
 fake transport; its acknowledgment timings are not IPC or durable-ack evidence.
+
+### Populated Coinbase level2 ingestion gate
+
+`--populated-books --book-intervals 1,default --require-book-capacity` runs
+10,000, 25,000, and 40,000 **populated bid/offer levels**, not padded frames or
+malformed history. Each isolated scenario uses a valid snapshot, a pre-boundary
+heartbeat, a healthy boundary crossing, and 1,024 sustained incremental update
+envelopes with ten depth mutations per envelope and periodic heartbeats.
+The snapshot and first heartbeat drain before the open-loop update workload;
+their costs remain in receiver transaction/serialization and resource measurements.
+Normal arrivals are 100 frames/s; bursts deliver 32 frames together at the same
+100 frames/s average. `--book-burst-rate 1000` is a separate overload stress
+setting, not an assertion that arbitrary bursts cannot saturate a finite queue.
+
+The benchmark compares the actual collector with integration disabled, the
+per-frame checkpoint policy (`1`), and the default bounded-tail policy. A separate
+receiver process runs the production Unix socket server on Linux, actual
+checkpoint JSON serialization, SQLite FULL commits, and production durable ACK
+framing. The publisher uses its unchanged 64-frame / 64-MiB queue.
+Windows uses labeled loopback TCP with the same receiver/framing/commits; it
+does not bypass the fail-closed production Unix server or satisfy its platform gate.
+Output includes sample counts, median/p95/p99/max stage latencies, collector
+arrival lag and enabled/disabled ratio, per-process CPU and sampled RSS,
+checkpoint bytes, journal/WAL footprint and bytes per committed frame, source
+queue high-water/loss/validity, canonical eligibility and exact warm/restarted
+state parity. Five fresh-receiver recovery samples include the first load in a
+new process; subsequent loads have warm process/OS caches. Recovery process
+startup is reported separately. The OS page cache is never purged; RSS sampling
+is every 10 ms. This is synthetic ingestion-capacity evidence, not production
+Coinbase latency, power-loss durability, UTC synchronization, or T+60 compliance.
+
+The Python 3.11 Linux CI job runs this gate and retains the complete JSON as
+`populated-book-benchmark`. Per-frame-policy saturation is an expected diagnostic;
+default-policy frame loss, missing canonical evidence, collector interruption,
+or a recovery parity failure makes the gate fail.
 
 ## Boundaries and operational validation
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import copy
 import hashlib
 import json
 import math
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from btc_quarter_hour_engine.research.prospective_source import (
+    MAX_CANONICAL_CHECKPOINT_TAIL_BYTES,
+    MAX_CANONICAL_CHECKPOINT_TAIL_FRAMES,
     SOURCE_CERTIFICATION_WINDOW,
     ProspectiveRawFrameJournal,
     _validate_bridge_health,
@@ -565,12 +568,19 @@ class ProspectiveSourceReceiver:
         *,
         clock_health_provider: Callable[[], ClockHealthEvidence] = read_chrony_clock_health,
         max_frame_bytes: int = MAX_RAW_FRAME_BYTES,
+        checkpoint_interval_frames: int = MAX_CANONICAL_CHECKPOINT_TAIL_FRAMES,
     ) -> None:
         if type(max_frame_bytes) is not int or max_frame_bytes < 1:
             raise ValueError("Source frame size limit must be a positive integer")
+        if (
+            type(checkpoint_interval_frames) is not int
+            or not 1 <= checkpoint_interval_frames <= MAX_CANONICAL_CHECKPOINT_TAIL_FRAMES
+        ):
+            raise ValueError("Canonical checkpoint interval exceeds the bounded tail limit")
         self.journal = journal
         self.clock_health_provider = clock_health_provider
         self.max_frame_bytes = max_frame_bytes
+        self.checkpoint_interval_frames = checkpoint_interval_frames
         self.frames_committed = 0
         self.frames_rejected = 0
         self.gaps = 0
@@ -580,9 +590,14 @@ class ProspectiveSourceReceiver:
         self.watermark_latency_max_ms = 0.0
         self.canonical_checkpoint_load_latency_max_ms = 0.0
         self.canonical_checkpoint_bytes_max = 0
+        self.canonical_checkpoints_committed = 0
+        self.canonical_tail_frames_recovered = 0
+        self.canonical_tail_bytes_recovered = 0
         self._session_started: dict[str, datetime] = {}
         self._canonical_replays: dict[str, CanonicalReplayAccumulator] = {}
         self._canonical_timeouts: dict[str, float] = {}
+        self._canonical_checkpoint_indices: dict[str, int] = {}
+        self._canonical_tail_bytes: dict[str, int] = {}
 
     def _canonical_replay(
         self, session_id: str, heartbeat_timeout_seconds: float
@@ -611,58 +626,25 @@ class ProspectiveSourceReceiver:
                 session_id=session_id,
                 heartbeat_timeout_seconds=timeout,
             )
+            self._canonical_checkpoint_indices[session_id] = -1
+            self._canonical_tail_bytes[session_id] = 0
         else:
-            checkpoint = self.journal._connection.execute(
-                "SELECT frame_index, prefix_commitment_sha256, checkpoint_json, "
-                "checkpoint_sha256 FROM source_canonical_checkpoints "
-                "WHERE session_id = ?",
+            replay = self.journal._validate_latest_canonical_checkpoint(session_id)
+            if (
+                replay.heartbeat_timeout_seconds != timeout
+            ):
+                raise ValueError("Source canonical replay heartbeat tolerance changed")
+            anchor, tail_bytes = self.journal._canonical_tail_extent(session_id, latest["frame_index"])
+            self._canonical_checkpoint_indices[session_id] = anchor
+            self._canonical_tail_bytes[session_id] = tail_bytes
+            self.canonical_tail_frames_recovered += latest["frame_index"] - anchor
+            self.canonical_tail_bytes_recovered += tail_bytes
+            checkpoint_size = self.journal._connection.execute(
+                "SELECT length(checkpoint_json) FROM source_canonical_checkpoints WHERE session_id = ?",
                 (session_id,),
-            ).fetchone()
-            if checkpoint is None:
-                raise ValueError("Canonical replay checkpoint is missing for committed source")
-            checkpoint_json = checkpoint["checkpoint_json"]
-            if (
-                checkpoint["frame_index"] != latest["frame_index"]
-                or latest["commitment_sha256"] is None
-                or checkpoint["prefix_commitment_sha256"]
-                != latest["commitment_sha256"]
-                or hashlib.sha256(checkpoint_json.encode("utf-8")).hexdigest()
-                != checkpoint["checkpoint_sha256"]
-            ):
-                raise ValueError("Canonical replay checkpoint identity or digest is invalid")
-            try:
-                payload = json.loads(checkpoint_json)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Canonical replay checkpoint JSON is malformed") from exc
-            if (
-                not isinstance(payload, dict)
-                or set(payload)
-                != {
-                    "version",
-                    "session_id",
-                    "frame_index",
-                    "prefix_commitment_sha256",
-                    "state",
-                }
-                or payload["version"] != 1
-                or payload["session_id"] != session_id
-                or payload["frame_index"] != latest["frame_index"]
-                or payload["prefix_commitment_sha256"]
-                != latest["commitment_sha256"]
-            ):
-                raise ValueError("Canonical replay checkpoint provenance is invalid")
-            replay = CanonicalReplayAccumulator.from_checkpoint(payload["state"])
-            if (
-                replay.product_id != "BTC-USD"
-                or replay.session_id != session_id
-                or replay.heartbeat_timeout_seconds != timeout
-                or replay.frame_count != latest["frame_index"] + 1
-            ):
-                raise ValueError("Canonical replay checkpoint state identity is invalid")
-            replay._require_bounded_live_state()
+            ).fetchone()[0]
             self.canonical_checkpoint_bytes_max = max(
-                self.canonical_checkpoint_bytes_max,
-                len(checkpoint_json.encode("utf-8")),
+                self.canonical_checkpoint_bytes_max, checkpoint_size,
             )
         self._canonical_replays[session_id] = replay
         self._canonical_timeouts[session_id] = timeout
@@ -844,7 +826,12 @@ class ProspectiveSourceReceiver:
                 enforce_live_limits=True,
             )
             replay._require_bounded_live_state()
-            canonical_checkpoint = replay.to_checkpoint()
+            checkpoint_due = (
+                self._canonical_checkpoint_indices[session_id] < 0
+                or frame_index - self._canonical_checkpoint_indices[session_id] >= self.checkpoint_interval_frames
+                or self._canonical_tail_bytes[session_id] + len(raw_bytes) > MAX_CANONICAL_CHECKPOINT_TAIL_BYTES
+            )
+            canonical_checkpoint = replay.to_checkpoint() if checkpoint_due else None
         except Exception:
             self._canonical_replays.pop(session_id, None)
             self._canonical_timeouts.pop(session_id, None)
@@ -860,11 +847,18 @@ class ProspectiveSourceReceiver:
                 reconnect_epoch=reconnect_epoch,
                 producer_health=producer_health,
                 canonical_replay_checkpoint=canonical_checkpoint,
+                canonical_checkpoint_tail=not checkpoint_due,
             )
         except Exception:
             self._canonical_replays.pop(session_id, None)
             self._canonical_timeouts.pop(session_id, None)
             raise
+        if checkpoint_due:
+            self._canonical_checkpoint_indices[session_id] = frame_index
+            self._canonical_tail_bytes[session_id] = 0
+            self.canonical_checkpoints_committed += 1
+        else:
+            self._canonical_tail_bytes[session_id] += len(raw_bytes)
         write_latency = (time.perf_counter_ns() - write_started) / 1_000_000
         self.frame_write_latency_max_ms = max(
             self.frame_write_latency_max_ms, write_latency
@@ -919,9 +913,12 @@ class ProspectiveSourceReceiver:
             frame_health=validated_health,
         )
         replay = self._canonical_replays[session_id]
-        pruned_replay = CanonicalReplayAccumulator.from_checkpoint(
-            replay.to_checkpoint()
-        )
+        # Pruning replaces only bounded metadata. Share the read-only live book
+        # until the fence commits, rather than copying every populated level.
+        pruned_replay = copy.copy(replay)
+        pruned_replay._connections = {
+            key: copy.copy(state) for key, state in replay._connections.items()
+        }
         pruned_replay.prune_for_next_boundary(watermark)
         canonical_checkpoint = pruned_replay.to_checkpoint()
         clock = self.clock_health_provider()
@@ -940,6 +937,9 @@ class ProspectiveSourceReceiver:
             canonical_replay_checkpoint=canonical_checkpoint,
         )
         self._canonical_replays[session_id] = pruned_replay
+        self._canonical_checkpoint_indices[session_id] = frame_index
+        self._canonical_tail_bytes[session_id] = 0
+        self.canonical_checkpoints_committed += 1
         fence_latency = (time.perf_counter_ns() - fence_started) / 1_000_000
         self.watermark_latency_max_ms = max(
             self.watermark_latency_max_ms, fence_latency
@@ -965,6 +965,9 @@ class ProspectiveSourceReceiver:
             "watermark_certification_latency_max_ms": self.watermark_latency_max_ms,
             "canonical_checkpoint_load_latency_max_ms": self.canonical_checkpoint_load_latency_max_ms,
             "canonical_checkpoint_bytes_max": self.canonical_checkpoint_bytes_max,
+            "canonical_checkpoints_committed": self.canonical_checkpoints_committed,
+            "canonical_tail_frames_recovered": self.canonical_tail_frames_recovered,
+            "canonical_tail_bytes_recovered": self.canonical_tail_bytes_recovered,
         }
 
     def note_rejection(self, *, gap: bool = False) -> None:
