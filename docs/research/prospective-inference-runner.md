@@ -19,10 +19,10 @@ The protocol remains exactly the registered 2,880 UTC quarter-hours from
 
 For one exact scheduled boundary `T`, the explicit runner:
 
-1. Confirms `T` is in the immutable ledger schedule, that it is not early, and
-   that the current wall time has not passed `T+60s`. Historical boundaries
-   are never recreated as timely predictions.
-2. Takes the nonblocking single-writer process lock for the ledger.
+1. Takes the nonblocking single-writer process lock for the ledger.
+2. Confirms `T` is in the registered schedule, rejects early work, and
+   reconciles the immutable ledger lifecycle before attempting inference.
+   Expired boundaries are never recreated as timely predictions.
 3. Checks independent chrony/UTC evidence and the ledger wall/monotonic clock
    health. Rechecks them while awaiting the source and immediately before
    inference.
@@ -30,16 +30,18 @@ For one exact scheduled boundary `T`, the explicit runner:
    The runner opens the source SQLite file with `mode=ro` and `query_only`;
    it does not initialize, migrate, or append to that journal.
 5. Loads the latest valid, durable, immutable ready checkpoint strictly before
-   `T`. On a cold start it resumes or performs the separately persisted
-   four-hour warm-up to `T-15m`, one bounded chunk at a time. Every continuation
-   is published before reading the next chunk.
+   `T`. Missing or corrupt state fails closed. The deadline path never runs
+   initial warm-up: explicit `prepare` must have completed it beforehand.
 6. Waits with blocking sleeps (not a spin loop) for the *exact* bridge fence at
    `T`. Missing-fence polling is bounded by the deadline; the runner never
    substitutes an offline watermark, a later fence, or a stale session.
 7. Reads the contiguous hash-verified raw tail through `T`, calls
    `process_incremental_boundary()`, and relies on its existing causal feature,
    official-model, ledger, and durability-attestation checks.
-8. Only after the prediction transaction and post-commit attestation succeed,
+8. Forces a new independent UTC-health check before the prediction write and
+   again after its COMMIT, inside the separate attestation transaction, after
+   acquiring its write lock and before taking the attestation timestamp.
+   Only after the prediction transaction and post-commit attestation succeed,
    advances replay state through `T` and publishes a new write-once checkpoint.
    A checkpoint publication failure does not alter or repeat the committed
    prediction; it returns `prediction_committed_checkpoint_recovery_required`.
@@ -79,7 +81,21 @@ cannot hold up a later boundary.
   CLI option cannot substitute for chrony evidence.
 
 Restart uses the latest valid durable checkpoint and immutable ledger state.
-The normal scheduler selects only the current boundary. If the checkpoint,
+On startup, the scheduler floors UTC to the most recent exact quarter-hour,
+clamped to the registered start. At T+10 it reconciles T, not T+15m. Ledger
+prediction identity (including late/unconfirmed commits), labels, and any
+permanent `missed` event prevent another attempt, even if a later diagnostic
+is the most recent event. The T+60 timestamp is inclusive, as in the ledger;
+any actual generation/commit/confirmation delay past it is ineligible.
+After one result the cursor advances at least one full quarter-hour. Forward
+clock jumps skip expired work via missed-boundary reconciliation, never
+through historical inference or checkpoint repair. Shutdown interrupts a
+scheduled wait at its next bounded wait step.
+
+Only SQLite BUSY/LOCKED **reads** are retried, at most three attempts, with
+blocking, deadline-capped waits. No prediction transaction or attestation is
+retried. Read/diagnostic persistence failures are surfaced in structured
+results rather than silently treated as success. If the checkpoint,
 source prefix, session, four-hour history, frame cap, clock evidence, or model
 integrity cannot be verified, it fails closed. Missing source fences are
 polled only until the T+60 deadline; terminal status is recorded without
@@ -122,6 +138,44 @@ btc-qh-prospective-inference-runner dry-run `
   --config .\runner.json --boundary 2026-11-15T00:00:00Z
 ```
 
+**Explicit checkpoint preparation** (source reads and immutable checkpoint
+writes only; no model loading, prediction-ledger opening, prediction records,
+or deployment authorization):
+
+```powershell
+btc-qh-prospective-inference-runner prepare `
+  --config .\runner.json --boundary 2026-11-15T00:00:00Z
+```
+
+For the first registered prediction, the normal cutoff is
+`2026-11-14T23:45:00Z`. The separately authorized source must contain the exact
+240 minutes of history through that cutoff: its session must begin no later
+than `2026-11-14T19:45:00Z` (prefer earlier for operational margin). This is a
+source-readiness requirement, **not authorization to enable the bridge**.
+Begin `prepare` as soon as the certified 23:45 fence exists, allowing the
+whole pre-window interval for replay and durable publication. Do not defer it
+until midnight. Benchmark that budget on the isolated VM beforehand.
+
+Preparation verifies the source mode/session, exact cutoff fence, independent
+UTC evidence, canonical eligibility, causal raw prefix and every bounded
+chunk. Each continuation is durably published before the next chunk is read.
+Interruptions resume from the latest trustworthy continuation for that exact
+cutoff. The replay API still enforces all 17 exact quarter-hour buckets and
+the 240-minute history; a continuation is not a ready checkpoint. Preparation
+checks time between chunks and around ready publication, and refuses work
+at/after the prediction boundary. Partial/corrupt state is never promoted.
+
+Before midnight, require a successful JSON result with `ready: true`,
+`cutoff_utc: "2026-11-14T23:45:00Z"`, the expected source session, immutable
+checkpoint path and integrity SHA256. Rerunning `prepare` reopens and
+revalidates the published checkpoint against its exact certified source
+prefix without replaying the four hours or touching the ledger; the result
+then includes `recovered_ready_checkpoint: true`. Record the successful
+readiness result before T. A failed or incomplete preparation is not approval
+to cold-start inference inside T+60. Later prediction-state advancement
+remains permitted from an older trustworthy checkpoint if the verified tail
+fits the existing replay limit.
+
 **Synthetic schedule/deadline smoke check** (no source, model, or ledger):
 
 ```powershell
@@ -150,10 +204,12 @@ smoke test invokes it.
 ## Failure classification and diagnostics
 
 The one-boundary result distinguishes `not_due`, `predicted`,
+`predicted_clock_alert`,
 `prediction_committed_checkpoint_recovery_required`, `waiting_for_source_fence`,
 `missing_source_data`, `invalid_source_health`, `checkpoint_failure`,
 `clock_sync_failure`, `model_verification_failure`,
-`inference_or_persistence_failure`, `duplicate_prediction`, `late_prediction`,
+`inference_or_persistence_failure`, `ledger_or_source_io_failure`,
+`duplicate_prediction`, `late_prediction`,
 and `missed_deadline`. Existing ledger event types are reused; the ledger
 remains append-only.
 
@@ -161,8 +217,8 @@ Runner metrics include source-fence wait/availability, tail read and
 verification, checkpoint load, checkpoint restore, bounded tail replay,
 feature generation, candidate/control inference, SQLite transaction,
 post-commit attestation, checkpoint publication, total completion, deadline
-margin, independent UTC checks immediately before and after the ledger
-operation, startup model/source validation, CPU time, resident memory where the
+margin, independent UTC checks before persistence and at the durability
+decision, startup model/source validation, CPU time, resident memory where the
 OS exposes it, and unpredicted boundary backlog. Checkpoint-load timing is the
 restart-recovery measurement. The offline replay benchmark reports median, p95, p99, and
 maximum stage latency and traced Python allocation peak. Its synthetic
@@ -172,6 +228,48 @@ The official CLI emits structured JSON-line operational summaries. Those
 summaries omit candidate/control probabilities, predicted classes, and raw
 feature values so monitoring does not disclose comparative results before the
 registered analysis.
+
+### UTC eligibility versus subsequent alerts
+
+| Failure detected | Durable evidence and eligibility |
+| --- | --- |
+| Before prediction write | No prediction is written. |
+| During prediction write, or before/while acquiring the attestation transaction | The fresh independent check must pass after the prediction COMMIT and attestation lock acquisition. Failure retains any committed prediction but rolls back the confirmation; it is unconfirmed and ineligible. |
+| Attestation timestamp after T+60 | Late confirmation is retained but ineligible. |
+| Crash after prediction COMMIT, before confirmation | Prediction remains unconfirmed and ineligible across restart; never retrospectively re-attested. |
+| Clock failure observed after successful attestation | A subsequent operational alert (`predicted_clock_alert`), not a rewrite of the earlier durability decision. The prediction and its eligibility remain immutable, and checkpoint advancement is still attempted. |
+
+The gate samples independent UTC health at the durability decision; it is not
+a claim of continuous synchronization before or after that sample. A failure
+to record a subsequent alert is also surfaced in `failure_record_error`; it
+does not erase an already committed prediction. The inference API's optional
+`pre_attestation_check` is forwarded into the ledger; omitted callbacks retain
+the existing public flow. `post_persist_check` remains available to existing
+callers but is not used as the runner's eligibility gate.
+
+### Deterministic integration coverage and measurements
+
+`tests/test_prospective_runner_integration.py` feeds local raw-frame fixtures
+through the real source receiver and certified read-only journal, prepares
+and recovers chunked checkpoints, and executes the real runner, causal replay,
+official-loader verification gate and immutable SQLite ledger across
+consecutive boundaries. Only test clocks and disk-loaded model artifacts are
+substituted; the test models are deterministically fitted ExtraTrees. The
+production loader and CLI gain no test bypass.
+
+Coverage includes restart offsets -1/0/1/10/30/59/60/61 seconds, complete and
+unconfirmed commits, post-commit checkpoint failure, transient real SQLite
+read contention, three-attempt retry limits, exact fences, clock/chrony
+failure and no-write diagnostic/preparation modes. Full replay and incremental
+feature vectors, ordering, fingerprints and candidate/control/always-DOWN
+outputs must agree exactly. The registered 2,880-boundary schedule is checked.
+
+The Python 3.10/3.11/3.12 Actions jobs preserve JUnit artifacts containing
+warm-up readiness/latency, checkpoint reload latency, two-boundary stage
+timings and traced Python peak allocation. These are small **synthetic**
+fixtures, not production load or T+60 acceptance measurements. Ubuntu uses
+real POSIX file/directory fsync; Windows test publication is explicitly
+simulated because the existing publisher does not support that platform.
 
 ## Activation and VM acceptance (not performed)
 

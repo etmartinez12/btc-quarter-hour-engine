@@ -375,6 +375,7 @@ def process_incremental_boundary(
     timings: dict[str, float] | None = None,
     pre_persist_check: Callable[[], Any] | None = None,
     post_persist_check: Callable[[], Any] | None = None,
+    pre_attestation_check: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Run one boundary from a verified checkpoint and bounded raw tail."""
     boundary = _utc(boundary_utc, field="prediction boundary")
@@ -419,6 +420,7 @@ def process_incremental_boundary(
         timings=timings,
         pre_persist_check=pre_persist_check,
         post_persist_check=post_persist_check,
+        pre_attestation_check=pre_attestation_check,
     )
 
 
@@ -432,6 +434,7 @@ def _persist_causal_features(
     timings: dict[str, float] | None = None,
     pre_persist_check: Callable[[], Any] | None = None,
     post_persist_check: Callable[[], Any] | None = None,
+    pre_attestation_check: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     try:
         evidence = infer_causal_prediction(
@@ -483,7 +486,20 @@ def _persist_causal_features(
             timings["utc_clock_check_before_persist_ms"] = (
                 time.perf_counter() - check_started
             ) * 1000
-    if timings is None:
+    if pre_attestation_check is not None:
+        def check_before_attestation() -> None:
+            check_started = time.perf_counter()
+            pre_attestation_check()
+            if timings is not None:
+                timings["utc_clock_check_before_attestation_ms"] = (
+                    time.perf_counter() - check_started
+                ) * 1000
+
+        result = ledger.append_prediction(
+            evidence, model_bundle=model_bundle, timings=timings,
+            pre_attestation_check=check_before_attestation,
+        )
+    elif timings is None:
         result = ledger.append_prediction(evidence, model_bundle=model_bundle)
     else:
         result = ledger.append_prediction(

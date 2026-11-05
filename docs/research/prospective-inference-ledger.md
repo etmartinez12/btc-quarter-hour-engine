@@ -188,11 +188,22 @@ retroactively attested. Earlier prediction rows are never updated to add
 confirmation data. Existing schema-version-1 ledgers have no commit
 attestations; they are rejected for writing and must be preserved read-only.
 
+The runner supplies an independent UTC-health gate through the optional
+`pre_attestation_check` argument to `process_incremental_boundary()` and
+`append_prediction()`. It runs after the prediction transaction commits and
+after the attestation transaction obtains its write lock, before the measured
+attestation timestamp. Failure rolls back confirmation, not the immutable
+prediction. It cannot be retried on restart. This closes the interval left by
+a pre-write check alone; a post-persist callback is too late to decide
+eligibility. Subsequent synchronization failures are operational alerts,
+not retrospective changes to an already successful attestation. Omitting the
+optional gate preserves existing callers and the ledger's own clock checks.
+
 Only complete, ready predictions with exact frozen hashes and feature ordering
 can be written. The ledger derives timing eligibility from the generation and
 persistence timestamps. The inference runner takes generation time from the
-ledger's clock-health source immediately after model execution; persistence
-time is independently taken inside the durable write transaction. Late writes
+ledger's clock-health source immediately after model execution; confirmation
+time is independently taken in the separate post-commit attestation. Late writes
 create a `late_attempt` event and never a prediction row.
 `mark_missed_boundaries()` appends missed events after deadline without
 generating or backfilling predictions. Labels are appended to a separate

@@ -87,6 +87,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     dry_run.add_argument("--config", type=Path, required=True)
     dry_run.add_argument("--boundary", required=True)
+    prepare = commands.add_parser(
+        "prepare", help="Explicit source-verified pre-window warm-up; never opens a prediction ledger"
+    )
+    prepare.add_argument("--config", type=Path, required=True)
+    prepare.add_argument("--boundary", required=True)
     simulate = commands.add_parser(
         "simulate", help="Synthetic registered-schedule and deadline smoke test"
     )
@@ -139,10 +144,14 @@ def main(argv: list[str] | None = None) -> int:
             }, sort_keys=True))
             return 0
 
-        if args.mode == "dry-run":
+        if args.mode in {"dry-run", "prepare"}:
             boundary = _utc(args.boundary)
             journal = ProspectiveRawFrameJournal.open_read_only(config.source_journal_path)
             try:
+                if args.mode == "prepare":
+                    runner = ProspectiveInferenceRunner(config, ledger=None, journal=journal)
+                    _emit_diagnostic(runner.prepare_checkpoint(boundary))
+                    return 0
                 session_id = config.expected_source_session_id
                 mode = journal.session_mode(session_id)
                 started = journal.session_started_at(session_id)

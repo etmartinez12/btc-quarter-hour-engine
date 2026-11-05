@@ -148,7 +148,7 @@ def test_official_clock_health_can_be_distinguished_from_test_clock():
     assert ClockHealth(wall_clock=lambda: START).uses_system_clock is False
 
 
-def test_runner_missed_boundary_is_reported_without_prediction_write(tmp_path):
+def test_diagnostic_runner_cannot_write_even_a_missed_boundary(tmp_path):
     config = _config(tmp_path)
     journal_writer = ProspectiveRawFrameJournal(config.source_journal_path)
     journal_writer.start_session(
@@ -171,10 +171,10 @@ def test_runner_missed_boundary_is_reported_without_prediction_write(tmp_path):
         clock=clock,
         official_mode=False,
     )
-    result = runner.process_boundary(START)
-    assert result.status == "missed_deadline"
-    assert "never backfilled" in result.reason
+    with pytest.raises(ValueError, match="diagnostic-only"):
+        runner.process_boundary(START)
     assert ledger.lifecycle(START)["prediction"] is None
+    assert ledger.lifecycle(START)["events"] == []
     runner.close()
     ledger.close()
 

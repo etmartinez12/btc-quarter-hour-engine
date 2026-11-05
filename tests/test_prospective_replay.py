@@ -90,8 +90,10 @@ def _record(index: int, sequence: int, timestamp: datetime, *, connection="conne
     )
 
 
-def _snapshot(*, end: datetime = BOUNDARY + timedelta(minutes=45)) -> RawFrameSnapshot:
-    start = BOUNDARY - timedelta(hours=4)
+def _snapshot(
+    *, end: datetime = BOUNDARY + timedelta(minutes=45),
+    start: datetime = BOUNDARY - timedelta(hours=4),
+) -> RawFrameSnapshot:
     frames = [_record(0, 0, start, snapshot=True)]
     index = 1
     sequence = 1
@@ -300,24 +302,20 @@ def test_chunked_warmup_is_restartable_bounded_and_matches_full_replay(tmp_path,
     assert actual.feature_fingerprint == expected.feature_fingerprint
 
 
-def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_path):
-    target_boundary = BOUNDARY + timedelta(minutes=15)
-    source = _with_boundary_witnesses(
-        _snapshot(end=target_boundary), (BOUNDARY, target_boundary)
-    )
-    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+def _populate_receiver_journal(path, source, boundaries, *, clock_verified=True):
+    journal = ProspectiveRawFrameJournal(path)
     clock_values = iter(
         (
             ClockHealthEvidence(
                 observed_at_utc=boundary + timedelta(seconds=2),
-                synchronized=True,
-                verified=True,
-                offset_seconds=0.001,
-                reference_time_utc=boundary + timedelta(seconds=1),
-                leap_status="Normal",
+                synchronized=clock_verified,
+                verified=clock_verified,
+                offset_seconds=0.001 if clock_verified else None,
+                reference_time_utc=boundary + timedelta(seconds=1) if clock_verified else None,
+                leap_status="Normal" if clock_verified else None,
                 source="synthetic test evidence",
             )
-            for boundary in (BOUNDARY, target_boundary)
+            for boundary in boundaries
         )
     )
     receiver = ProspectiveSourceReceiver(
@@ -419,10 +417,9 @@ def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_pa
             },
             frame.raw_bytes,
         )
-        if canonical_boundary is not None and frame.ingest_time_utc in (
-            BOUNDARY + timedelta(seconds=1),
-            target_boundary + timedelta(seconds=1),
-        ):
+        if canonical_boundary is not None and frame.ingest_time_utc in {
+            boundary + timedelta(seconds=1) for boundary in boundaries
+        }:
             boundary = current_boundary
             receiver.process(
                 {
@@ -438,7 +435,17 @@ def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_pa
                 },
                 b"",
             )
+    return journal
 
+
+def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_path):
+    target_boundary = BOUNDARY + timedelta(minutes=15)
+    source = _with_boundary_witnesses(
+        _snapshot(end=target_boundary), (BOUNDARY, target_boundary)
+    )
+    journal = _populate_receiver_journal(
+        tmp_path / "source.sqlite", source, (BOUNDARY, target_boundary)
+    )
     warmup_chunk = journal.warmup_chunk(
         source.session_id,
         after_frame_index=-1,

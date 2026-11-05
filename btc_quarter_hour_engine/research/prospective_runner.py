@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import math
 import os
+import sqlite3
 import time
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, TypeVar
 
 from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
     ClockHealthEvidence,
@@ -40,6 +41,7 @@ from btc_quarter_hour_engine.research.prospective_ledger import (
 from btc_quarter_hour_engine.research.prospective_replay import (
     FeatureReplayCheckpoint,
     FeatureReplayWarmup,
+    IncrementalRawFrameSnapshot,
     accumulate_feature_replay_warmup,
     advance_feature_replay_checkpoint,
     finish_feature_replay_warmup,
@@ -47,7 +49,10 @@ from btc_quarter_hour_engine.research.prospective_replay import (
 )
 from btc_quarter_hour_engine.research.prospective_source import (
     ProspectiveRawFrameJournal,
+    _require_bridge_prediction_health,
 )
+
+_ReadResult = TypeVar("_ReadResult")
 
 try:
     import fcntl
@@ -206,13 +211,18 @@ class BoundaryScheduler:
         self.poll_seconds = poll_seconds
 
     @staticmethod
-    def next_boundary(now: datetime) -> datetime:
+    def most_recent_boundary(now: datetime) -> datetime:
         instant = _utc(now, "scheduler time")
-        minute_floor = instant.replace(
+        return instant.replace(
             minute=instant.minute - instant.minute % 15,
             second=0,
             microsecond=0,
         )
+
+    @staticmethod
+    def next_boundary(now: datetime) -> datetime:
+        instant = _utc(now, "scheduler time")
+        minute_floor = BoundaryScheduler.most_recent_boundary(instant)
         return (
             minute_floor
             if instant == minute_floor
@@ -225,10 +235,14 @@ class BoundaryScheduler:
         instant = _utc(now, "scheduler time")
         return scheduled <= instant <= scheduled + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
 
-    def wait_for_boundary(self, boundary: datetime) -> bool:
+    def wait_for_boundary(
+        self, boundary: datetime, *, should_stop: Callable[[], bool] | None = None
+    ) -> bool:
         """Block without spinning; return False if its deadline has already passed."""
         scheduled = _utc(boundary, "scheduled boundary")
         while True:
+            if should_stop is not None and should_stop():
+                return False
             now = _utc(self.clock.now(), "scheduler clock")
             if now >= scheduled:
                 return self.is_open(scheduled, now)
@@ -318,7 +332,7 @@ class ProspectiveInferenceRunner:
         self,
         config: RunnerConfig,
         *,
-        ledger: ProspectiveLedger,
+        ledger: ProspectiveLedger | None,
         journal: ProspectiveRawFrameJournal,
         model_bundle: FrozenModelBundle | None = None,
         clock: Clock | None = None,
@@ -335,6 +349,7 @@ class ProspectiveInferenceRunner:
             raise ValueError("Injected UTC clock evidence is unavailable in official operation")
         self.config = config
         self.ledger = ledger
+        self._preparation_clock_health = ledger.clock_health if ledger is not None else ClockHealth()
         self.journal = journal
         self.model_bundle = model_bundle
         self.clock_evidence_provider = clock_evidence_provider
@@ -389,6 +404,8 @@ class ProspectiveInferenceRunner:
     def validate_runtime(self) -> ClockHealthEvidence:
         if not self.official_mode:
             raise ValueError("Runtime validation is only defined for explicitly authorized official mode")
+        if self.ledger is None:
+            raise ValueError("Prediction operation requires an immutable ledger")
         if not self.config.operational_authorization_id.strip():
             raise ValueError("Official inference lacks explicit operational authorization")
         if os.environ.get("BTC_QH_PROSPECTIVE_AUTHORIZATION_ID") != self.config.operational_authorization_id:
@@ -490,7 +507,10 @@ class ProspectiveInferenceRunner:
             raise ValueError("Conflicting immutable checkpoints share the same source position")
         path = latest_paths[0]
         checkpoint_type = FeatureReplayWarmup if kind == "warmup" else FeatureReplayCheckpoint
-        checkpoint = checkpoint_type.load_durable(path)
+        try:
+            checkpoint = checkpoint_type.load_durable(path)
+        except (ValueError, OSError) as exc:
+            raise ValueError(f"Checkpoint validation failed for {path.name}: {exc}") from exc
         if (
             checkpoint.session_id != session_id
             or checkpoint.cutoff_utc != latest_identity[0]
@@ -516,13 +536,121 @@ class ProspectiveInferenceRunner:
         metrics["checkpoint_load_ms"] = (time.perf_counter() - started) * 1000
         if checkpoint is not None:
             return checkpoint
+        raise ValueError("missing_ready_checkpoint: run explicit preparation before the boundary")
 
+    def _read_with_retry(
+        self,
+        operation: Callable[[], _ReadResult],
+        *,
+        deadline: datetime,
+        metrics: dict[str, Any],
+    ) -> _ReadResult:
+        """Retry only read contention, never inference, commits or attestations."""
+        for attempt in range(3):
+            if self._stopping:
+                raise RuntimeError("runner_stopping_during_read")
+            if self.scheduler.clock.now() > deadline:
+                raise LatePredictionError("read_deadline_elapsed")
+            try:
+                return operation()
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                transient = (
+                    code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                ) or str(exc) in {"database is locked", "database table is locked"}
+                remaining = (deadline - self.scheduler.clock.now()).total_seconds()
+                if not transient or attempt == 2 or remaining <= 0:
+                    raise
+                metrics["read_retries"] = metrics.get("read_retries", 0) + 1
+                self._preparation_clock_health.now()
+                self._require_fresh_utc_evidence()
+                self.scheduler.waiter.wait(min(self.config.source_poll_seconds, remaining))
+        raise AssertionError("Unreachable read retry state")
+
+    def _validate_source_tail(
+        self, tail: IncrementalRawFrameSnapshot, boundary: datetime
+    ) -> None:
+        if (
+            tail.source_mode != "bridge"
+            or tail.source_certified is not True
+            or tail.clock_health_verified is not True
+            or tail.watermark_utc != boundary
+            or tail.through_boundary_utc != boundary
+            or tail.session_id != self.config.expected_source_session_id
+        ):
+            raise ValueError("invalid_or_substitute_source_fence")
+        _require_bridge_prediction_health(
+            source_mode=tail.source_mode,
+            source_certified=tail.source_certified,
+            producer_health=tail.producer_health,
+            boundary=boundary,
+            session_id=tail.session_id,
+        )
+
+    def prepare_checkpoint(self, boundary_utc: datetime) -> dict[str, Any]:
+        """Explicit pre-window maintenance. Never opens or writes a prediction ledger."""
+        boundary = _utc(boundary_utc, "preparation boundary")
+        if (
+            boundary.minute % 15 or boundary.second or boundary.microsecond
+            or not WINDOW_START <= boundary < WINDOW_END_EXCLUSIVE
+        ):
+            raise ValueError("Preparation requires an exact registered prediction boundary")
+        metrics: dict[str, Any] = {}
+        started = time.perf_counter()
+        with SingleWriterGuard(self.config.prediction_ledger_path):
+            checkpoint = self._prepare_checkpoint_locked(boundary, metrics)
+        return {
+            "mode": "checkpoint_preparation",
+            "ready": True,
+            "boundary_utc": _format_value(boundary),
+            "cutoff_utc": _format_value(checkpoint.cutoff_utc),
+            "source_session_id": checkpoint.session_id,
+            "checkpoint": str(Path(self.config.checkpoint_directory) / _filename("checkpoint", checkpoint)),
+            "integrity_sha256": checkpoint.data["integrity_sha256"],
+            "official_records_written": False,
+            "preparation_ms": (time.perf_counter() - started) * 1000,
+            **metrics,
+        }
+
+    def _check_preparation_time(self, boundary: datetime) -> None:
+        if self._stopping:
+            raise RuntimeError("runner_stopping_during_warmup")
+        self._preparation_clock_health.now()
+        self._require_fresh_utc_evidence()
+        if self.scheduler.clock.now() >= boundary:
+            raise LatePredictionError("checkpoint_preparation_must_finish_before_boundary")
+
+    def _prepare_checkpoint_locked(
+        self, boundary: datetime, metrics: dict[str, Any]
+    ) -> FeatureReplayCheckpoint:
+        self._check_preparation_time(boundary)
         session_id = self.config.expected_source_session_id
+        if self.journal.session_mode(session_id) != "bridge":
+            raise ValueError("Checkpoint preparation requires a bridge source session")
         source_started = self.journal.session_started_at(session_id)
-        assert source_started is not None
+        if source_started is None:
+            raise ValueError("Configured bridge source session is not registered")
         cutoff = boundary - timedelta(minutes=15)
         if source_started > cutoff - timedelta(hours=4):
             raise ValueError("incomplete_four_hour_warmup")
+        ready = self._load_latest_checkpoint(
+            session_id=session_id, kind="checkpoint", cutoff_exact=cutoff,
+        )
+        if ready is not None:
+            witness = self._read_with_retry(
+                lambda: self.journal.tail_snapshot(
+                    session_id, after_frame_index=ready.last_frame_index,
+                    expected_prefix_commitment_sha256=ready.prefix_commitment_sha256,
+                    through_boundary_utc=cutoff, max_tail_frames=1,
+                ),
+                deadline=boundary, metrics=metrics,
+            )
+            self._validate_source_tail(witness, cutoff)
+            if witness.frames or witness.has_more:
+                raise ValueError("Ready checkpoint source prefix is incomplete")
+            self._check_preparation_time(boundary)
+            metrics["recovered_ready_checkpoint"] = True
+            return ready
         warmup = self._load_latest_checkpoint(
             session_id=session_id,
             kind="warmup",
@@ -530,6 +658,9 @@ class ProspectiveInferenceRunner:
         )
         if warmup is not None and not isinstance(warmup, FeatureReplayWarmup):
             warmup = FeatureReplayWarmup.from_dict(warmup.data)
+        metrics["resumed_warmup"] = warmup is not None
+        metrics["warmup_chunks"] = 0
+        metrics["warmup_frames"] = 0
         if warmup is None:
             prefix_index = -1
             prefix_digest = initial_prefix_commitment(session_id, source_started)
@@ -538,16 +669,23 @@ class ProspectiveInferenceRunner:
             prefix_digest = warmup.prefix_commitment_sha256
 
         while not self._stopping:
-            chunk = self.journal.warmup_chunk(
-                session_id,
-                after_frame_index=prefix_index,
-                expected_prefix_commitment_sha256=prefix_digest,
-                through_boundary_utc=cutoff,
-                max_chunk_frames=self.config.warmup_chunk_frames,
+            self._check_preparation_time(boundary)
+            chunk = self._read_with_retry(
+                lambda: self.journal.warmup_chunk(
+                    session_id,
+                    after_frame_index=prefix_index,
+                    expected_prefix_commitment_sha256=prefix_digest,
+                    through_boundary_utc=cutoff,
+                    max_chunk_frames=self.config.warmup_chunk_frames,
+                ),
+                deadline=boundary, metrics=metrics,
             )
+            self._validate_source_tail(chunk, cutoff)
             if chunk.frames:
                 warmup = accumulate_feature_replay_warmup(chunk, cutoff, warmup)
                 _save_checkpoint(Path(self.config.checkpoint_directory), warmup, warmup=True)
+                metrics["warmup_chunks"] += 1
+                metrics["warmup_frames"] += len(chunk.frames)
                 prefix_index = warmup.last_frame_index
                 prefix_digest = warmup.prefix_commitment_sha256
             if not chunk.has_more:
@@ -555,17 +693,23 @@ class ProspectiveInferenceRunner:
                     raise ValueError("incomplete_four_hour_warmup")
                 # Read an empty, fresh completion witness so the last chunk is
                 # not replayed twice by finish_feature_replay_warmup().
-                exhausted = self.journal.warmup_chunk(
-                    session_id,
-                    after_frame_index=prefix_index,
-                    expected_prefix_commitment_sha256=prefix_digest,
-                    through_boundary_utc=cutoff,
-                    max_chunk_frames=self.config.warmup_chunk_frames,
+                exhausted = self._read_with_retry(
+                    lambda: self.journal.warmup_chunk(
+                        session_id,
+                        after_frame_index=prefix_index,
+                        expected_prefix_commitment_sha256=prefix_digest,
+                        through_boundary_utc=cutoff,
+                        max_chunk_frames=self.config.warmup_chunk_frames,
+                    ),
+                    deadline=boundary, metrics=metrics,
                 )
+                self._validate_source_tail(exhausted, cutoff)
                 if exhausted.frames or exhausted.has_more:
                     continue
                 checkpoint = finish_feature_replay_warmup(exhausted, warmup)
+                self._check_preparation_time(boundary)
                 _save_checkpoint(Path(self.config.checkpoint_directory), checkpoint)
+                self._check_preparation_time(boundary)
                 return checkpoint
         raise RuntimeError("runner_stopping_during_warmup")
 
@@ -575,6 +719,7 @@ class ProspectiveInferenceRunner:
         checkpoint: FeatureReplayCheckpoint,
         metrics: dict[str, Any],
     ):
+        assert self.ledger is not None
         session_id = self.config.expected_source_session_id
         started = time.perf_counter()
         fence_started = started
@@ -586,11 +731,17 @@ class ProspectiveInferenceRunner:
                 )
                 continue
             deadline = boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
-            if now >= deadline:
+            if now > deadline:
                 raise LatePredictionError("missed_deadline_waiting_for_exact_source_fence")
             self.ledger.clock_health.now()
             self._require_fresh_utc_evidence()
-            if not self.journal.has_fence_record(session_id, boundary):
+            if not self._read_with_retry(
+                lambda: self.journal.has_fence_record(session_id, boundary),
+                deadline=deadline, metrics=metrics,
+            ):
+                now = self.scheduler.clock.now()
+                if now >= deadline:
+                    raise LatePredictionError("missed_deadline_waiting_for_exact_source_fence")
                 self.scheduler.waiter.wait(
                     min(
                         self.config.source_poll_seconds,
@@ -599,27 +750,25 @@ class ProspectiveInferenceRunner:
                 )
                 continue
             tail_started = time.perf_counter()
-            tail = self.journal.tail_snapshot(
-                session_id,
-                after_frame_index=checkpoint.last_frame_index,
-                expected_prefix_commitment_sha256=checkpoint.prefix_commitment_sha256,
-                through_boundary_utc=boundary,
-                max_tail_frames=self.config.max_tail_frames,
+            tail = self._read_with_retry(
+                lambda: self.journal.tail_snapshot(
+                    session_id,
+                    after_frame_index=checkpoint.last_frame_index,
+                    expected_prefix_commitment_sha256=checkpoint.prefix_commitment_sha256,
+                    through_boundary_utc=boundary,
+                    max_tail_frames=self.config.max_tail_frames,
+                ),
+                deadline=deadline, metrics=metrics,
             )
             metrics["source_fence_availability_ms"] = (time.perf_counter() - fence_started) * 1000
             metrics["source_tail_read_and_verification_ms"] = (time.perf_counter() - tail_started) * 1000
             metrics["source_wait_total_ms"] = (time.perf_counter() - started) * 1000
-            if (
-                tail.source_mode != "bridge"
-                or tail.source_certified is not True
-                or tail.watermark_utc != boundary
-                or tail.session_id != session_id
-            ):
-                raise ValueError("invalid_or_substitute_source_fence")
+            self._validate_source_tail(tail, boundary)
             return tail
         raise RuntimeError("runner_stopped_waiting_for_source_fence")
 
     def _record_failure(self, boundary: datetime, status: str, reason: str) -> None:
+        assert self.ledger is not None
         lifecycle = self.ledger.lifecycle(boundary)
         prediction_committed = lifecycle["prediction"] is not None
         if prediction_committed and status not in {
@@ -655,6 +804,14 @@ class ProspectiveInferenceRunner:
             details={"runner_status": status},
         )
 
+    def _report_failure(
+        self, boundary: datetime, status: str, reason: str, metrics: dict[str, Any]
+    ) -> None:
+        try:
+            self._record_failure(boundary, status, reason)
+        except sqlite3.Error as exc:
+            metrics["failure_record_error"] = f"{type(exc).__name__}:{exc}"
+
     def recover_committed_checkpoint(self, boundary_utc: datetime) -> FeatureReplayCheckpoint:
         """Recover state after a committed prediction without rerunning or re-attesting it.
 
@@ -663,6 +820,8 @@ class ProspectiveInferenceRunner:
         It requires the exact original bridge fence, a trusted prior checkpoint,
         and a ledger prediction; it does not create prediction evidence.
         """
+        if self.ledger is None:
+            raise ValueError("Checkpoint recovery requires an existing immutable ledger")
         if self._writer_lock_held:
             try:
                 return self._recover_committed_checkpoint_locked(boundary_utc)
@@ -687,6 +846,7 @@ class ProspectiveInferenceRunner:
     def _recover_committed_checkpoint_locked(
         self, boundary_utc: datetime
     ) -> FeatureReplayCheckpoint:
+        assert self.ledger is not None
         boundary = _utc(boundary_utc, "checkpoint recovery boundary")
         lifecycle = self.ledger.lifecycle(boundary)
         if lifecycle["prediction"] is None:
@@ -715,12 +875,15 @@ class ProspectiveInferenceRunner:
         return advanced
 
     def process_boundary(self, boundary_utc: datetime) -> BoundaryResult:
+        if not self.official_mode or self.ledger is None:
+            raise ValueError("Prediction processing is unavailable in diagnostic-only mode")
         if self._writer_lock_held:
             return self._process_boundary_locked(boundary_utc)
         with SingleWriterGuard(self.config.prediction_ledger_path):
             return self._process_boundary_locked(boundary_utc)
 
     def _process_boundary_locked(self, boundary_utc: datetime) -> BoundaryResult:
+        assert self.ledger is not None
         boundary = _utc(boundary_utc, "scheduled boundary")
         boundary_started = time.perf_counter()
         if boundary.minute % 15 or boundary.second or boundary.microsecond:
@@ -730,31 +893,40 @@ class ProspectiveInferenceRunner:
         now = _utc(self.scheduler.clock.now(), "runner UTC time")
         if now < boundary:
             return BoundaryResult(boundary, "not_due", "scheduled boundary has not arrived")
-        if now >= boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS):
-            self.ledger.mark_missed_boundaries()
-            return BoundaryResult(boundary, "missed_deadline", "historical boundary is never backfilled")
-        if not self.official_mode:
-            raise ValueError("Prediction processing is unavailable in diagnostic-only mode")
-        if self.model_bundle is None or not is_verified_official_bundle(self.model_bundle):
-            self._record_failure(
-                boundary,
-                "model_verification_failure",
-                "official model bundle is unverified",
-            )
-            return BoundaryResult(boundary, "model_verification_failure", "official model bundle is unverified")
-
-        before = self.ledger.lifecycle(boundary)
-        if before["prediction"] is not None:
-            return BoundaryResult(boundary, "duplicate_prediction", "ledger already contains immutable prediction evidence")
-        if before["status"] in {"missed", "labeled"}:
-            return BoundaryResult(boundary, "missed_deadline", f"boundary lifecycle is already {before['status']}")
-
         result_metrics: dict[str, Any] = {
             "startup_validation_ms": self.startup_validation_ms
         }
         try:
+            # Even unconfirmed/late commits own this identity forever. A later
+            # diagnostic event must not hide an earlier permanent missed event.
+            deadline = boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
+            before = (
+                self.ledger.lifecycle(boundary)
+                if now > deadline
+                else self._read_with_retry(
+                    lambda: self.ledger.lifecycle(boundary),
+                    deadline=deadline, metrics=result_metrics,
+                )
+            )
+            if before["prediction"] is not None:
+                return BoundaryResult(
+                    boundary, "duplicate_prediction",
+                    f"immutable ledger lifecycle: {before['status']}", metrics=result_metrics,
+                )
+            if before["label"] is not None or any(
+                event["event_type"] == "missed" for event in before["events"]
+            ):
+                return BoundaryResult(boundary, "missed_deadline", "boundary is labeled or permanently missed")
+            if self.scheduler.clock.now() > deadline:
+                self.ledger.mark_missed_boundaries()
+                return BoundaryResult(boundary, "missed_deadline", "historical boundary is never backfilled")
+            if self.model_bundle is None or not is_verified_official_bundle(self.model_bundle):
+                self._record_failure(boundary, "model_verification_failure", "official model bundle is unverified")
+                return BoundaryResult(boundary, "model_verification_failure", "official model bundle is unverified")
             runtime_started = time.perf_counter()
-            self.validate_runtime()
+            self._read_with_retry(
+                self.validate_runtime, deadline=deadline, metrics=result_metrics,
+            )
             result_metrics["runtime_validation_ms"] = (
                 time.perf_counter() - runtime_started
             ) * 1000
@@ -777,7 +949,7 @@ class ProspectiveInferenceRunner:
                 ledger=self.ledger,
                 timings=stage_timings,
                 pre_persist_check=lambda: self._require_fresh_utc_evidence(force=True),
-                post_persist_check=lambda: self._require_fresh_utc_evidence(force=True),
+                pre_attestation_check=lambda: self._require_fresh_utc_evidence(force=True),
             )
             result_metrics.update(stage_timings)
             result_metrics["inference_and_ledger_total_ms"] = (
@@ -788,6 +960,14 @@ class ProspectiveInferenceRunner:
                 - evidence["persisted_at_utc"]
             ).total_seconds()
             result_metrics.update(_process_metrics(self.ledger, boundary))
+            clock_alert = None
+            try:
+                self._require_fresh_utc_evidence(force=True)
+            except ClockHealthError as exc:
+                # This is subsequent health, not a revision of the successful
+                # durability decision. Keep evidence and still advance state.
+                clock_alert = str(exc)
+                result_metrics["subsequent_clock_alert"] = clock_alert
             advance_started = time.perf_counter()
             try:
                 advanced = advance_feature_replay_checkpoint(tail, boundary, checkpoint)
@@ -798,7 +978,7 @@ class ProspectiveInferenceRunner:
             except Exception as exc:
                 result_metrics["checkpoint_recovery_required"] = True
                 reason = f"prediction_committed_checkpoint_publication_failed:{type(exc).__name__}:{exc}"
-                self._record_failure(boundary, "checkpoint_recovery_required", reason)
+                self._report_failure(boundary, "checkpoint_recovery_required", reason, result_metrics)
                 result_metrics["total_boundary_completion_ms"] = (
                     time.perf_counter() - boundary_started
                 ) * 1000
@@ -806,7 +986,15 @@ class ProspectiveInferenceRunner:
             result_metrics["total_boundary_completion_ms"] = (
                 time.perf_counter() - boundary_started
             ) * 1000
-            return BoundaryResult(boundary, "predicted", None, evidence, result_metrics)
+            if clock_alert is not None:
+                self._report_failure(
+                    boundary, "clock_sync_failure",
+                    f"post_attestation_alert:{clock_alert}", result_metrics,
+                )
+            return BoundaryResult(
+                boundary, "predicted_clock_alert" if clock_alert else "predicted",
+                clock_alert, evidence, result_metrics,
+            )
         except LatePredictionError as exc:
             reason = str(exc)
             status = (
@@ -818,6 +1006,8 @@ class ProspectiveInferenceRunner:
             status, reason = "duplicate_prediction", str(exc)
         except ClockHealthError as exc:
             status, reason = "clock_sync_failure", str(exc)
+        except sqlite3.Error as exc:
+            status, reason = "ledger_or_source_io_failure", f"{type(exc).__name__}:{exc}"
         except (FileNotFoundError, OSError) as exc:
             status, reason = "checkpoint_or_io_failure", f"{type(exc).__name__}:{exc}"
         except Exception as exc:
@@ -835,9 +1025,12 @@ class ProspectiveInferenceRunner:
             else:
                 status = "inference_or_persistence_failure"
             reason = f"{type(exc).__name__}:{message}"
-        self._record_failure(boundary, status, reason)
+        self._report_failure(boundary, status, reason, result_metrics)
         if _utc(self.scheduler.clock.now(), "runner UTC time") > boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS):
-            self.ledger.mark_missed_boundaries()
+            try:
+                self.ledger.mark_missed_boundaries()
+            except (sqlite3.Error, ClockHealthError) as exc:
+                result_metrics["missed_reconciliation_error"] = f"{type(exc).__name__}:{exc}"
             if status == "waiting_for_source_fence":
                 status = "missing_source_data"
         result_metrics.update(_process_metrics(self.ledger, boundary))
@@ -852,9 +1045,14 @@ class ProspectiveInferenceRunner:
         diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         """Explicit opt-in loop. No caller invokes this merely by importing the module."""
-        if not self.official_mode:
+        if not self.official_mode or self.ledger is None:
             raise ValueError("Diagnostic mode cannot start a scheduler loop")
-        startup_evidence = self.validate_runtime()
+        startup_metrics: dict[str, Any] = {}
+        startup_evidence = self._read_with_retry(
+            self.validate_runtime,
+            deadline=self.scheduler.clock.now() + timedelta(seconds=PREDICTION_DEADLINE_SECONDS),
+            metrics=startup_metrics,
+        )
         with SingleWriterGuard(self.config.prediction_ledger_path):
             self._writer_lock_held = True
             try:
@@ -864,34 +1062,41 @@ class ProspectiveInferenceRunner:
                         "source_session_id": self.config.expected_source_session_id,
                         "clock_evidence_source": startup_evidence.source,
                         "startup_validation_ms": self.startup_validation_ms,
+                        "startup_read_retries": startup_metrics.get("read_retries", 0),
                         "scheduled_boundaries": self.ledger.scheduled_count,
                         "window_start_utc": WINDOW_START.isoformat().replace("+00:00", "Z"),
                         "window_end_exclusive_utc": WINDOW_END_EXCLUSIVE.isoformat().replace("+00:00", "Z"),
                     })
+                boundary = max(
+                    WINDOW_START,
+                    BoundaryScheduler.most_recent_boundary(self.scheduler.clock.now()),
+                )
                 while not self._stopping:
-                    now = _utc(self.scheduler.clock.now(), "runner UTC time")
-                    boundary = BoundaryScheduler.next_boundary(now)
-                    if boundary < WINDOW_START:
-                        boundary = WINDOW_START
-                        if not self.scheduler.wait_for_boundary(boundary):
-                            continue
+                    # Reconciliation is idempotent; no prediction or attestation
+                    # write is retried when source/ledger reads are contended.
+                    try:
+                        self.ledger.mark_missed_boundaries()
+                    except (sqlite3.Error, ClockHealthError) as exc:
+                        if diagnostic_sink is None:
+                            raise
+                        diagnostic_sink({
+                            "event": "missed_reconciliation_failed",
+                            "reason": f"{type(exc).__name__}:{exc}",
+                        })
                     if boundary >= WINDOW_END_EXCLUSIVE:
                         return
-                    if not self.scheduler.wait_for_boundary(boundary):
-                        self.ledger.mark_missed_boundaries()
-                        if diagnostic_sink is not None:
-                            diagnostic_sink(BoundaryResult(
-                                boundary,
-                                "missed_deadline",
-                                "scheduler observed the boundary after T+60; no backfill attempted",
-                            ).as_dict())
-                        continue
-                    # Preserve every expired boundary, including one whose
-                    # final source poll landed exactly on the deadline.
-                    self.ledger.mark_missed_boundaries()
+                    self.scheduler.wait_for_boundary(
+                        boundary, should_stop=lambda: self._stopping,
+                    )
+                    if self._stopping:
+                        return
                     result = self.process_boundary(boundary)
                     if diagnostic_sink is not None:
                         diagnostic_sink(result.as_dict())
+                    boundary = max(
+                        boundary + timedelta(minutes=15),
+                        BoundaryScheduler.most_recent_boundary(self.scheduler.clock.now()),
+                    )
             finally:
                 self._writer_lock_held = False
 
