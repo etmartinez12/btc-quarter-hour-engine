@@ -75,10 +75,17 @@ cannot hold up a later boundary.
 * **Concurrency:** a process-level lock serializes runner ownership of one
   ledger. SQLite's existing immediate transactions remain authoritative for
   writes.
-* **Clock:** chrony evidence is checked for synchronization, normal leap
-  status, offset within 50 ms, and a fresh reference/observation. `ClockHealth`
-  separately detects wall/monotonic jumps. A local `ClockHealth` Boolean or
-  CLI option cannot substitute for chrony evidence.
+* **Clock:** chrony evidence is certified under the shared
+  `chrony-freshness-v1` policy, the same policy used at the source fence. See
+  `prospective-clock-freshness.md`. The policy checks:
+  * synchronization to a reachable selected NTP source, with leap status
+    `Normal`;
+  * offset and estimated error, each within 50 ms;
+  * a reference age within the poll-derived horizon, capped at 1,080 s;
+  * an observation that is at most 5 s old at a forced decision.
+
+  `ClockHealth` separately detects wall/monotonic jumps. A local `ClockHealth`
+  Boolean or a CLI option cannot substitute for chrony evidence.
 
 Restart uses the latest valid durable checkpoint and immutable ledger state.
 On startup, the scheduler floors UTC to the most recent exact quarter-hour,
@@ -381,6 +388,12 @@ registered analysis.
 | Crash after prediction COMMIT, before confirmation | Prediction remains unconfirmed and ineligible across restart; never retrospectively re-attested. |
 | Clock failure observed after successful attestation | A subsequent operational alert (`predicted_clock_alert`), not a rewrite of the earlier durability decision. The prediction and its eligibility remain immutable, and checkpoint advancement is still attempted. |
 
+Each forced check uses the shared `chrony-freshness-v1` policy. The check
+takes a fresh `chronyc -n tracking` / `chronyc -n -c sources` observation and
+evaluates it at the decision time. The policy is described in
+`prospective-clock-freshness.md`. Example: a reference that is fresh at
+pre-persist can pass the 1,060.48 s poll-10 horizon before attestation. The
+prediction is then kept, but it is not attested and is not eligible.
 The gate samples independent UTC health at the durability decision; it is not
 a claim of continuous synchronization before or after that sample. A failure
 to record a subsequent alert is also surfaced in `failure_record_error`; it
@@ -433,7 +446,13 @@ production collector/materializer impact:
    SHA are each refused.
 3. Verify bridge-only operation, exact certified fences, canonical
    eligibility, independent chrony freshness, and source receiver continuity
-   across reconnects and interruptions.
+   across reconnects and interruptions. Capture literal `chronyc -n tracking`
+   and `chronyc -n -c sources` output on the VM. Replace the reconstructed
+   `tests/chrony_fixtures.py` fixture with that output and confirm it is
+   certified. Then observe certification throughout at least one full
+   1,024 s polling cycle. Decide, under separate authorization, whether to
+   accept the fail-closed exposure to lost polls at `maxpoll 10` or to lower
+   `maxpoll`.
 4. Run synthetic and pre-window read-only diagnostics; prove post-T frames
    cannot affect features and target/label data is absent from inference.
 5. Exercise every crash boundary: warm-up continuation, checkpoint link/fsync,

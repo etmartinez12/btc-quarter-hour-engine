@@ -18,8 +18,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol, TypeVar
 
-from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
+from btc_quarter_hour_engine.research.prospective_clock import (
+    CHRONY_CLOCK_POLICY,
     ClockHealthEvidence,
+    evaluate_clock_evidence,
     read_chrony_clock_health,
 )
 from btc_quarter_hour_engine.research.prospective_inference import (
@@ -388,7 +390,6 @@ class ProspectiveInferenceRunner:
         self._writer_lock_held = False
         self.startup_validation_ms = 0.0
         self._last_utc_evidence: ClockHealthEvidence | None = None
-        self._last_utc_evidence_check_monotonic = float("-inf")
         self._verified_implementation: VerifiedImplementation | None = None
 
     @property
@@ -499,31 +500,67 @@ class ProspectiveInferenceRunner:
         return self._require_fresh_utc_evidence(force=True)
 
     def _require_fresh_utc_evidence(self, *, force: bool = False) -> ClockHealthEvidence:
-        monotonic = time.monotonic()
-        if (
-            not force
-            and self._last_utc_evidence is not None
-            and monotonic - self._last_utc_evidence_check_monotonic < 10.0
-        ):
-            evidence = self._last_utc_evidence
-        else:
-            evidence = self.clock_evidence_provider()
-            self._last_utc_evidence = evidence
-            self._last_utc_evidence_check_monotonic = monotonic
+        """Certify UTC under the shared chrony freshness policy.
+
+        Forced checks (startup, before persistence, before durability
+        attestation, after attestation) always take a fresh chrony
+        observation that must be at most 5 s old at the decision. Unforced
+        checks may reuse an observation at most 10 s old on the scheduler
+        clock. Every fresh observation is bracketed by the wall/monotonic jump
+        detector, and certification is recomputed rather than trusted.
+        """
+        policy = CHRONY_CLOCK_POLICY
         now = _utc(self.scheduler.clock.now(), "current UTC time")
-        if (
-            not isinstance(evidence, ClockHealthEvidence)
-            or evidence.verified is not True
-            or evidence.synchronized is not True
-            or evidence.reference_time_utc is None
-            or evidence.leap_status != "Normal"
-            or evidence.offset_seconds is None
-            or not math.isfinite(evidence.offset_seconds)
-            or abs(evidence.offset_seconds) > 0.050
-            or not 0 <= (now - _utc(evidence.observed_at_utc, "chrony observation")).total_seconds() <= 120
-            or not 0 <= (now - _utc(evidence.reference_time_utc, "chrony reference")).total_seconds() <= 120
-        ):
-            raise ClockHealthError("independent_utc_clock_evidence_unavailable_or_stale")
+        evidence = self._last_utc_evidence
+        reuse = False
+        if not force and isinstance(evidence, ClockHealthEvidence):
+            try:
+                cached_age = (
+                    now - _utc(evidence.observed_at_utc, "chrony observation")
+                ).total_seconds()
+            except ValueError:
+                cached_age = None
+            reuse = (
+                cached_age is not None
+                and 0 <= cached_age <= policy.max_cached_observation_age_seconds
+            )
+        if not reuse:
+            self._last_utc_evidence = None
+            self._preparation_clock_health.now()
+            evidence = self.clock_evidence_provider()
+            self._preparation_clock_health.now()
+            now = _utc(self.scheduler.clock.now(), "current UTC time")
+        max_observation_age = (
+            policy.max_decision_observation_age_seconds
+            if force
+            else policy.max_cached_observation_age_seconds
+        )
+        if not isinstance(evidence, ClockHealthEvidence):
+            reasons = ["clock evidence has an invalid type"]
+        else:
+            reasons = list(
+                evaluate_clock_evidence(evidence, decision_utc=now, policy=policy).reasons
+            )
+            if evidence.verified is not True or evidence.synchronized is not True:
+                reasons.append("chrony evidence is not certified")
+            try:
+                observation_age = (
+                    now - _utc(evidence.observed_at_utc, "chrony observation")
+                ).total_seconds()
+            except ValueError:
+                observation_age = None
+            if observation_age is None or not 0 <= observation_age <= max_observation_age:
+                reasons.append("chrony observation is not fresh at the decision")
+            if reasons and isinstance(evidence.reason, str) and evidence.reason:
+                # Reader failures (chronyc unavailable, malformed output).
+                reasons[:0] = evidence.reason.split("; ")
+        if reasons:
+            self._last_utc_evidence = None
+            raise ClockHealthError(
+                "independent_utc_clock_evidence_unavailable_or_stale: "
+                + "; ".join(dict.fromkeys(reasons))
+            )
+        self._last_utc_evidence = evidence
         return evidence
 
     def _load_latest_checkpoint(

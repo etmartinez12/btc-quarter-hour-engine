@@ -20,7 +20,9 @@ import pandas as pd
 import pytest
 from sklearn.ensemble import ExtraTreesClassifier
 
-from btc_quarter_hour_engine.acquisition.prospective_source_bridge import ClockHealthEvidence
+from btc_quarter_hour_engine.research.prospective_clock import (
+    CHRONY_CLOCK_POLICY, ClockHealthEvidence, read_chrony_clock_health,
+)
 from btc_quarter_hour_engine.research import prospective_inference as inference
 from btc_quarter_hour_engine.research import prospective_provenance as provenance
 from btc_quarter_hour_engine.research import prospective_runner as runner_module
@@ -42,7 +44,30 @@ from tests.test_prospective_replay import (
     _populate_receiver_journal, _snapshot, _with_boundary_witnesses,
     publication_platform,
 )
+from tests.chrony_fixtures import chrony_evidence
 from tests.test_prospective_runner import START, _config
+
+
+CHRONY_FAILURES = {
+    "unsynchronised": {"verified": False},
+    "stale_reference": {"reference_age": 1100.0, "last_rx": 10},
+    "source_lost": {"reach": "376"},
+    "excessive_offset": {"system_time": "0.050100000 seconds fast"},
+    "excessive_error": {"root_delay": "0.080000000", "root_dispersion": "0.020000000"},
+    "future_reference": {"reference_age": -5.0, "last_rx": 0},
+    "clock_jump": {"divergence": 0.2},
+    "unavailable": None,
+}
+CHRONY_FAILURE_REASONS = {
+    "unsynchronised": "leap status is not Normal",
+    "stale_reference": "chrony reference evidence is stale",
+    "source_lost": "selected source missed its most recent poll",
+    "excessive_offset": "system offset exceeds tolerance",
+    "excessive_error": "estimated error exceeds tolerance",
+    "future_reference": "reference time is in the future",
+    "clock_jump": "wall clock jumped while chrony evidence was observed",
+    "unavailable": "chronyc -n tracking unavailable: FileNotFoundError",
+}
 
 
 class TestClock:
@@ -52,6 +77,10 @@ class TestClock:
         self.value = value
         self.elapsed = 0.0
         self.healthy = True
+        self.failure = None
+        self.reference_age = 1.0
+        self.reference_time = None
+        self.observations = 0
 
     def now(self):
         return self.value
@@ -63,12 +92,24 @@ class TestClock:
     def move_to(self, value):
         self.advance((value - self.value).total_seconds())
 
-    def evidence(self):
-        return ClockHealthEvidence(
-            observed_at_utc=self.value, synchronized=self.healthy,
-            verified=self.healthy, offset_seconds=0.001,
-            reference_time_utc=self.value, leap_status="Normal",
-            source="isolated runner test clock",
+    def evidence(self) -> ClockHealthEvidence:
+        # Real chronyc text through the real parser and shared policy.
+        self.observations += 1
+        failure = self.failure or (None if self.healthy else "unsynchronised")
+        if failure == "unavailable":
+            def missing(command, **kwargs):
+                raise FileNotFoundError(command[0])
+
+            return read_chrony_clock_health(
+                now_fn=self.now, monotonic_fn=lambda: self.elapsed, runner=missing,
+            )
+        age = (
+            self.reference_age
+            if self.reference_time is None
+            else (self.value - self.reference_time).total_seconds()
+        )
+        return chrony_evidence(
+            self.value, **{"reference_age": age, **(CHRONY_FAILURES[failure] if failure else {})},
         )
 
 
@@ -176,7 +217,7 @@ def engine_factory(tmp_path, monkeypatch, publication_platform):
     monkeypatch.setattr(provenance, "verify_runtime_implementation", verified_test_checkout)
     engines = []
 
-    def create(*, prepare=True, clock_verified=True, incomplete=False):
+    def create(*, prepare=True, clock_verified=True, incomplete=False, source_clock_reference_age=1.0):
         root = tmp_path / f"engine-{len(engines)}"
         root.mkdir()
         config = replace(
@@ -193,6 +234,7 @@ def engine_factory(tmp_path, monkeypatch, publication_platform):
         )
         writer = _populate_receiver_journal(
             config.source_journal_path, source, boundaries, clock_verified=clock_verified,
+            clock_reference_age=source_clock_reference_age,
         )
         clock = TestClock(START - timedelta(seconds=5))
         monkeypatch.setattr(runner_module, "read_chrony_clock_health", clock.evidence)
@@ -435,6 +477,116 @@ def test_independent_utc_health_at_each_durability_stage(engine_factory, monkeyp
     else:
         assert result.status == "clock_sync_failure"
         assert state["durability_attestation"] is None
+
+
+@pytest.mark.parametrize("failure", sorted(CHRONY_FAILURES))
+@pytest.mark.parametrize("stage", ["before_write", "before_attestation", "after_attestation"])
+def test_shared_chrony_policy_governs_each_durability_decision(engine_factory, monkeypatch, stage, failure):
+    engine = engine_factory()
+    engine.clock.move_to(START + timedelta(seconds=2))
+    original_infer = inference.infer_causal_prediction
+    original_insert = engine.ledger._insert_event
+    original_append = engine.ledger.append_prediction
+
+    def infer(*args, **kwargs):
+        evidence = original_infer(*args, **kwargs)
+        if stage == "before_write":
+            engine.clock.failure = failure
+        return evidence
+
+    def insert(boundary, event_type, *args, **kwargs):
+        original_insert(boundary, event_type, *args, **kwargs)
+        if stage == "before_attestation" and event_type == "prediction_recorded":
+            engine.clock.failure = failure
+
+    def append(*args, **kwargs):
+        evidence = original_append(*args, **kwargs)
+        if stage == "after_attestation":
+            engine.clock.failure = failure
+        return evidence
+
+    monkeypatch.setattr(inference, "infer_causal_prediction", infer)
+    monkeypatch.setattr(engine.ledger, "_insert_event", insert)
+    monkeypatch.setattr(engine.ledger, "append_prediction", append)
+    result = engine.runner.process_boundary(START)
+    state = engine.ledger.lifecycle(START)
+    assert CHRONY_FAILURE_REASONS[failure] in result.reason
+    if stage == "after_attestation":
+        # A later failure is an operational alert; it cannot revoke evidence
+        # that was already certified and attested in time.
+        assert result.status == "predicted_clock_alert"
+        assert state["evaluation_eligible"] is True
+        assert state["durability_attestation"] is not None
+    else:
+        assert result.status == "clock_sync_failure"
+        assert state["evaluation_eligible"] is False
+        assert state["durability_attestation"] is None
+        assert (state["prediction"] is None) is (stage == "before_write")
+
+
+def test_mid_poll_chrony_reference_age_remains_certified_and_eligible(engine_factory):
+    # Ubuntu/GCE acceptance: ~1,033 s between chrony updates at poll 10.
+    engine = engine_factory(source_clock_reference_age=1033.0)
+    engine.clock.reference_age = 1033.0
+    engine.clock.move_to(START + timedelta(seconds=2))
+    result = engine.runner.process_boundary(START)
+    state = engine.ledger.lifecycle(START)
+    assert result.status == "predicted"
+    assert state["evaluation_eligible"] is True
+    assert state["prediction"]["clock_health_verified"] == 1
+    assert state["durability_attestation"]["clock_health_verified"] == 1
+
+
+def test_reference_crossing_the_freshness_horizon_during_write_blocks_attestation(
+    engine_factory, monkeypatch,
+):
+    horizon = CHRONY_CLOCK_POLICY.reference_age_horizon(10)
+    engine = engine_factory()
+    engine.clock.move_to(START + timedelta(seconds=2))
+    # Fresh (1,059 s < 1,060.48 s) at pre-persist, stale (1,062 s) at attestation.
+    engine.clock.reference_time = engine.clock.value - timedelta(seconds=1059)
+    original_insert = engine.ledger._insert_event
+
+    def insert(boundary, event_type, *args, **kwargs):
+        original_insert(boundary, event_type, *args, **kwargs)
+        if event_type == "prediction_recorded":
+            engine.clock.advance(3)
+
+    monkeypatch.setattr(engine.ledger, "_insert_event", insert)
+    observations = engine.clock.observations
+    result = engine.runner.process_boundary(START)
+    state = engine.ledger.lifecycle(START)
+    assert 1059 < horizon < 1062
+    assert engine.clock.observations - observations >= 2
+    assert result.status == "clock_sync_failure"
+    assert CHRONY_FAILURE_REASONS["stale_reference"] in result.reason
+    assert state["prediction"] is not None
+    assert state["durability_attestation"] is None
+    assert state["evaluation_eligible"] is False
+
+
+def test_clock_freshness_evidence_does_not_change_features_or_predictions(engine_factory):
+    fresh = engine_factory()
+    mid_poll = engine_factory(source_clock_reference_age=1033.0)
+    mid_poll.clock.reference_age = 1000.0
+    rows = []
+    for engine in (fresh, mid_poll):
+        engine.clock.move_to(START + timedelta(seconds=2))
+        assert engine.runner.process_boundary(START).status == "predicted"
+        rows.append(engine.ledger.lifecycle(START)["prediction"])
+    fields = (
+        "target_utc", "source_watermark_utc", "source_frame_count",
+        "excluded_ingest_future_count", "excluded_event_future_count",
+        "feature_contract", "feature_family_contract", "feature_fingerprint",
+        "candidate_predictors_json", "control_predictors_json", "feature_vector_json",
+        "candidate_model_sha256", "control_model_sha256", "candidate_probability",
+        "candidate_prediction", "control_probability", "control_prediction",
+        "baseline_prediction",
+    )
+    assert {name: rows[0][name] for name in fields} == {name: rows[1][name] for name in fields}
+    assert rows[0]["source_watermark_utc"] == rows[0]["boundary_utc"]
+    assert rows[0]["baseline_prediction"] == 0
+    assert "target" not in json.dumps(json.loads(rows[0]["feature_vector_json"])).lower()
 
 
 def test_commit_crossing_deadline_is_durable_but_ineligible(engine_factory, monkeypatch):

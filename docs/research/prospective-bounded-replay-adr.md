@@ -218,13 +218,29 @@ candidates, 4096 heartbeat buckets, 100,000 active book levels, and an 8 MiB
 checkpoint). Exceeding a bound invalidates certification but is isolated from
 canonical collection.
 
-Clock synchronization is a separate receiver-side check using read-only
-`chronyc tracking` evidence. By default it requires a `Normal` leap status,
-absolute system offset no greater than 50 ms, and a reference observation no
-older than 120 seconds. Missing `chronyc`, unparseable evidence, future or
-stale reference time, and unhealthy status persist as unverified clock
-evidence; they never become verified from producer health or clock drift
-alone. Completeness, clock status, heartbeat health, sequence integrity, and
+Clock synchronization is a separate receiver-side check. At each fence, the
+receiver takes a fresh read-only observation with `chronyc -n tracking` and
+`chronyc -n -c sources`. The journal then re-evaluates it under the shared
+`chrony-freshness-v1` policy (see `prospective-clock-freshness.md`). The policy
+requires all of the following:
+
+* `Normal` leap status;
+* absolute system offset no greater than 50 ms;
+* estimated error no greater than 50 ms;
+* a reachable selected NTP source that answered its most recent poll;
+* a reference age no greater than `min(1,080 s, 2**poll * 1.02 + 16 s)`.
+
+These conditions fail closed and are persisted as unverified clock evidence:
+
+* `chronyc` is missing;
+* the evidence is malformed or conflicting;
+* the reference time is in the future or stale;
+* the source is lost;
+* a clock jump occurs during the read;
+* the clock status is otherwise unhealthy.
+
+Unverified evidence never becomes verified from producer health or clock drift
+alone. Forged verified evidence is rejected. Completeness, clock status, heartbeat health, sequence integrity, and
 order-book synchronization remain separate signals. The bounded replay still
 enforces its own sequence, timestamp, snapshot, and synchronized-book
 requirements before feature readiness.

@@ -61,7 +61,9 @@ that watermark may be appended, and watermarks must advance strictly. This
 preserves already-issued snapshots against backdated additions. The legacy
 `advance_watermark()` API remains an offline adapter that accepts an explicit
 caller assertion. The bridge instead uses the fenced-watermark API and records
-the fence, producer-health evidence, and separately evaluated chrony status.
+the fence, producer-health evidence, and chrony status. The chrony status is
+evaluated separately under the shared `chrony-freshness-v1` policy (see
+`prospective-clock-freshness.md`).
 Those local checks are not a production host or filesystem durability
 attestation; independent VM validation is still an activation prerequisite.
 
@@ -143,8 +145,10 @@ produce or persist an eligible prediction.
 
 The SQLite `ClockHealth` monitor detects wall-clock regressions and wall versus
 monotonic-clock jumps after its baseline check. It does not independently verify
-NTP/chrony synchronization or absolute UTC accuracy. Production operation must
-add and validate that external host-time health signal before activation.
+NTP/chrony synchronization or absolute UTC accuracy. The bridge and runner
+supply that external signal through the shared `chrony-freshness-v1` policy
+(see `prospective-clock-freshness.md`). It must still be validated on the
+isolated VM before activation.
 
 ## Offline dry run
 

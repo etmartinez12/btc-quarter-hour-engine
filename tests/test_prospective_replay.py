@@ -16,10 +16,7 @@ from btc_quarter_hour_engine.research.prospective_source import (
     RawFrameSnapshot,
     build_causal_feature_vector,
 )
-from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
-    ClockHealthEvidence,
-    ProspectiveSourceReceiver,
-)
+from btc_quarter_hour_engine.acquisition.prospective_source_bridge import ProspectiveSourceReceiver
 from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
 from btc_quarter_hour_engine.research.model_freeze import OFFICIAL_STATUS, frozen_predictors
 from btc_quarter_hour_engine.research.prospective_contract import (
@@ -46,6 +43,7 @@ from btc_quarter_hour_engine.research.prospective_replay import (
     finish_feature_replay_warmup,
     initial_prefix_commitment,
 )
+from tests.chrony_fixtures import chrony_evidence
 
 
 UTC = timezone.utc
@@ -302,18 +300,16 @@ def test_chunked_warmup_is_restartable_bounded_and_matches_full_replay(tmp_path,
     assert actual.feature_fingerprint == expected.feature_fingerprint
 
 
-def _populate_receiver_journal(path, source, boundaries, *, clock_verified=True):
+def _populate_receiver_journal(
+    path, source, boundaries, *, clock_verified=True, clock_reference_age=1.0
+):
     journal = ProspectiveRawFrameJournal(path)
     clock_values = iter(
         (
-            ClockHealthEvidence(
-                observed_at_utc=boundary + timedelta(seconds=2),
-                synchronized=clock_verified,
+            chrony_evidence(
+                boundary + timedelta(seconds=2),
                 verified=clock_verified,
-                offset_seconds=0.001 if clock_verified else None,
-                reference_time_utc=boundary + timedelta(seconds=1) if clock_verified else None,
-                leap_status="Normal" if clock_verified else None,
-                source="synthetic test evidence",
+                reference_age=clock_reference_age,
             )
             for boundary in boundaries
         )
