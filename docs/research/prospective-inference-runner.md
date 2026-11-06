@@ -123,8 +123,15 @@ directory and do not point at production files for tests):
 }
 ```
 
-**Configuration and model validation only** (loads/verifies artifacts, creates
-no ledger and does not infer):
+For an installed-wheel deployment, also set
+`"implementation_attestation_path"` (absolute path) and
+`"implementation_attestation_sha256"` (the reviewed pin); see
+[Runtime implementation provenance](#runtime-implementation-provenance).
+Both are omitted (or `null`) for Git-checkout execution.
+
+**Configuration and model validation only** (verifies the executing
+implementation's provenance, loads/verifies artifacts, creates no ledger and
+does not infer):
 
 ```powershell
 btc-qh-prospective-inference-runner validate --config .\runner.json
@@ -187,7 +194,11 @@ authorization ID matching the reviewed configuration and a second deployment
 acknowledgement. The host environment must independently provide the same
 authorization via `BTC_QH_PROSPECTIVE_AUTHORIZATION_ID`; it is not a clock
 health assertion. It must also set `BTC_QH_IMPLEMENTATION_GIT_SHA` to the
-reviewed implementation SHA. Example syntax only—**do not run until all
+reviewed implementation SHA. That variable is only an operator
+acknowledgement: before opening the ledger, official mode independently
+verifies the executing code (see
+[Runtime implementation provenance](#runtime-implementation-provenance)) and
+refuses to start if it cannot. Example syntax only—**do not run until all
 activation gates are separately approved**:
 
 ```powershell
@@ -201,6 +212,118 @@ btc-qh-prospective-inference-runner official --config .\runner.json `
 Official mode is not used by tests or by this implementation task. No CLI
 smoke test invokes it.
 
+## Runtime implementation provenance
+
+The ledger's `implementation_git_sha` must describe the code that is actually
+executing. `RunnerConfig.implementation_git_sha` is the reviewed
+*expectation*; the identity written to the ledger comes only from
+`prospective_provenance.verify_runtime_implementation()`, which inspects the
+imported `btc_quarter_hour_engine` package locally (no GitHub or other network
+access). Matching environment variables are never treated as proof. There
+are exactly two accepted modes; anything else fails closed.
+
+**Git-checkout mode** (no attestation configured). The imported package
+directory must be the top-level package of a Git work tree, and:
+
+1. `git rev-parse --show-toplevel` must be that package's parent directory.
+   Inherited `GIT_*` environment variables (for example `GIT_DIR`) are
+   removed so they cannot redirect the check.
+2. `HEAD` must be exactly the expected 40-hex commit.
+3. `git status --porcelain=v1 --untracked-files=all --ignore-submodules=none`
+   must be empty for the **whole** checkout (modified, staged, deleted,
+   renamed and untracked files all fail). Keep runtime data such as ledgers,
+   journals, checkpoints and logs outside the checkout.
+4. No index entry may be flagged assume-unchanged or skip-worktree.
+5. Every regular file in the package must hash, in Python, to the blob
+   recorded for it in `HEAD` (LF/CRLF checkout normalization is accepted), and
+   the package file set must equal the tracked set. This independently
+   detects edits that `git status` was made to overlook. Links, special
+   files, and anything except `.pyc` files inside `__pycache__` are refused.
+
+**Installed-wheel mode** (attestation configured). Git metadata is not
+assumed. The required deployment artifact is an **implementation
+attestation** JSON (`schema: "btc-qh-implementation-attestation/v1"`) produced
+at build time by `attest-build` from a clean, verified checkout. It records
+the distribution, version, package, Git SHA, wheel filename, wheel SHA256,
+every package file's SHA256 and size, and a package content digest. The
+reviewed configuration pins the attestation's own SHA256. At runtime:
+
+1. The attestation file's SHA256 must equal the pin before it is parsed;
+   parsing then rejects duplicate keys, non-finite numbers, unknown or missing
+   fields, a different package, or an inconsistent digest.
+2. The attested Git SHA must equal the expected implementation SHA.
+3. The installed package files must equal the attested inventory exactly (no
+   extra, missing, or changed files).
+4. Exactly one installed distribution must own the package, with a matching
+   version and a `RECORD` whose package entries agree with the attestation.
+   An editable install is refused (use Git-checkout mode), and a recorded
+   `direct_url.json` archive hash must equal the attested wheel SHA256.
+
+Without a configured attestation, a package outside a Git checkout is
+**unverifiable** and refused. A partial attestation configuration (path
+without pin, or pin without path) is refused. Until the attestation artifact
+exists and its SHA256 is pinned in the reviewed configuration, wheel
+execution fails closed.
+
+**Loaded modules (both modes).** Every already-imported
+`btc_quarter_hour_engine` module, including the package itself and a package
+`__main__`, must have been imported by the source loader from a file in the
+verified set, with consistent `__file__`/origin and an unaltered package search
+path. Modules from another location, extension or sourceless loaders, and
+unchecked hash-based `.pyc` caches are refused. Timestamp-based `.pyc`
+validation is left to CPython.
+
+**Binding and rechecks.** The first verification occurs in `validate`, at
+`official` startup before the ledger is opened, in `prepare`, and in
+committed-checkpoint recovery. The runner keeps the verified identity and
+rechecks it once per boundary before inference (package location, every file
+hash/size, and the loaded-module set). The ledger's `implementation_git_sha`
+for each prediction is the verified identity's SHA. Checkpoint preparation
+reports also include the mode and package content digest. Any failure
+returns `implementation_provenance_failure`, writes an `inference_failed`
+diagnostic event, and creates no prediction. It is not retried, and drift
+after startup blocks every later boundary.
+
+Commands (they verify and print JSON only: no model load, source read, ledger
+or prediction write):
+
+```powershell
+# Git checkout: verify the executing checkout.
+btc-qh-prospective-inference-runner verify-implementation `
+  --implementation-git-sha "<reviewed SHA>"
+
+# Build host, from a fresh clean checkout of the reviewed commit:
+Remove-Item -Recurse -Force .\build -ErrorAction SilentlyContinue
+python -m pip wheel . --no-deps --no-build-isolation -w <dist directory>
+btc-qh-prospective-inference-runner attest-build `
+  --wheel <dist directory>\btc_quarter_hour_engine-0.1.0-py3-none-any.whl `
+  --output <artifact directory>\implementation-attestation.json `
+  --implementation-git-sha "<reviewed SHA>"
+
+# Target VM, after installing that exact wheel:
+btc-qh-prospective-inference-runner verify-implementation `
+  --implementation-git-sha "<reviewed SHA>" `
+  --attestation <absolute path>\implementation-attestation.json `
+  --attestation-sha256 "<attestation_sha256 from attest-build>"
+```
+
+`attest-build` runs from the verified Git checkout, requires the wheel's
+package contents to match that checkout byte for byte, and writes the
+attestation exclusively (an existing output is never overwritten). Its
+`attestation_sha256` output is the value to review and pin. Remove stale
+`build/` output before building, because setuptools can otherwise copy files
+that are no longer in the checkout (the content check then fails). The
+package content digest depends on line endings, so a CRLF checkout and an LF
+build differ; only the Git SHA is written to prediction evidence.
+
+Limitations: this is self-verification by the running process. It detects
+an unexpected commit, modified/extra/missing source, a mismatched installed
+package and an unverifiable identity. It does not protect against someone
+able to modify the interpreter, this verifier, the attestation pin in the
+reviewed configuration, or third-party dependencies; host access control and
+the frozen environment remain responsible for those. Git
+`safe.directory`/ownership refusals fail closed.
+
 ## Failure classification and diagnostics
 
 The one-boundary result distinguishes `not_due`, `predicted`,
@@ -208,6 +331,7 @@ The one-boundary result distinguishes `not_due`, `predicted`,
 `prediction_committed_checkpoint_recovery_required`, `waiting_for_source_fence`,
 `missing_source_data`, `invalid_source_health`, `checkpoint_failure`,
 `clock_sync_failure`, `model_verification_failure`,
+`implementation_provenance_failure`,
 `inference_or_persistence_failure`, `ledger_or_source_io_failure`,
 `duplicate_prediction`, `late_prediction`,
 and `missed_deadline`. Existing ledger event types are reused; the ledger
@@ -280,29 +404,39 @@ production collector/materializer impact:
 
 1. Validate official artifact SHA256s and dependency/Python versions against
    the freeze manifest.
-2. Verify bridge-only operation, exact certified fences, canonical
+2. Establish implementation provenance on the VM. For wheel execution, build
+   the wheel from a fresh clean checkout of the reviewed commit, run
+   `attest-build`, review and pin `implementation_attestation_path`/
+   `implementation_attestation_sha256`, install exactly that wheel
+   (not editable), and confirm `verify-implementation` reports the reviewed
+   SHA in `installed_artifact` mode. For checkout execution, confirm a clean
+   checkout with runtime data outside it reports `git_checkout` mode. Also
+   confirm that a modified installed file, a wrong pin, and a wrong expected
+   SHA are each refused.
+3. Verify bridge-only operation, exact certified fences, canonical
    eligibility, independent chrony freshness, and source receiver continuity
    across reconnects and interruptions.
-3. Run synthetic and pre-window read-only diagnostics; prove post-T frames
+4. Run synthetic and pre-window read-only diagnostics; prove post-T frames
    cannot affect features and target/label data is absent from inference.
-4. Exercise every crash boundary: warm-up continuation, checkpoint link/fsync,
+5. Exercise every crash boundary: warm-up continuation, checkpoint link/fsync,
    prediction transaction, attestation, restart reconciliation, and
    checkpoint-advance failure after a successful prediction.
-5. Run representative official-model inference and storage durability
+6. Run representative official-model inference and storage durability
    benchmarks on the target VM. Record stage median/p95/p99/max, RSS, backlog,
    clock evidence, disk/filesystem semantics, and measured T+60 margin. Repeat
    under realistic source load and collection interruption. Synthetic
    timings do not qualify.
-6. Confirm the collector and canonical materializer remain unchanged, test
+7. Confirm the collector and canonical materializer remain unchanged, test
    graceful shutdown/restart, and verify no duplicate or retroactively timely
    predictions can be written.
-7. Approve deployment separately and create any service configuration only
+8. Approve deployment separately and create any service configuration only
    through the normal production change process. This PR creates no enabled
    service, timer, cron entry, or collector hook.
 
 This implementation has not received independent VM or production acceptance.
 The source bridge's host/socket/disk properties, production chrony, genuine
-frozen model load/inference latency, filesystem durability and deployment
+frozen model load/inference latency, filesystem durability, the reviewed
+implementation attestation (for wheel execution) and deployment
 authorization remain prerequisites. In particular, the existing immutable
 checkpoint publisher currently requires POSIX directory `fsync`; Windows
 local development cannot attest checkpoint publication and must fail closed.

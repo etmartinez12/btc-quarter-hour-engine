@@ -22,6 +22,7 @@ from sklearn.ensemble import ExtraTreesClassifier
 
 from btc_quarter_hour_engine.acquisition.prospective_source_bridge import ClockHealthEvidence
 from btc_quarter_hour_engine.research import prospective_inference as inference
+from btc_quarter_hour_engine.research import prospective_provenance as provenance
 from btc_quarter_hour_engine.research import prospective_runner as runner_module
 from btc_quarter_hour_engine.research.model_freeze import OFFICIAL_STATUS, frozen_predictors
 from btc_quarter_hour_engine.research.prospective_contract import (
@@ -156,6 +157,23 @@ def engine_factory(tmp_path, monkeypatch, publication_platform):
         }
 
     monkeypatch.setattr(inference, "load_frozen_models", disk_loader)
+    # Test-only implementation identity: the real Git/attestation verification
+    # is exercised in test_prospective_provenance. The runner's per-boundary
+    # recheck of the executing package still runs unmodified here.
+    package_root = provenance.imported_package_root()
+    package_files = provenance.snapshot_package_files(package_root)
+
+    def verified_test_checkout(expected, *, attestation_path=None, attestation_sha256=None, modules=None):
+        return provenance.VerifiedImplementation(
+            mode=provenance.MODE_GIT_CHECKOUT,
+            git_sha=provenance.require_git_sha(expected),
+            package_root=package_root,
+            files=package_files,
+            package_content_sha256=provenance.package_content_digest(package_files),
+            source_root=package_root.parent,
+        )
+
+    monkeypatch.setattr(provenance, "verify_runtime_implementation", verified_test_checkout)
     engines = []
 
     def create(*, prepare=True, clock_verified=True, incomplete=False):
@@ -814,3 +832,151 @@ def test_failed_subsequent_alert_logging_retains_successful_evidence(engine_fact
     assert result.evidence["timing_eligible"] is True
     assert "failure_record_error" in result.metrics
     assert engine.ledger.lifecycle(START)["evaluation_eligible"] is True
+
+
+_PROVENANCE_FAILURES = {
+    "unexpected_commit": "executing checkout HEAD " + "c" * 40 + " does not match expected implementation",
+    "modified_source": "Git working tree is not clean:  M btc_quarter_hour_engine/research/prospective_runner.py",
+    "mismatched_installed_package": "installed package files differ from attestation",
+    "unverifiable": "executing package is not in a Git checkout and no implementation attestation is "
+    "configured; implementation identity is unverifiable",
+}
+
+
+def _substitute_verifier(kind):
+    def verifier(expected, *, attestation_path=None, attestation_sha256=None, modules=None):
+        if kind == "mismatched_identity":
+            root = provenance.imported_package_root()
+            files = provenance.snapshot_package_files(root)
+            return provenance.VerifiedImplementation(
+                mode=provenance.MODE_GIT_CHECKOUT, git_sha="b" * 40, package_root=root,
+                files=files, package_content_sha256=provenance.package_content_digest(files),
+            )
+        raise provenance.ImplementationProvenanceError(_PROVENANCE_FAILURES[kind])
+
+    return verifier
+
+
+def _write_cli_config(engine):
+    path = engine.config.checkpoint_directory.parent / "runner.json"
+    path.write_text(json.dumps({
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in engine.config.__dict__.items()
+    }), encoding="utf-8")
+    return path
+
+
+def test_ledger_binds_the_independently_verified_implementation(engine_factory):
+    engine = engine_factory()
+    identity = engine.runner.verified_implementation
+    assert identity is not None and identity.mode == provenance.MODE_GIT_CHECKOUT
+    assert engine.preparation_report["implementation_git_sha"] == identity.git_sha
+    assert engine.preparation_report["implementation_provenance_mode"] == identity.mode
+    assert engine.preparation_report["implementation_package_sha256"] == identity.package_content_sha256
+    engine.clock.move_to(START + timedelta(seconds=2))
+    reports = engine.run(2)
+    assert [report["status"] for report in reports] == ["predicted", "predicted"]
+    for report, boundary in zip(reports, (START, START + timedelta(minutes=15))):
+        assert report["metrics"]["implementation_git_sha"] == identity.git_sha
+        assert report["metrics"]["implementation_provenance_mode"] == identity.mode
+        row = engine.ledger.lifecycle(boundary)["prediction"]
+        assert row["implementation_git_sha"] == identity.git_sha == engine.config.implementation_git_sha
+
+
+@pytest.mark.parametrize(
+    "kind", [*sorted(_PROVENANCE_FAILURES), "mismatched_identity"],
+)
+def test_unverified_implementation_fails_closed_without_prediction(engine_factory, monkeypatch, kind):
+    engine = engine_factory(prepare=False)
+    # The operator acknowledgement still matches; it is not proof of identity.
+    assert os.environ["BTC_QH_IMPLEMENTATION_GIT_SHA"] == engine.config.implementation_git_sha
+    monkeypatch.setattr(provenance, "verify_runtime_implementation", _substitute_verifier(kind))
+    with pytest.raises(provenance.ImplementationProvenanceError):
+        engine.runner.prepare_checkpoint(START)
+    assert not any(engine.config.checkpoint_directory.glob("*.json"))
+    with pytest.raises(provenance.ImplementationProvenanceError):
+        engine.runner.validate_runtime()
+    engine.clock.move_to(START + timedelta(seconds=2))
+    result = engine.runner.process_boundary(START)
+    assert result.status == "implementation_provenance_failure"
+    assert result.reason.startswith("ImplementationProvenanceError:")
+    assert result.evidence is None
+    state = engine.ledger.lifecycle(START)
+    assert state["prediction"] is None
+    assert [event["event_type"] for event in state["events"]] == ["inference_failed"]
+    with pytest.raises(provenance.ImplementationProvenanceError):
+        engine.runner.run_forever()
+    assert engine.runner.verified_implementation is None
+
+
+@pytest.mark.parametrize("drift", ["modified_package_file", "foreign_package_module"])
+def test_implementation_drift_after_startup_blocks_later_boundaries(engine_factory, monkeypatch, tmp_path, drift):
+    import importlib.util
+    import sys
+
+    engine = engine_factory()
+    engine.clock.move_to(START + timedelta(seconds=2))
+    assert engine.runner.process_boundary(START).status == "predicted"
+    first = engine.ledger.lifecycle(START)
+    if drift == "modified_package_file":
+        original = provenance.snapshot_package_files
+
+        def drifted(root):
+            files = list(original(root))
+            path, _, size = files[-1]
+            files[-1] = (path, "0" * 64, size)
+            return tuple(files)
+
+        monkeypatch.setattr(provenance, "snapshot_package_files", drifted)
+        expected = "package files changed after verification"
+    else:
+        rogue = tmp_path / "rogue.py"
+        rogue.write_text("VALUE = 1\n", encoding="utf-8")
+        name = "btc_quarter_hour_engine.research._unverified_rogue"
+        spec = importlib.util.spec_from_file_location(name, rogue)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        monkeypatch.setitem(sys.modules, name, module)
+        expected = "originates outside the verified package"
+    second = START + timedelta(minutes=15)
+    engine.clock.move_to(second + timedelta(seconds=2))
+    result = engine.runner.process_boundary(second)
+    assert result.status == "implementation_provenance_failure"
+    assert expected in result.reason
+    assert engine.ledger.lifecycle(second)["prediction"] is None
+    assert engine.ledger.lifecycle(START) == first
+
+
+def test_official_and_validate_cli_refuse_unverified_implementation(engine_factory, monkeypatch, capsys):
+    from btc_quarter_hour_engine.research import prospective_runner_cli as cli
+
+    engine = engine_factory(prepare=False)
+    config_path = _write_cli_config(engine)
+    engine.ledger.close()
+    engine.config.prediction_ledger_path.unlink()
+    monkeypatch.setattr(provenance, "verify_runtime_implementation", _substitute_verifier("unexpected_commit"))
+    assert cli.main([
+        "official", "--config", str(config_path),
+        "--authorization-id", engine.config.operational_authorization_id,
+        "--confirm-authorized-deployment",
+    ]) == 2
+    assert "ImplementationProvenanceError" in capsys.readouterr().err
+    assert not engine.config.prediction_ledger_path.exists()
+    assert cli.main(["validate", "--config", str(config_path)]) == 2
+    assert "does not match expected implementation" in capsys.readouterr().err
+    assert not engine.config.prediction_ledger_path.exists()
+
+
+def test_verify_implementation_cli_reports_identity_without_side_effects(engine_factory, capsys):
+    from btc_quarter_hour_engine.research import prospective_runner_cli as cli
+
+    assert cli.main(["verify-implementation", "--implementation-git-sha", "a" * 40]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["verified"] is True
+    assert output["implementation"]["git_sha"] == "a" * 40
+    assert output["implementation"]["package_file_count"] > 0
+    assert output["official_records_written"] is False and output["ledger_opened"] is False
+    assert cli.main([
+        "verify-implementation", "--implementation-git-sha", "a" * 40, "--attestation", "x.json",
+    ]) == 2
+    assert "must be supplied together" in capsys.readouterr().err

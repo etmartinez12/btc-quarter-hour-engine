@@ -28,6 +28,11 @@ from btc_quarter_hour_engine.research.prospective_inference import (
     load_official_models,
     process_incremental_boundary,
 )
+from btc_quarter_hour_engine.research import prospective_provenance
+from btc_quarter_hour_engine.research.prospective_provenance import (
+    ImplementationProvenanceError,
+    VerifiedImplementation,
+)
 from btc_quarter_hour_engine.research.prospective_ledger import (
     ClockHealth,
     ClockHealthError,
@@ -95,6 +100,10 @@ class RunnerConfig:
     source_poll_seconds: float = 0.25
     max_tail_frames: int = 100_000
     warmup_chunk_frames: int = 10_000
+    # Installed-wheel execution only: the build attestation and its pinned
+    # SHA256 (see prospective_provenance). Git-checkout execution omits both.
+    implementation_attestation_path: Path | None = None
+    implementation_attestation_sha256: str | None = None
 
     def validate(self, *, require_existing: bool = True) -> None:
         if any(
@@ -134,6 +143,22 @@ class RunnerConfig:
             or any(character not in "0123456789abcdef" for character in self.implementation_git_sha)
         ):
             raise ValueError("Implementation revision must be a full lowercase Git SHA")
+        attestation_path = self.implementation_attestation_path
+        attestation_sha256 = self.implementation_attestation_sha256
+        if (attestation_path is None) != (attestation_sha256 is None):
+            raise ValueError("Implementation attestation path and SHA256 must be configured together")
+        if attestation_path is not None:
+            if not isinstance(attestation_path, Path) or not attestation_path.is_absolute():
+                raise ValueError("Implementation attestation path must be absolute")
+            if attestation_path.is_symlink():
+                raise ValueError("Implementation attestation path must not be a symlink")
+            if attestation_path.resolve() in set(paths.values()):
+                raise ValueError("Implementation attestation must be distinct from runtime data paths")
+            if not isinstance(attestation_sha256, str) or (
+                len(attestation_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in attestation_sha256)
+            ):
+                raise ValueError("Implementation attestation SHA256 must be 64 lowercase hex characters")
         if not isinstance(self.expected_source_session_id, str) or not self.expected_source_session_id:
             raise ValueError("An explicit expected bridge source-session ID is required")
         if not isinstance(self.operational_authorization_id, str) or not self.operational_authorization_id.strip():
@@ -364,6 +389,44 @@ class ProspectiveInferenceRunner:
         self.startup_validation_ms = 0.0
         self._last_utc_evidence: ClockHealthEvidence | None = None
         self._last_utc_evidence_check_monotonic = float("-inf")
+        self._verified_implementation: VerifiedImplementation | None = None
+
+    @property
+    def verified_implementation(self) -> VerifiedImplementation | None:
+        return self._verified_implementation
+
+    def _require_verified_implementation(self) -> VerifiedImplementation:
+        """Independently establish (then cheaply recheck) the executing code.
+
+        The configured SHA is only the expectation; identity comes from the
+        checkout or the pinned installed-artifact attestation, never from
+        environment variables.
+        """
+        if self._verified_implementation is not None:
+            return prospective_provenance.recheck_runtime_implementation(
+                self._verified_implementation
+            )
+        identity = prospective_provenance.verify_runtime_implementation(
+            self.config.implementation_git_sha,
+            attestation_path=self.config.implementation_attestation_path,
+            attestation_sha256=self.config.implementation_attestation_sha256,
+        )
+        if not isinstance(identity, VerifiedImplementation) or (
+            identity.git_sha != self.config.implementation_git_sha
+        ):
+            raise ImplementationProvenanceError(
+                "verified implementation does not match the reviewed configuration"
+            )
+        self._verified_implementation = identity
+        return identity
+
+    @staticmethod
+    def _implementation_metrics(identity: VerifiedImplementation) -> dict[str, Any]:
+        return {
+            "implementation_git_sha": identity.git_sha,
+            "implementation_provenance_mode": identity.mode,
+            "implementation_package_sha256": identity.package_content_sha256,
+        }
 
     @classmethod
     def from_config(
@@ -412,6 +475,9 @@ class ProspectiveInferenceRunner:
             raise ValueError("Independent deployment authorization is absent or does not match")
         if os.environ.get("BTC_QH_IMPLEMENTATION_GIT_SHA") != self.config.implementation_git_sha:
             raise ValueError("Running implementation SHA is absent or does not match the reviewed configuration")
+        # The environment value above is an operator acknowledgement only;
+        # this establishes the executing implementation independently.
+        self._require_verified_implementation()
         self.ledger.clock_health.now()
         if (
             self.ledger.window_start != WINDOW_START
@@ -624,6 +690,9 @@ class ProspectiveInferenceRunner:
         self, boundary: datetime, metrics: dict[str, Any]
     ) -> FeatureReplayCheckpoint:
         self._check_preparation_time(boundary)
+        # Checkpoints feed official predictions, so they must come from the
+        # same independently verified implementation.
+        metrics.update(self._implementation_metrics(self._require_verified_implementation()))
         session_id = self.config.expected_source_session_id
         if self.journal.session_mode(session_id) != "bridge":
             raise ValueError("Checkpoint preparation requires a bridge source session")
@@ -848,6 +917,7 @@ class ProspectiveInferenceRunner:
     ) -> FeatureReplayCheckpoint:
         assert self.ledger is not None
         boundary = _utc(boundary_utc, "checkpoint recovery boundary")
+        self._require_verified_implementation()
         lifecycle = self.ledger.lifecycle(boundary)
         if lifecycle["prediction"] is None:
             raise ValueError("checkpoint recovery requires an existing immutable prediction")
@@ -930,6 +1000,10 @@ class ProspectiveInferenceRunner:
             result_metrics["runtime_validation_ms"] = (
                 time.perf_counter() - runtime_started
             ) * 1000
+            implementation = self._verified_implementation
+            if implementation is None:
+                raise ImplementationProvenanceError("implementation identity was not verified")
+            result_metrics.update(self._implementation_metrics(implementation))
             if not self.scheduler.is_open(boundary, self.scheduler.clock.now()):
                 self.ledger.mark_missed_boundaries()
                 return BoundaryResult(boundary, "missed_deadline", "deadline elapsed during runtime validation")
@@ -945,7 +1019,7 @@ class ProspectiveInferenceRunner:
                 boundary,
                 checkpoint,
                 self.model_bundle,
-                implementation_git_sha=self.config.implementation_git_sha,
+                implementation_git_sha=implementation.git_sha,
                 ledger=self.ledger,
                 timings=stage_timings,
                 pre_persist_check=lambda: self._require_fresh_utc_evidence(force=True),
@@ -1006,6 +1080,8 @@ class ProspectiveInferenceRunner:
             status, reason = "duplicate_prediction", str(exc)
         except ClockHealthError as exc:
             status, reason = "clock_sync_failure", str(exc)
+        except ImplementationProvenanceError as exc:
+            status, reason = "implementation_provenance_failure", f"ImplementationProvenanceError:{exc}"
         except sqlite3.Error as exc:
             status, reason = "ledger_or_source_io_failure", f"{type(exc).__name__}:{exc}"
         except (FileNotFoundError, OSError) as exc:
@@ -1060,6 +1136,10 @@ class ProspectiveInferenceRunner:
                     diagnostic_sink({
                         "event": "runner_started",
                         "source_session_id": self.config.expected_source_session_id,
+                        "implementation": (
+                            None if self._verified_implementation is None
+                            else self._verified_implementation.as_dict()
+                        ),
                         "clock_evidence_source": startup_evidence.source,
                         "startup_validation_ms": self.startup_validation_ms,
                         "startup_read_retries": startup_metrics.get("read_retries", 0),
