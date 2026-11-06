@@ -267,17 +267,32 @@ execution fails closed.
 
 **Loaded modules (both modes).** Every already-imported
 `btc_quarter_hour_engine` module, including the package itself and a package
-`__main__`, must have been imported by the source loader from a file in the
-verified set, with consistent `__file__`/origin and an unaltered package search
-path. Modules from another location, extension or sourceless loaders, and
-unchecked hash-based `.pyc` caches are refused. Timestamp-based `.pyc`
-validation is left to CPython.
+`__main__`, must have been imported by the standard `SourceFileLoader` from a
+file in the verified set, with consistent `__file__`/origin/cache locations and
+an unaltered package search path. Custom loader subclasses, modules from
+another location, extension or sourceless loaders are refused.
+
+**Bytecode caches (both modes).** Source hashes alone do not authenticate
+`.pyc` payloads: a timestamp/size header or even a checked source-hash header
+can remain valid while the cached instructions are replaced. For every
+verified Python source file, including not-yet-imported modules, the verifier
+derives the cache path for the current interpreter and optimization level
+(including an external `PYTHONPYCACHEPREFIX`). If a cache exists, it requires
+a valid header and code payload, and compares the complete code object,
+including nested code/constants, stack sizes and line/exception tables,
+against a fresh compilation of the hash-verified source with matching
+interpreter optimization. No cached code
+is executed by this comparison. Missing caches are allowed; malformed,
+unchecked-hash, mismatched, or unverifiable active caches fail closed.
+Legitimate installer staging filenames are supported, as CPython adjusts
+`co_filename` when loading a relocated source cache. Caches for other Python
+versions or optimization levels are not selected by this interpreter.
 
 **Binding and rechecks.** The first verification occurs in `validate`, at
 `official` startup before the ledger is opened, in `prepare`, and in
 committed-checkpoint recovery. The runner keeps the verified identity and
 rechecks it once per boundary before inference (package location, every file
-hash/size, and the loaded-module set). The ledger's `implementation_git_sha`
+hash/size, active bytecode payloads, and the loaded-module set). The ledger's `implementation_git_sha`
 for each prediction is the verified identity's SHA. Checkpoint preparation
 reports also include the mode and package content digest. Any failure
 returns `implementation_provenance_failure`, writes an `inference_failed`
@@ -320,8 +335,11 @@ Limitations: this is self-verification by the running process. It detects
 an unexpected commit, modified/extra/missing source, a mismatched installed
 package and an unverifiable identity. It does not protect against someone
 able to modify the interpreter, this verifier, the attestation pin in the
-reviewed configuration, or third-party dependencies; host access control and
-the frozen environment remain responsible for those. Git
+reviewed configuration, or third-party dependencies. The environment must
+also prevent in-memory module changes and artifact replacement between
+loading and verification; these are point-in-time checks, not an atomic
+secure loader. Host access control and the frozen environment remain
+responsible for those. Git
 `safe.directory`/ownership refusals fail closed.
 
 ## Failure classification and diagnostics

@@ -22,8 +22,9 @@ identity locally (no network access) in one of two modes:
     distribution's ``RECORD`` and the attestation must agree exactly.
 
 In both modes every already-imported package module must have been loaded by
-the source loader from a file in the verified set, without an unchecked
-hash-based bytecode cache.
+the standard source loader from a file in the verified set. Every cache the
+current interpreter could use for those sources is checked against a fresh
+compilation of the verified source, not merely its timestamp or hash header.
 
 This is self-verification by the running process. It detects an unexpected
 commit, modified/extra/missing source, a mismatched installed package and an
@@ -41,14 +42,17 @@ import hashlib
 import importlib
 import importlib.machinery
 import importlib.metadata
+import importlib.util
 import io
 import json
+import marshal
 import os
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import types
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -235,29 +239,64 @@ def _in_package(name: str) -> bool:
     return name == PACKAGE_NAME or name.startswith(PACKAGE_NAME + ".")
 
 
-def _verify_bytecode_cache(name: str, cached: str | None) -> None:
-    if not cached:
-        return
+def _matches_compiled_code(cached: types.CodeType, expected: types.CodeType) -> bool:
+    # Code equality omits stack size and some interpreter metadata. Check
+    # those fields at every nested code object too, not only at module level.
+    if cached != expected or any(
+        getattr(cached, field, None) != getattr(expected, field, None)
+        for field in ("co_stacksize", "co_filename", "co_qualname", "co_linetable", "co_exceptiontable")
+    ):
+        return False
+    return all(
+        not isinstance(value, types.CodeType)
+        or (isinstance(reference, types.CodeType) and _matches_compiled_code(value, reference))
+        for value, reference in zip(cached.co_consts, expected.co_consts)
+    )
+
+
+def _verify_bytecode_cache(source: Path, source_bytes: bytes) -> None:
+    cached = importlib.util.cache_from_source(str(source))
     try:
         with open(cached, "rb") as handle:
             header = handle.read(16)
+            if len(header) != 16 or header[:4] != importlib.util.MAGIC_NUMBER:
+                raise ImplementationProvenanceError(f"invalid bytecode cache header for {source}")
+            flags = int.from_bytes(header[4:8], "little")
+            if flags == 1:
+                raise ImplementationProvenanceError(
+                    f"{source} has an unchecked hash-based bytecode cache that is not validated against source"
+                )
+            if flags not in (0, 3):
+                raise ImplementationProvenanceError(f"unsupported bytecode cache flags for {source}")
+            if flags == 3 and header[8:16] != importlib.util.source_hash(source_bytes):
+                raise ImplementationProvenanceError(f"bytecode cache source hash differs for {source}")
+            code = marshal.load(handle)
+            if not isinstance(code, types.CodeType) or handle.read(1):
+                raise ImplementationProvenanceError(f"invalid bytecode cache payload for {source}")
     except FileNotFoundError:
         return
-    except OSError as exc:
-        raise ImplementationProvenanceError(f"bytecode cache for {name} is unreadable: {exc}") from exc
-    if len(header) >= 8:
-        flags = int.from_bytes(header[4:8], "little")
-        if flags & 0b01 and not flags & 0b10:
-            raise ImplementationProvenanceError(
-                f"{name} has an unchecked hash-based bytecode cache that is not validated against source"
-            )
+    except ImplementationProvenanceError:
+        raise
+    except (OSError, EOFError, ValueError, TypeError) as exc:
+        raise ImplementationProvenanceError(f"bytecode cache for {source} is unverifiable: {exc}") from exc
+    try:
+        # Installers may compile in a staging directory. SourceFileLoader fixes
+        # co_filename on import; it does not verify the cached code's contents.
+        expected = compile(
+            source_bytes, code.co_filename, "exec", dont_inherit=True,
+            optimize=sys.flags.optimize,
+        )
+    except (SyntaxError, ValueError, TypeError) as exc:
+        raise ImplementationProvenanceError(f"bytecode source cannot be compiled for {source}: {exc}") from exc
+    if not _matches_compiled_code(code, expected):
+        raise ImplementationProvenanceError(f"bytecode cache payload differs from verified source for {source}")
 
 
 def _verify_module(name: str, module: object, package_root: Path, allowed: frozenset[str]) -> None:
     spec = getattr(module, "__spec__", None)
     if spec is None or spec.name != name:
         raise ImplementationProvenanceError(f"loaded module {name} has no consistent import spec")
-    if not isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+    if type(spec.loader) is not importlib.machinery.SourceFileLoader:
         raise ImplementationProvenanceError(f"loaded module {name} was not imported from a source file")
     origin = spec.origin
     module_file = getattr(module, "__file__", None)
@@ -281,17 +320,33 @@ def _verify_module(name: str, module: object, package_root: Path, allowed: froze
         search = [os.path.normcase(os.path.abspath(item)) for item in (getattr(module, "__path__", None) or [])]
         if search != [os.path.normcase(str(origin_path.parent))]:
             raise ImplementationProvenanceError(f"loaded package {name} has an altered search path")
-    _verify_bytecode_cache(name, getattr(spec, "cached", None))
+    expected_cache = os.path.normcase(importlib.util.cache_from_source(str(origin_path)))
+    if any(
+        not cached or os.path.normcase(os.path.abspath(cached)) != expected_cache
+        for cached in (getattr(spec, "cached", None), getattr(module, "__cached__", None))
+    ):
+        raise ImplementationProvenanceError(f"loaded module {name} has an inconsistent bytecode cache location")
 
 
 def verify_loaded_modules(
     package_root: Path, files: PackageFiles, *, modules: Mapping[str, object] | None = None
 ) -> int:
-    """Require every imported package module to come from the verified files."""
+    """Verify loaded origins and all active caches, including not-yet-imported modules."""
 
     module_map = sys.modules if modules is None else modules
     allowed = frozenset(path for path, _, _ in files if path.endswith(".py"))
     root = Path(os.path.abspath(package_root))
+    for path, sha256, size in files:
+        if path not in allowed:
+            continue
+        source = root.parent.joinpath(*PurePosixPath(path).parts)
+        try:
+            source_bytes = source.read_bytes()
+        except OSError as exc:
+            raise ImplementationProvenanceError(f"verified source {source} is unreadable: {exc}") from exc
+        if len(source_bytes) != size or hashlib.sha256(source_bytes).hexdigest() != sha256:
+            raise ImplementationProvenanceError(f"source changed after provenance inventory: {source}")
+        _verify_bytecode_cache(source, source_bytes)
     checked = 0
     root_seen = False
     for key, module in list(module_map.items()):

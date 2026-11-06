@@ -10,10 +10,12 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import marshal
 import os
 import py_compile
 import shutil
 import subprocess
+import sys
 import types
 import zipfile
 from pathlib import Path
@@ -385,6 +387,9 @@ def test_loaded_modules_must_come_from_verified_source_files(plain_package):
         ("file_mismatch", "__file__ does not match its origin"),
         ("altered_search_path", "altered search path"),
         ("unchecked_hash_bytecode", "unchecked hash-based bytecode cache"),
+        ("custom_source_loader", "was not imported from a source file"),
+        ("hidden_cache_location", "inconsistent bytecode cache location"),
+        ("redirected_cache_location", "inconsistent bytecode cache location"),
         ("missing_root", "is not among the loaded modules"),
     ],
 )
@@ -421,6 +426,19 @@ def test_unverified_loaded_modules_are_rejected(plain_package, tmp_path, case, m
             spec.origin, cfile=spec.cached, doraise=True,
             invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
         )
+    elif case == "custom_source_loader":
+        class SubstitutedLoader(importlib.machinery.SourceFileLoader):
+            def get_code(self, fullname):
+                return compile("VALUE = 99", self.path, "exec", dont_inherit=True)
+
+        module = modules[runner_name]
+        module.__spec__.loader = SubstitutedLoader(runner_name, module.__file__)
+        module.__spec__.loader.exec_module(module)
+        assert module.VALUE == 99
+    elif case == "hidden_cache_location":
+        modules[runner_name].__cached__ = None
+    elif case == "redirected_cache_location":
+        modules[runner_name].__spec__.cached = str(tmp_path / "unrelated.pyc")
     else:
         del modules[PACKAGE]
     with pytest.raises(ImplementationProvenanceError, match=message):
@@ -436,6 +454,201 @@ def test_checked_hash_bytecode_is_accepted(plain_package):
         invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
     )
     assert provenance.verify_loaded_modules(plain_package, files, modules=modules) == len(MODULES)
+
+
+def _substitute_cached_code(package_root, invalidation_mode):
+    source = package_root / "research" / "runner.py"
+    cached = Path(importlib.util.cache_from_source(str(source)))
+    py_compile.compile(str(source), doraise=True, invalidation_mode=invalidation_mode)
+    header = cached.read_bytes()[:16]
+    replacement = compile(b"VALUE = 99\n", str(source), "exec", dont_inherit=True)
+    cached.write_bytes(header + marshal.dumps(replacement))
+    return cached
+
+
+@needs_git
+@pytest.mark.parametrize("invalidation_mode", [
+    py_compile.PycInvalidationMode.TIMESTAMP,
+    py_compile.PycInvalidationMode.CHECKED_HASH,
+])
+def test_cached_payload_cannot_override_verified_checkout(checkout, invalidation_mode):
+    root, package, head = checkout
+    _substitute_cached_code(package, invalidation_mode)
+    modules = _load_modules(package)
+    assert modules[f"{PACKAGE}.research.runner"].VALUE == 99
+    assert (package / "research" / "runner.py").read_bytes() == SOURCES[f"{PACKAGE}/research/runner.py"]
+    assert _git(root, "status", "--porcelain") == ""
+    with pytest.raises(ImplementationProvenanceError, match="bytecode"):
+        provenance.verify_git_checkout(package, head, modules=modules)
+
+
+@pytest.mark.parametrize("invalidation_mode", [
+    py_compile.PycInvalidationMode.TIMESTAMP,
+    py_compile.PycInvalidationMode.CHECKED_HASH,
+])
+def test_cached_payload_cannot_override_attested_install(artifact, invalidation_mode):
+    _substitute_cached_code(artifact.package, invalidation_mode)
+    modules = _load_modules(artifact.package)
+    assert modules[f"{PACKAGE}.research.runner"].VALUE == 99
+    with pytest.raises(ImplementationProvenanceError, match="bytecode"):
+        _verify_artifact(artifact, modules=modules)
+
+
+def test_unimported_module_cache_is_verified_before_it_can_be_used(plain_package):
+    files = provenance.snapshot_package_files(plain_package)
+    modules = _load_modules(plain_package)
+    del modules[f"{PACKAGE}.research.runner"]
+    _substitute_cached_code(plain_package, py_compile.PycInvalidationMode.TIMESTAMP)
+    with pytest.raises(ImplementationProvenanceError, match="bytecode cache payload differs"):
+        provenance.verify_loaded_modules(plain_package, files, modules=modules)
+
+
+def test_boundary_recheck_detects_cache_drift_without_source_changes(plain_package):
+    identity = _source_identity(plain_package)
+    modules = _load_modules(plain_package)
+    assert provenance.recheck_runtime_implementation(identity, modules=modules) is identity
+    _substitute_cached_code(plain_package, py_compile.PycInvalidationMode.TIMESTAMP)
+    assert provenance.snapshot_package_files(plain_package) == identity.files
+    with pytest.raises(ImplementationProvenanceError, match="bytecode cache payload differs"):
+        provenance.recheck_runtime_implementation(identity, modules=modules)
+
+
+def test_external_pycache_prefix_is_verified(plain_package, tmp_path, monkeypatch):
+    prefix = str(tmp_path / "external-cache")
+    if os.name == "nt":
+        # Prefixes mirror absolute source paths, easily exceeding MAX_PATH.
+        prefix = "\\\\?\\" + prefix
+    monkeypatch.setattr(sys, "pycache_prefix", prefix)
+    files = provenance.snapshot_package_files(plain_package)
+    modules = _load_modules(plain_package)
+    assert provenance.verify_loaded_modules(plain_package, files, modules=modules) == len(MODULES)
+    cached = _substitute_cached_code(plain_package, py_compile.PycInvalidationMode.TIMESTAMP)
+    assert not cached.is_relative_to(plain_package)
+    with pytest.raises(ImplementationProvenanceError, match="bytecode cache payload differs"):
+        provenance.verify_loaded_modules(plain_package, files, modules=modules)
+
+
+def test_installer_staging_filename_does_not_change_valid_code(plain_package, tmp_path):
+    source = plain_package / "research" / "runner.py"
+    py_compile.compile(
+        str(source), dfile=str(tmp_path / "old-install-staging" / "runner.py"), doraise=True,
+    )
+    modules = _load_modules(plain_package)
+    files = provenance.snapshot_package_files(plain_package)
+    assert provenance.verify_loaded_modules(plain_package, files, modules=modules) == len(MODULES)
+
+
+def test_nested_code_constants_are_verified(plain_package):
+    source = plain_package / "research" / "runner.py"
+    source.write_bytes(b"VALUE = 35\ndef answer():\n    return 35\n")
+    files = provenance.snapshot_package_files(plain_package)
+    py_compile.compile(str(source), doraise=True)
+    cached = Path(importlib.util.cache_from_source(str(source)))
+    replacement = compile(b"VALUE = 35\ndef answer():\n    return 99\n", str(source), "exec", dont_inherit=True)
+    cached.write_bytes(cached.read_bytes()[:16] + marshal.dumps(replacement))
+    modules = _load_modules(plain_package)
+    assert modules[f"{PACKAGE}.research.runner"].VALUE == 35
+    assert modules[f"{PACKAGE}.research.runner"].answer() == 99
+    with pytest.raises(ImplementationProvenanceError, match="bytecode cache payload differs"):
+        provenance.verify_loaded_modules(plain_package, files, modules=modules)
+
+
+@pytest.mark.parametrize("level", ["module", "function"])
+def test_cached_execution_metadata_is_verified_recursively(plain_package, level):
+    source = plain_package / "research" / "runner.py"
+    source.write_bytes(b"def answer():\n    return 35\n")
+    files = provenance.snapshot_package_files(plain_package)
+    modules = _load_modules(plain_package)
+    cached = Path(importlib.util.cache_from_source(str(source)))
+    original = cached.read_bytes()
+    code = marshal.loads(original[16:])
+    nested = next(value for value in code.co_consts if isinstance(value, types.CodeType))
+    target = code if level == "module" else nested
+    replacements = [
+        target.replace(co_stacksize=target.co_stacksize + 1),
+        target.replace(co_linetable=target.co_linetable + b"\0"),
+    ]
+    if level == "function":
+        replacements.append(target.replace(co_filename="unverified-nested-origin"))
+    if hasattr(target, "co_qualname"):
+        replacements.append(target.replace(co_qualname="unverified_name"))
+    if hasattr(target, "co_exceptiontable"):
+        replacements.append(target.replace(co_exceptiontable=target.co_exceptiontable + b"\0"))
+    for replacement in replacements:
+        altered = replacement if level == "module" else code.replace(
+            co_consts=tuple(replacement if value is nested else value for value in code.co_consts),
+        )
+        cached.write_bytes(original[:16] + marshal.dumps(altered))
+        with pytest.raises(ImplementationProvenanceError, match="bytecode cache payload differs"):
+            provenance.verify_loaded_modules(plain_package, files, modules=modules)
+
+
+@pytest.mark.parametrize("damage", [
+    "magic", "truncated_header", "invalid_flags", "non_code", "invalid_marshal",
+    "truncated_payload", "trailing_payload", "wrong_source_hash",
+])
+def test_unverifiable_cache_is_rejected(plain_package, damage):
+    files = provenance.snapshot_package_files(plain_package)
+    modules = _load_modules(plain_package)
+    cached = Path(modules[f"{PACKAGE}.research.runner"].__cached__)
+    data = cached.read_bytes()
+    if damage == "magic":
+        data = b"\0" * 4 + data[4:]
+    elif damage == "truncated_header":
+        data = data[:10]
+    elif damage == "invalid_flags":
+        data = data[:4] + (2).to_bytes(4, "little") + data[8:]
+    elif damage == "non_code":
+        data = data[:16] + marshal.dumps(35)
+    elif damage == "invalid_marshal":
+        data = data[:16] + b"?"
+    elif damage == "truncated_payload":
+        data = data[:17]
+    elif damage == "trailing_payload":
+        data += b"unattested data"
+    elif damage == "wrong_source_hash":
+        data = data[:4] + (3).to_bytes(4, "little") + b"\0" * 8 + data[16:]
+    cached.write_bytes(data)
+    with pytest.raises(ImplementationProvenanceError, match="bytecode"):
+        provenance.verify_loaded_modules(plain_package, files, modules=modules)
+
+
+@pytest.mark.parametrize("optimization", [0, 1, 2])
+def test_cache_compilation_matches_interpreter_optimization(plain_package, optimization):
+    source = plain_package / "research" / "runner.py"
+    source.write_bytes(
+        b'"""Module docs."""\ndef answer():\n    """Function docs."""\n'
+        b'    assert False, "kept without optimization"\n    return 35\n'
+    )
+    script = """
+import importlib.util
+from pathlib import Path
+import py_compile
+import sys
+from tests.test_prospective_provenance import _load_modules, MODULES
+from btc_quarter_hour_engine.research import prospective_provenance as p
+root = Path(sys.argv[1])
+files = p.snapshot_package_files(root)
+modules = _load_modules(root)
+if p.verify_loaded_modules(root, files, modules=modules) != len(MODULES):
+    raise AssertionError('valid optimized bytecode was rejected')
+source = root / 'research' / 'runner.py'
+py_compile.compile(str(source), cfile=importlib.util.cache_from_source(str(source)),
+                   optimize=1 if sys.flags.optimize == 0 else 0, doraise=True)
+try:
+    p.verify_loaded_modules(root, files, modules=_load_modules(root))
+except p.ImplementationProvenanceError as exc:
+    if 'bytecode cache payload differs' not in str(exc):
+        raise AssertionError(str(exc))
+else:
+    raise AssertionError('wrong optimization bytecode was accepted')
+"""
+    result = subprocess.run(
+        [sys.executable, *([] if optimization == 0 else ["-" + "O" * optimization]),
+         "-c", script, str(plain_package)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_package_inventory_rejects_unexpected_cache_content(plain_package):

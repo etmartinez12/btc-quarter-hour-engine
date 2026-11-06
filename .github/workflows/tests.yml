@@ -63,6 +63,28 @@ jobs:
           PY
           if verify "$sha" "$(printf '0%.0s' {1..64})"; then echo "wrong pin accepted"; exit 1; fi
           if verify "$(printf 'a%.0s' {1..40})" "$pin"; then echo "wrong SHA accepted"; exit 1; fi
+          for cache_mode in TIMESTAMP CHECKED_HASH; do
+            python - "$site" "$cache_mode" <<'PY'
+          import importlib.util, marshal, py_compile, sys
+          from pathlib import Path
+          source = Path(sys.argv[1]) / "btc_quarter_hour_engine/research/prospective_contract.py"
+          py_compile.compile(str(source), doraise=True,
+                             invalidation_mode=py_compile.PycInvalidationMode[sys.argv[2]])
+          cached = Path(importlib.util.cache_from_source(str(source)))
+          code = compile(source.read_bytes() + b"\nBYTECODE_PROVENANCE_PROBE = 35\n",
+                         str(source), "exec", dont_inherit=True)
+          cached.write_bytes(cached.read_bytes()[:16] + marshal.dumps(code))
+          PY
+            PYTHONPATH="$site" python -c 'from btc_quarter_hour_engine.research import prospective_contract as c; assert c.BYTECODE_PROVENANCE_PROBE == 35'
+            if verify "$sha" "$pin"; then echo "modified $cache_mode bytecode accepted"; exit 1; fi
+          done
+          python - "$site" <<'PY'
+          import py_compile, sys
+          from pathlib import Path
+          py_compile.compile(str(Path(sys.argv[1]) / "btc_quarter_hour_engine/research/prospective_contract.py"),
+                             doraise=True)
+          PY
+          verify "$sha" "$pin"
           echo "# tampered" >> "$site/btc_quarter_hour_engine/__init__.py"
           if verify "$sha" "$pin"; then echo "modified install accepted"; exit 1; fi
 
