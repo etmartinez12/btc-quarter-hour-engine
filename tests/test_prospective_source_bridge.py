@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -24,13 +25,17 @@ from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
     _encode_event,
     _read_event,
     parse_chrony_tracking,
+    read_chrony_clock_health,
 )
 from btc_quarter_hour_engine.research.prospective_source import (
+    CausalInputError,
     ProspectiveRawFrameJournal,
+    build_causal_feature_vector,
     _validate_bridge_health,
     _require_bridge_prediction_health,
 )
 from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
+from tests.chrony_fixtures import chrony_evidence, sources_row, tracking_output
 
 
 UTC = timezone.utc
@@ -39,16 +44,7 @@ BOUNDARY = START + timedelta(minutes=15)
 
 
 def _clock(*, verified: bool = True) -> ClockHealthEvidence:
-    return ClockHealthEvidence(
-        observed_at_utc=BOUNDARY + timedelta(seconds=2),
-        synchronized=verified,
-        verified=verified,
-        offset_seconds=0.001 if verified else None,
-        reference_time_utc=BOUNDARY + timedelta(seconds=1) if verified else None,
-        leap_status="Normal" if verified else None,
-        source="fixture",
-        reason=None if verified else "unknown synchronization",
-    )
+    return chrony_evidence(BOUNDARY + timedelta(seconds=2), verified=verified)
 
 
 def _producer_health(connection_id="connection-0", *, canonical_boundary=None):
@@ -205,16 +201,7 @@ def _canonical_boundary_health(raw_frames, ingest_times):
 
 
 def _clock_at(boundary, *, verified=True):
-    return ClockHealthEvidence(
-        observed_at_utc=boundary + timedelta(seconds=2),
-        synchronized=verified,
-        verified=verified,
-        offset_seconds=0.001 if verified else None,
-        reference_time_utc=boundary + timedelta(seconds=1) if verified else None,
-        leap_status="Normal" if verified else None,
-        source="fixture",
-        reason=None if verified else "unknown synchronization",
-    )
+    return chrony_evidence(boundary + timedelta(seconds=2), verified=verified)
 
 
 def _run_socket_server_process(socket_path, status_pipe):
@@ -619,6 +606,151 @@ def test_ordered_verified_fence_certifies_durable_snapshot(tmp_path):
     journal.close()
 
 
+def _publish_fenced_boundary(tmp_path, clock_provider):
+    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+    receiver = ProspectiveSourceReceiver(journal, clock_health_provider=clock_provider)
+    ingest_times = (
+        BOUNDARY - timedelta(seconds=2),
+        BOUNDARY - timedelta(seconds=1),
+        BOUNDARY + timedelta(seconds=1),
+    )
+    raw_frames = (
+        _wire_frame(1, ingest_times[0], snapshot=True),
+        _wire_frame(2, ingest_times[1], heartbeat=True),
+        _wire_frame(3, ingest_times[2]),
+    )
+    _replay, final_health = _canonical_boundary_health(raw_frames, ingest_times)
+    publisher = NonBlockingSourcePublisher(
+        tmp_path / "unused.sock",
+        session_id="session-1",
+        session_started_at_utc=START,
+        transport=JournalTransport(),
+    )
+    for index, (raw, received) in enumerate(zip(raw_frames, ingest_times)):
+        assert publisher.publish_frame(
+            connection_id="connection-0",
+            reconnect_epoch=0,
+            frame_index=index,
+            raw_bytes=raw,
+            received_at_utc=received,
+            producer_health=(
+                final_health if index == len(raw_frames) - 1 else _producer_health()
+            ),
+        )
+    publisher._queue.join()
+    assert publisher.valid, publisher.failure_reason
+    publisher.close()
+    return journal, receiver, publisher.transport.events
+
+
+@pytest.mark.parametrize(
+    "reference_age, certified",
+    [
+        (1.0, True),
+        (512.0, True),
+        (1033.0, True),
+        (1060.0, True),
+        (1061.0, False),
+        (2090.0, False),
+    ],
+)
+def test_fence_certification_applies_the_shared_chrony_freshness_policy(
+    tmp_path, reference_age, certified
+):
+    # A healthy 1,024 s chrony poll certifies; evidence past the bounded
+    # horizon (or after a lost poll) is recorded as an uncertified fence.
+    clock = chrony_evidence(
+        BOUNDARY + timedelta(seconds=2),
+        reference_age=reference_age,
+        last_rx=min(int(reference_age), 1000),
+    )
+    assert clock.verified is certified
+    calls = []
+
+    def provider():
+        calls.append(clock)
+        return clock
+
+    journal, receiver, events = _publish_fenced_boundary(tmp_path, provider)
+    for header, raw_bytes in events:
+        receiver.process(header, raw_bytes)
+    assert len(calls) == 1
+    fence = journal._connection.execute(
+        "SELECT clock_health_verified FROM source_fences WHERE session_id = 'session-1'"
+    ).fetchone()
+    assert fence["clock_health_verified"] == int(certified)
+    snapshot = journal.snapshot("session-1")
+    assert snapshot.source_certified is True
+    assert snapshot.clock_health_verified is certified
+    if not certified:
+        with pytest.raises(CausalInputError, match="source_clock_health_unverified"):
+            build_causal_feature_vector(snapshot, BOUNDARY)
+    journal.close()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unavailable",
+        "source_lost",
+        "unsynchronised",
+        "clock_jump",
+    ],
+)
+def test_fence_records_uncertified_clock_when_chrony_cannot_be_trusted(tmp_path, failure):
+    observed = BOUNDARY + timedelta(seconds=2)
+    if failure == "unavailable":
+        def missing(command, **kwargs):
+            raise FileNotFoundError(command[0])
+
+        walls = iter((observed, observed))
+        monotonic = iter((10.0, 10.0))
+        clock = read_chrony_clock_health(
+            now_fn=lambda: next(walls), monotonic_fn=lambda: next(monotonic), runner=missing
+        )
+    elif failure == "source_lost":
+        clock = chrony_evidence(observed, reach="376")
+    elif failure == "unsynchronised":
+        clock = chrony_evidence(observed, verified=False)
+    else:
+        clock = chrony_evidence(observed, divergence=0.2)
+    assert clock.verified is False
+    journal, receiver, events = _publish_fenced_boundary(tmp_path, lambda: clock)
+    for header, raw_bytes in events:
+        receiver.process(header, raw_bytes)
+    assert journal._connection.execute(
+        "SELECT clock_health_verified FROM source_fences"
+    ).fetchone()[0] == 0
+    snapshot = journal.snapshot("session-1")
+    assert snapshot.clock_health_verified is False
+    with pytest.raises(CausalInputError, match="source_clock_health_unverified"):
+        build_causal_feature_vector(snapshot, BOUNDARY)
+    journal.close()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"offset_seconds": 0.5},
+        {"reference_time_utc": BOUNDARY - timedelta(seconds=2000)},
+        {"policy_version": None},
+        {"selected_source_reach": 0o376},
+    ],
+)
+def test_fence_rejects_forged_verified_clock_evidence(tmp_path, changes):
+    forged = replace(chrony_evidence(BOUNDARY + timedelta(seconds=2)), **changes)
+    assert forged.verified is True
+    journal, receiver, events = _publish_fenced_boundary(tmp_path, lambda: forged)
+    *frames, fence = events
+    for header, raw_bytes in frames:
+        receiver.process(header, raw_bytes)
+    with pytest.raises(ValueError, match="Verified clock evidence is incomplete or outside tolerance"):
+        receiver.process(*fence)
+    assert journal._connection.execute("SELECT COUNT(*) FROM source_fences").fetchone()[0] == 0
+    assert journal._connection.execute("SELECT COUNT(*) FROM source_watermarks").fetchone()[0] == 0
+    journal.close()
+
+
 @pytest.mark.skipif(
     not (sys.platform.startswith("linux") and hasattr(socket, "AF_UNIX")),
     reason="Process-level stale Unix socket recovery is Linux-only",
@@ -777,21 +909,28 @@ def test_partial_and_oversized_stream_messages_are_rejected():
         )
 
 
-def test_chrony_clock_health_requires_fresh_sync_and_offset_tolerance():
+def test_bridge_reexports_the_shared_chrony_freshness_policy():
+    from btc_quarter_hour_engine.research import prospective_clock
+
+    assert bridge_module.parse_chrony_tracking is prospective_clock.parse_chrony_tracking
+    assert bridge_module.read_chrony_clock_health is prospective_clock.read_chrony_clock_health
+    assert bridge_module.ClockHealthEvidence is prospective_clock.ClockHealthEvidence
+    assert bridge_module.CHRONY_CLOCK_POLICY is prospective_clock.CHRONY_CLOCK_POLICY
     now = datetime(2026, 1, 1, 0, 15, 2, tzinfo=UTC)
-    good = """\
-Reference time (UTC) : Thu Jan  1 00:15:01 2026
-System time     : 0.001 seconds slow of NTP time
-Leap status     : Normal
-"""
-    stale = good.replace("00:15:01", "00:10:00")
-    unhealthy = good.replace("0.001", "0.5")
-    assert parse_chrony_tracking(good, observed_at_utc=now).verified
-    assert not parse_chrony_tracking(stale, observed_at_utc=now).verified
-    assert not parse_chrony_tracking(unhealthy, observed_at_utc=now).verified
-    assert not parse_chrony_tracking(
-        "Leap status : Not synchronised", observed_at_utc=now
+    good = tracking_output(datetime(2026, 1, 1, 0, 15, 1, tzinfo=UTC))
+    sources = sources_row(last_rx=1) + "\n"
+    timing = {"observation_duration_seconds": 0.01, "wall_monotonic_divergence_seconds": 0.0}
+    assert parse_chrony_tracking(
+        good, observed_at_utc=now, sources_output=sources, **timing
     ).verified
+    assert not parse_chrony_tracking(
+        good.replace("0.000012345 seconds fast", "0.5 seconds slow"),
+        observed_at_utc=now,
+        sources_output=sources,
+        **timing,
+    ).verified
+    assert not parse_chrony_tracking(good, observed_at_utc=now, **timing).verified
+    assert not parse_chrony_tracking(good, observed_at_utc=now, sources_output=sources).verified
 
 
 def test_unfinalized_boundary_cannot_be_fenced_or_certified(tmp_path):

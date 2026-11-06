@@ -191,11 +191,12 @@ class SyntheticDurableLedger:
 
 def _summary(samples: list[float]) -> dict[str, float]:
     if not samples:
-        return {"median": 0.0, "p95": 0.0, "max": 0.0}
+        return {"median": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
     ordered = sorted(samples)
     return {
         "median": statistics.median(ordered),
         "p95": ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))],
+        "p99": ordered[min(len(ordered) - 1, int(0.99 * len(ordered)))],
         "max": max(ordered),
     }
 

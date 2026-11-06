@@ -4,6 +4,7 @@ import hashlib
 import math
 import pickle
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -197,6 +198,7 @@ def infer_causal_prediction(
     generated_at_utc: datetime | None = None,
     generation_clock: Callable[[], datetime] | None = None,
     require_official_bundle: bool = False,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Create immutable prediction evidence without reading any target or label."""
     implementation_sha = _require_git_sha(implementation_git_sha)
@@ -252,16 +254,22 @@ def infer_causal_prediction(
     )
     candidate_matrix = vector.loc[:, list(predictors["range_volatility"])]
     control_matrix = vector.loc[:, list(predictors["full_v2"])]
+    candidate_started = time.perf_counter()
     candidate_probabilities = verified_probabilities(
         model_bundle.models["range_volatility"],
         candidate_matrix,
         predictors["range_volatility"],
     )
+    if timings is not None:
+        timings["candidate_inference_ms"] = (time.perf_counter() - candidate_started) * 1000
+    control_started = time.perf_counter()
     control_probabilities = verified_probabilities(
         model_bundle.models["full_v2"],
         control_matrix,
         predictors["full_v2"],
     )
+    if timings is not None:
+        timings["control_inference_ms"] = (time.perf_counter() - control_started) * 1000
     candidate_probability = float(candidate_probabilities[0, 1])
     control_probability = float(control_probabilities[0, 1])
     if generation_clock is not None:
@@ -364,6 +372,10 @@ def process_incremental_boundary(
     *,
     implementation_git_sha: str,
     ledger: ProspectiveLedger,
+    timings: dict[str, float] | None = None,
+    pre_persist_check: Callable[[], Any] | None = None,
+    post_persist_check: Callable[[], Any] | None = None,
+    pre_attestation_check: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Run one boundary from a verified checkpoint and bounded raw tail."""
     boundary = _utc(boundary_utc, field="prediction boundary")
@@ -373,7 +385,7 @@ def process_incremental_boundary(
         )
     try:
         features = build_incremental_causal_feature_vector(
-            tail, boundary, checkpoint
+            tail, boundary, checkpoint, timings=timings
         )
     except CausalInputError as exc:
         recorded_at = ledger.clock_health.now()
@@ -405,6 +417,10 @@ def process_incremental_boundary(
         model_bundle,
         implementation_git_sha=implementation_git_sha,
         ledger=ledger,
+        timings=timings,
+        pre_persist_check=pre_persist_check,
+        post_persist_check=post_persist_check,
+        pre_attestation_check=pre_attestation_check,
     )
 
 
@@ -415,6 +431,10 @@ def _persist_causal_features(
     *,
     implementation_git_sha: str,
     ledger: ProspectiveLedger,
+    timings: dict[str, float] | None = None,
+    pre_persist_check: Callable[[], Any] | None = None,
+    post_persist_check: Callable[[], Any] | None = None,
+    pre_attestation_check: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     try:
         evidence = infer_causal_prediction(
@@ -423,6 +443,7 @@ def _persist_causal_features(
             implementation_git_sha=implementation_git_sha,
             generation_clock=ledger.clock_health.now,
             require_official_bundle=True,
+            timings=timings,
         )
     except ClockHealthError as exc:
         observed = ledger.clock_health.observed_wall_utc
@@ -458,4 +479,37 @@ def _persist_causal_features(
             },
         )
         raise
-    return ledger.append_prediction(evidence, model_bundle=model_bundle)
+    if pre_persist_check is not None:
+        check_started = time.perf_counter()
+        pre_persist_check()
+        if timings is not None:
+            timings["utc_clock_check_before_persist_ms"] = (
+                time.perf_counter() - check_started
+            ) * 1000
+    if pre_attestation_check is not None:
+        def check_before_attestation() -> None:
+            check_started = time.perf_counter()
+            pre_attestation_check()
+            if timings is not None:
+                timings["utc_clock_check_before_attestation_ms"] = (
+                    time.perf_counter() - check_started
+                ) * 1000
+
+        result = ledger.append_prediction(
+            evidence, model_bundle=model_bundle, timings=timings,
+            pre_attestation_check=check_before_attestation,
+        )
+    elif timings is None:
+        result = ledger.append_prediction(evidence, model_bundle=model_bundle)
+    else:
+        result = ledger.append_prediction(
+            evidence, model_bundle=model_bundle, timings=timings
+        )
+    if post_persist_check is not None:
+        check_started = time.perf_counter()
+        post_persist_check()
+        if timings is not None:
+            timings["utc_clock_check_after_persist_ms"] = (
+                time.perf_counter() - check_started
+            ) * 1000
+    return result
