@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+PYTHON="${BTC_QH_DEV_PYTHON:-/home/martinez_elias12/btc-quarter-hour-engine-dev/.venv/bin/python}"
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: shared development Python not found: $PYTHON" >&2
+    exit 2
+fi
+
+cd "$ROOT"
+
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+# Protect production capacity while verification runs.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+
+echo "=== Repository ==="
+git rev-parse --show-toplevel
+git branch --show-current
+git status --short
+
+echo
+echo "=== Full pytest suite ==="
+nice -n 10 "$PYTHON" -m pytest -q
+
+echo
+echo "=== Compile check ==="
+nice -n 10 "$PYTHON" -m compileall -q \
+    btc_quarter_hour_engine \
+    tests \
+    benchmarks
+
+echo
+echo "=== Git whitespace check ==="
+git diff --check
+
+echo
+echo "=== Final status ==="
+git status --short
+
+echo
+echo "COPILOT VERIFY: PASS"

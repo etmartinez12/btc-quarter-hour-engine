@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+PYTHON="${BTC_QH_DEV_PYTHON:-/home/martinez_elias12/btc-quarter-hour-engine-dev/.venv/bin/python}"
+
+if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: shared development Python not found: $PYTHON" >&2
+    exit 2
+fi
+
+if [[ "$#" -eq 0 ]]; then
+    echo "Usage: ./scripts/copilot-test <pytest target(s) and/or options>" >&2
+    echo "Example: ./scripts/copilot-test tests/test_prospective_replay.py -q" >&2
+    echo "Use ./scripts/copilot-verify for the complete review gate." >&2
+    exit 2
+fi
+
+cd "$ROOT"
+
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+# Keep development workloads subordinate to the live collector.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+
+exec nice -n 10 "$PYTHON" -m pytest "$@"
