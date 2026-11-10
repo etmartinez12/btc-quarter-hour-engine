@@ -52,6 +52,33 @@ _CHECKPOINT_DOMAIN = b"btc-qh-feature-replay-checkpoint-v1\0"
 _BUCKET_HISTORY = timedelta(minutes=240)
 
 
+class _CausalFeatureReplay(_IngestFeatureReplay):
+    """Keep one internally parsed frame across the causal gate and consumption."""
+
+    def __init__(self, product_id: str) -> None:
+        super().__init__(product_id)
+        self.__prepared_raw: bytes | None = None
+        self.__prepared_event: dict[str, Any] | None = None
+
+    def _prepare_frame(self, raw: bytes) -> tuple[datetime, ...]:
+        self.__prepared_raw = None
+        self.__prepared_event = None
+        event = parse_coinbase_ws_message(raw)
+        event_times = _frame_event_times(event)
+        self.__prepared_raw = raw
+        self.__prepared_event = event
+        return event_times
+
+    def _parse_frame(self, raw: bytes) -> dict[str, Any]:
+        prepared_raw, event = self.__prepared_raw, self.__prepared_event
+        self.__prepared_raw = None
+        self.__prepared_event = None
+        # Only the exact bytes parsed internally can reuse this single-use result.
+        if raw is prepared_raw and event is not None:
+            return event
+        return super()._parse_frame(raw)
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -393,7 +420,7 @@ def _replay_frames(
     *,
     session_id: str,
     expected_index: int,
-    replay: _IngestFeatureReplay,
+    replay: _CausalFeatureReplay,
     cutoff: datetime,
     previous_ingest: datetime | None,
     prefix_commitment: str,
@@ -420,8 +447,7 @@ def _replay_frames(
             raise CausalInputError("raw_frame_hash_mismatch", source_session_id=session_id)
         prefix_commitment = advance_prefix_commitment(prefix_commitment, frame)
         try:
-            event = parse_coinbase_ws_message(frame.raw_bytes)
-            event_times = _frame_event_times(event)
+            event_times = replay._prepare_frame(frame.raw_bytes)
         except (KeyError, TypeError, UnicodeError, ValueError) as exc:
             raise CausalInputError(
                 "malformed_raw_frame_at_or_before_boundary", source_session_id=session_id
@@ -482,7 +508,7 @@ def create_feature_replay_checkpoint(
             "checkpoint_bootstrap_exceeds_bounded_frame_limit",
             source_session_id=snapshot.session_id,
         )
-    replay = _IngestFeatureReplay("BTC-USD")
+    replay = _CausalFeatureReplay("BTC-USD")
     seed = initial_prefix_commitment(snapshot.session_id, started)
     expected, previous_ingest, latest_event, commitment, count, excluded_event = _replay_frames(
         snapshot.frames,
@@ -555,7 +581,7 @@ def accumulate_feature_replay_warmup(
     if not isinstance(chunk.frames, tuple) or not 1 <= len(chunk.frames) <= MAX_CHECKPOINT_BOOTSTRAP_FRAMES:
         raise ValueError("Warm-up requires a nonempty bounded immutable chunk")
     if warmup is None:
-        replay = _IngestFeatureReplay("BTC-USD")
+        replay = _CausalFeatureReplay("BTC-USD")
         index, previous, latest = -1, None, None
         commitment = initial_prefix_commitment(chunk.session_id, started)
     else:
@@ -565,7 +591,7 @@ def accumulate_feature_replay_warmup(
             raise ValueError("Warm-up source session mismatch")
         if cutoff != warmup.cutoff_utc:
             raise ValueError("Warm-up target cannot change during accumulation")
-        replay = _IngestFeatureReplay.from_checkpoint(data["replay_state"])
+        replay = _CausalFeatureReplay.from_checkpoint(data["replay_state"])
         index = warmup.last_frame_index
         previous = datetime.fromisoformat(data["last_ingest_time_utc"].replace("Z", "+00:00"))
         latest = (
@@ -777,7 +803,7 @@ def build_incremental_causal_feature_vector(
     commitment_by_index = dict(tail.frame_commitments)
     if len(commitment_by_index) != len(tail.frame_commitments):
         raise CausalInputError("raw_frame_tail_commitments_duplicated", source_session_id=tail.session_id)
-    replay = _IngestFeatureReplay.from_checkpoint(data["replay_state"])
+    replay = _CausalFeatureReplay.from_checkpoint(data["replay_state"])
     if timings is not None:
         timings["checkpoint_restore_ms"] = (time.perf_counter() - checkpoint_started) * 1000
     _validate_checkpoint_book(replay)
@@ -803,8 +829,7 @@ def build_incremental_causal_feature_vector(
         if not isinstance(frame.raw_bytes, bytes) or hashlib.sha256(frame.raw_bytes).hexdigest() != frame.raw_frame_sha256:
             raise CausalInputError("raw_frame_hash_mismatch", source_session_id=tail.session_id)
         try:
-            event = parse_coinbase_ws_message(frame.raw_bytes)
-            event_times = _frame_event_times(event)
+            event_times = replay._prepare_frame(frame.raw_bytes)
         except (KeyError, TypeError, UnicodeError, ValueError) as exc:
             raise CausalInputError("malformed_raw_frame_at_or_before_boundary", source_session_id=tail.session_id) from exc
         commitment = advance_prefix_commitment(commitment, frame)
@@ -890,7 +915,7 @@ def advance_feature_replay_checkpoint(
         raise CausalInputError("checkpoint_prefix_commitment_mismatch", source_session_id=tail.session_id)
     if cutoff <= checkpoint.cutoff_utc:
         raise CausalInputError("checkpoint_cutoff_not_strictly_advanced", source_session_id=tail.session_id)
-    replay = _IngestFeatureReplay.from_checkpoint(data["replay_state"])
+    replay = _CausalFeatureReplay.from_checkpoint(data["replay_state"])
     if not isinstance(tail.frames, tuple):
         raise CausalInputError("raw_frame_tail_must_be_immutable_tuple", source_session_id=tail.session_id)
     if len(tail.frames) > MAX_INCREMENTAL_TAIL_FRAMES:
@@ -925,8 +950,7 @@ def advance_feature_replay_checkpoint(
         if not isinstance(frame.raw_bytes, bytes) or hashlib.sha256(frame.raw_bytes).hexdigest() != frame.raw_frame_sha256:
             raise CausalInputError("raw_frame_hash_mismatch", source_session_id=tail.session_id)
         try:
-            event = parse_coinbase_ws_message(frame.raw_bytes)
-            event_times = _frame_event_times(event)
+            event_times = replay._prepare_frame(frame.raw_bytes)
         except (KeyError, TypeError, UnicodeError, ValueError) as exc:
             raise CausalInputError("malformed_raw_frame_at_or_before_boundary", source_session_id=tail.session_id) from exc
         if any(event_time > cutoff for event_time in event_times):
