@@ -30,8 +30,73 @@ jobs:
       - name: Install package
         run: pip install -e ".[dev]"
 
+      - name: Runtime implementation provenance (checkout and attested wheel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli="btc_quarter_hour_engine.research.prospective_runner_cli"
+          sha="$(git rev-parse HEAD)"
+          python -m "$cli" verify-implementation --implementation-git-sha "$sha"
+          dist="$RUNNER_TEMP/provenance-dist"
+          site="$RUNNER_TEMP/provenance-site"
+          python -m pip wheel . --no-deps -w "$dist"
+          wheel="$(ls "$dist"/btc_quarter_hour_engine-*.whl)"
+          attestation="$dist/implementation-attestation.json"
+          python -m "$cli" attest-build --wheel "$wheel" --output "$attestation" \
+            --implementation-git-sha "$sha" | tee "$RUNNER_TEMP/attest-build.json"
+          pin="$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["attestation_sha256"])' "$RUNNER_TEMP/attest-build.json")"
+          python -m pip install --no-deps --target "$site" "$wheel"
+          cd "$RUNNER_TEMP"
+          verify() {
+            PYTHONPATH="$site" python -m "$cli" verify-implementation \
+              --implementation-git-sha "$1" --attestation "$attestation" --attestation-sha256 "$2"
+          }
+          verify "$sha" "$pin" > installed-identity.json
+          cat installed-identity.json
+          python - "$sha" "$site" installed-identity.json <<'PY'
+          import json, os, sys
+          with open(sys.argv[3], encoding="utf-8") as handle:
+              identity = json.load(handle)["implementation"]
+          assert identity["mode"] == "installed_artifact", identity
+          assert identity["git_sha"] == sys.argv[1], identity
+          assert os.path.samefile(identity["package_root"], os.path.join(sys.argv[2], "btc_quarter_hour_engine")), identity
+          PY
+          if verify "$sha" "$(printf '0%.0s' {1..64})"; then echo "wrong pin accepted"; exit 1; fi
+          if verify "$(printf 'a%.0s' {1..40})" "$pin"; then echo "wrong SHA accepted"; exit 1; fi
+          for cache_mode in TIMESTAMP CHECKED_HASH; do
+            python - "$site" "$cache_mode" <<'PY'
+          import importlib.util, marshal, py_compile, sys
+          from pathlib import Path
+          source = Path(sys.argv[1]) / "btc_quarter_hour_engine/research/prospective_contract.py"
+          py_compile.compile(str(source), doraise=True,
+                             invalidation_mode=py_compile.PycInvalidationMode[sys.argv[2]])
+          cached = Path(importlib.util.cache_from_source(str(source)))
+          code = compile(source.read_bytes() + b"\nBYTECODE_PROVENANCE_PROBE = 35\n",
+                         str(source), "exec", dont_inherit=True)
+          cached.write_bytes(cached.read_bytes()[:16] + marshal.dumps(code))
+          PY
+            PYTHONPATH="$site" python -c 'from btc_quarter_hour_engine.research import prospective_contract as c; assert c.BYTECODE_PROVENANCE_PROBE == 35'
+            if verify "$sha" "$pin"; then echo "modified $cache_mode bytecode accepted"; exit 1; fi
+          done
+          python - "$site" <<'PY'
+          import py_compile, sys
+          from pathlib import Path
+          py_compile.compile(str(Path(sys.argv[1]) / "btc_quarter_hour_engine/research/prospective_contract.py"),
+                             doraise=True)
+          PY
+          verify "$sha" "$pin"
+          echo "# tampered" >> "$site/btc_quarter_hour_engine/__init__.py"
+          if verify "$sha" "$pin"; then echo "modified install accepted"; exit 1; fi
+
       - name: Run tests
-        run: pytest -q
+        run: pytest -q --junitxml=pytest-results.xml -o junit_family=legacy
+
+      - name: Preserve test results and isolated runner measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-${{ matrix.python-version }}
+          path: pytest-results.xml
 
       - name: Populated Coinbase book ingestion gate
         if: matrix.python-version == '3.11'

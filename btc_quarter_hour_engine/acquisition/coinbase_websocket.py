@@ -70,6 +70,10 @@ NORMALIZED_TYPE_HEARTBEAT = "heartbeat"
 # aliases are also accepted defensively even though the documented schema
 # only emits "bid"/"offer".
 _SIDE_ALIASES = {"bid": "bid", "buy": "bid", "offer": "ask", "ask": "ask", "sell": "ask"}
+_GO_TIMESTAMP = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{1,9}) ([+-]\d{4}) UTC m=[+-]\d+(?:\.\d+)?"
+)
+_ISO_FRACTION = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{7,})(.*)")
 
 
 def _utcnow() -> datetime:
@@ -87,10 +91,7 @@ def _require_utc_datetime(value: Any, *, field_name: str) -> datetime:
     if value is None:
         raise ValueError(f"Missing {field_name}")
     text = str(value).strip()
-    go_timestamp = re.fullmatch(
-        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{1,9}) ([+-]\d{4}) UTC m=[+-]\d+(?:\.\d+)?",
-        text,
-    )
+    go_timestamp = _GO_TIMESTAMP.fullmatch(text)
     if go_timestamp:
         wall_time, fraction, offset = go_timestamp.groups()
         microseconds = fraction[:6].ljust(6, "0")
@@ -105,7 +106,7 @@ def _require_utc_datetime(value: Any, *, field_name: str) -> datetime:
         # Coinbase heartbeats' `current_time` uses a space-separated
         # "YYYY-MM-DD HH:MM:SS.ffffff" form rather than ISO-8601 with "T".
         normalized = normalized.replace(" ", "T", 1)
-    iso_fraction = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{7,})(.*)", normalized)
+    iso_fraction = _ISO_FRACTION.fullmatch(normalized)
     if iso_fraction:
         wall_time, fraction, suffix = iso_fraction.groups()
         normalized = f"{wall_time}.{fraction[:6]}{suffix}"
@@ -172,7 +173,9 @@ class CoinbaseMessageEnvelope:
     events: tuple[Any, ...]
 
 
-def _parse_level2_update_entry(entry: Any) -> Level2UpdateEntry:
+def _parse_level2_update_entry(
+    entry: Any, *, _event_time_cache: dict[str, datetime] | None = None,
+) -> Level2UpdateEntry:
     if not isinstance(entry, Mapping):
         raise ValueError(f"Level 2 update entry must be an object: {entry!r}")
     price = entry.get("price_level")
@@ -187,7 +190,16 @@ def _parse_level2_update_entry(entry: Any) -> Level2UpdateEntry:
     if not (math.isfinite(price_value) and math.isfinite(quantity_value) and price_value > 0 and quantity_value >= 0):
         raise ValueError(f"Invalid Level 2 update entry: {entry!r}")
     side = _normalize_side(entry.get("side"))
-    event_time = _optional_utc_datetime(entry.get("event_time"), field_name="update event_time")
+    raw_event_time = entry.get("event_time")
+    if _event_time_cache is not None and type(raw_event_time) is str:
+        event_time = _event_time_cache.get(raw_event_time)
+        if event_time is None:
+            event_time = _require_utc_datetime(raw_event_time, field_name="update event_time")
+            # Retain only the last successful exact string within this event.
+            _event_time_cache.clear()
+            _event_time_cache[raw_event_time] = event_time
+    else:
+        event_time = _optional_utc_datetime(raw_event_time, field_name="update event_time")
     return Level2UpdateEntry(side=side, price_level=price_value, new_quantity=quantity_value, event_time_utc=event_time)
 
 
@@ -204,7 +216,11 @@ def parse_level2_event(event: Any) -> Level2Event:
     updates_payload = event.get("updates")
     if not isinstance(updates_payload, list) or not updates_payload:
         raise ValueError("Level 2 event missing non-empty updates list")
-    updates = tuple(_parse_level2_update_entry(entry) for entry in updates_payload)
+    event_time_cache: dict[str, datetime] = {}
+    updates = tuple(
+        _parse_level2_update_entry(entry, _event_time_cache=event_time_cache)
+        for entry in updates_payload
+    )
     return Level2Event(type=event_type, product_id=product_id, updates=updates)
 
 

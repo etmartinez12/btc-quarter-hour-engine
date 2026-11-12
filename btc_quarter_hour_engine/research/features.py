@@ -418,6 +418,9 @@ class _IngestFeatureReplay:
         finally:
             self._record_asof(ingest_time_utc)
 
+    def _parse_frame(self, raw: bytes) -> dict[str, Any]:
+        return parse_coinbase_ws_message(raw)
+
     def _consume(
         self,
         *,
@@ -433,7 +436,7 @@ class _IngestFeatureReplay:
             self._new_connection(connection_id)
 
         try:
-            event = parse_coinbase_ws_message(raw)
+            event = self._parse_frame(raw)
         except (ValueError, UnicodeError):
             self.malformed_frames += 1
             self.book.invalidate("malformed_source_state")

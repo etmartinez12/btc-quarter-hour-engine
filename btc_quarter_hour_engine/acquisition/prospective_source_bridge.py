@@ -4,17 +4,14 @@ import errno
 import copy
 import hashlib
 import json
-import math
 import os
 import queue
 import re
 import socket
 import stat
 import struct
-import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +24,14 @@ from btc_quarter_hour_engine.research.prospective_source import (
     _validate_bridge_health,
 )
 from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
+from btc_quarter_hour_engine.research.prospective_clock import (
+    CHRONY_CLOCK_POLICY,
+    ChronyFreshnessPolicy,
+    ClockHealthEvidence,
+    evaluate_clock_evidence,
+    parse_chrony_tracking,
+    read_chrony_clock_health,
+)
 
 try:
     import fcntl
@@ -60,142 +65,6 @@ def _parse_utc(value: Any, *, field: str) -> datetime:
         raise ValueError(f"{field} is malformed") from exc
 
 
-@dataclass(frozen=True, slots=True)
-class ClockHealthEvidence:
-    observed_at_utc: datetime
-    synchronized: bool
-    verified: bool
-    offset_seconds: float | None
-    reference_time_utc: datetime | None
-    leap_status: str | None
-    source: str
-    reason: str | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["observed_at_utc"] = _iso(self.observed_at_utc)
-        value["reference_time_utc"] = (
-            _iso(self.reference_time_utc) if self.reference_time_utc is not None else None
-        )
-        return value
-
-
-def parse_chrony_tracking(
-    output: str,
-    *,
-    observed_at_utc: datetime,
-    max_offset_seconds: float = 0.050,
-    max_reference_age_seconds: float = 120.0,
-) -> ClockHealthEvidence:
-    """Evaluate read-only `chronyc tracking` evidence; unknown values fail closed."""
-    observed = _utc(observed_at_utc, field="clock observation time")
-    if (
-        not math.isfinite(max_offset_seconds)
-        or max_offset_seconds < 0
-        or not math.isfinite(max_reference_age_seconds)
-        or max_reference_age_seconds <= 0
-    ):
-        raise ValueError("Clock-health tolerances must be finite and positive")
-    fields = {
-        key.strip().lower(): value.strip()
-        for key, value in (
-            line.split(":", 1) for line in output.splitlines() if ":" in line
-        )
-    }
-    offset: float | None = None
-    system_time = fields.get("system time")
-    if system_time:
-        match = re.match(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+seconds\b", system_time)
-        if match:
-            try:
-                parsed_offset = float(match.group(1))
-                if math.isfinite(parsed_offset):
-                    offset = parsed_offset
-            except ValueError:
-                pass
-    reference: datetime | None = None
-    reference_value = fields.get("reference time (utc)")
-    if reference_value:
-        for pattern in ("%a %b %d %H:%M:%S %Y",):
-            try:
-                reference = datetime.strptime(reference_value, pattern).replace(
-                    tzinfo=timezone.utc
-                )
-                break
-            except ValueError:
-                continue
-        if reference is None:
-            try:
-                reference = _parse_utc(reference_value, field="chrony reference time")
-            except ValueError:
-                pass
-    leap = fields.get("leap status")
-    age = (observed - reference).total_seconds() if reference is not None else None
-    synchronized = bool(
-        leap is not None
-        and leap.casefold() == "normal"
-        and offset is not None
-        and abs(offset) <= max_offset_seconds
-        and age is not None
-        and 0 <= age <= max_reference_age_seconds
-    )
-    reasons: list[str] = []
-    if leap is None or leap.casefold() != "normal":
-        reasons.append("chrony leap status is not Normal")
-    if offset is None:
-        reasons.append("chrony system offset is unavailable")
-    elif abs(offset) > max_offset_seconds:
-        reasons.append("chrony system offset exceeds tolerance")
-    if reference is None:
-        reasons.append("chrony reference time is unavailable")
-    elif age is not None and (age < 0 or age > max_reference_age_seconds):
-        reasons.append("chrony reference evidence is stale")
-    return ClockHealthEvidence(
-        observed_at_utc=observed,
-        synchronized=synchronized,
-        verified=synchronized,
-        offset_seconds=offset,
-        reference_time_utc=reference,
-        leap_status=leap,
-        source="chronyc tracking",
-        reason="; ".join(reasons) if reasons else None,
-    )
-
-
-def read_chrony_clock_health(
-    *,
-    now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-    runner: Callable[..., Any] = subprocess.run,
-    max_offset_seconds: float = 0.050,
-    max_reference_age_seconds: float = 120.0,
-    timeout_seconds: float = 2.0,
-) -> ClockHealthEvidence:
-    """Read Ubuntu chrony status without changing host time or service settings."""
-    observed = _utc(now_fn(), field="clock observation time")
-    try:
-        result = runner(
-            ["chronyc", "tracking"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return ClockHealthEvidence(
-            observed, False, False, None, None, None, "chronyc tracking",
-            f"chronyc tracking unavailable: {type(exc).__name__}",
-        )
-    if result.returncode != 0:
-        return ClockHealthEvidence(
-            observed, False, False, None, None, None, "chronyc tracking",
-            f"chronyc tracking exited with status {result.returncode}",
-        )
-    return parse_chrony_tracking(
-        result.stdout,
-        observed_at_utc=observed,
-        max_offset_seconds=max_offset_seconds,
-        max_reference_age_seconds=max_reference_age_seconds,
-    )
 
 
 def _encode_event(header: dict[str, Any], raw_bytes: bytes = b"") -> bytes:
@@ -1140,6 +1009,8 @@ class ProspectiveSourceSocketServer:
 
 
 __all__ = [
+    "CHRONY_CLOCK_POLICY",
+    "ChronyFreshnessPolicy",
     "ClockHealthEvidence",
     "MAX_RAW_FRAME_BYTES",
     "NonBlockingSourcePublisher",
@@ -1147,6 +1018,7 @@ __all__ = [
     "ProspectiveSourceReceiver",
     "ProspectiveSourceSocketServer",
     "UnixSocketFrameTransport",
+    "evaluate_clock_evidence",
     "parse_chrony_tracking",
     "read_chrony_clock_health",
 ]

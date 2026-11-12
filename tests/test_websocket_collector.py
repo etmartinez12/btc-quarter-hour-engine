@@ -13,7 +13,6 @@ from btc_quarter_hour_engine.acquisition.collector import WebSocketCollector
 from btc_quarter_hour_engine.acquisition.cli import _sigterm_stop_handler
 from btc_quarter_hour_engine.acquisition.config import CoinbaseWebSocketConfig
 from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
-    ClockHealthEvidence,
     NonBlockingSourcePublisher,
     ProspectiveSourceReceiver,
 )
@@ -25,6 +24,7 @@ from btc_quarter_hour_engine.market_data.replay import (
 from btc_quarter_hour_engine.research.prospective_source import ProspectiveRawFrameJournal
 from btc_quarter_hour_engine.storage.forward_parquet import ForwardParquetStore
 from btc_quarter_hour_engine.storage.websocket_raw import RawSegmentWriter
+from tests.chrony_fixtures import chrony_evidence
 
 
 class FakeTransport:
@@ -305,15 +305,7 @@ def test_bridge_uses_as_of_boundary_health_and_finalizes_from_raw_replay(
 
     receiver = ProspectiveSourceReceiver(
         journal,
-        clock_health_provider=lambda: ClockHealthEvidence(
-            observed_at_utc=boundary + timedelta(seconds=3),
-            synchronized=True,
-            verified=True,
-            offset_seconds=0.001,
-            reference_time_utc=boundary + timedelta(seconds=2),
-            leap_status="Normal",
-            source="integration fixture",
-        ),
+        clock_health_provider=lambda: chrony_evidence(boundary + timedelta(seconds=3)),
     )
     for header, raw in transport.events:
         receiver.process(header, raw)

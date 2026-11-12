@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import pytest
 
+from btc_quarter_hour_engine.acquisition import coinbase_websocket as parser_module
 from btc_quarter_hour_engine.acquisition.coinbase_websocket import (
     CoinbaseMessageEnvelope,
     HeartbeatEvent,
@@ -341,3 +344,265 @@ def test_parse_coinbase_ws_message_accepts_bytes():
 def test_parse_coinbase_ws_message_accepts_already_decoded_mapping():
     parsed = parse_coinbase_ws_message(_heartbeat_message())
     assert parsed["type"] == "heartbeat"
+
+
+def _phase1_timestamp(value, *, field_name):
+    """Frozen timestamp oracle from 4efcf7efe5e77ef231c0f5cd93b996ab2768619d."""
+    if value is None:
+        raise ValueError(f"Missing {field_name}")
+    text = str(value).strip()
+    go_timestamp = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{1,9}) ([+-]\d{4}) UTC m=[+-]\d+(?:\.\d+)?",
+        text,
+    )
+    if go_timestamp:
+        wall_time, fraction, offset = go_timestamp.groups()
+        microseconds = fraction[:6].ljust(6, "0")
+        offset = f"{offset[:3]}:{offset[3:]}"
+        try:
+            parsed = datetime.fromisoformat(f"{wall_time.replace(' ', 'T')}.{microseconds}{offset}")
+        except ValueError as exc:
+            raise ValueError(f"Malformed {field_name}: {value!r}") from exc
+        return parsed.astimezone(timezone.utc)
+    normalized = text.replace("Z", "+00:00")
+    if " " in normalized and "T" not in normalized:
+        normalized = normalized.replace(" ", "T", 1)
+    iso_fraction = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{7,})(.*)", normalized)
+    if iso_fraction:
+        wall_time, fraction, suffix = iso_fraction.groups()
+        normalized = f"{wall_time}.{fraction[:6]}{suffix}"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Malformed {field_name}: {value!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _outcome(action):
+    try:
+        return ("value", action())
+    except (ValueError, TypeError, OverflowError) as exc:
+        return ("error", type(exc), str(exc), type(exc.__cause__), str(exc.__cause__))
+
+
+_TIMESTAMP_CASES = [
+    None, "", "not-a-timestamp", 123, True, [], {},
+    "2026-10-06T18:30:00Z",
+    "2026-10-06T18:30:00.1Z",
+    "2026-10-06T18:30:00.123456Z",
+    "2026-10-06T18:30:00.123456789Z",
+    "2026-10-06T18:30:00.123456789123Z",
+    "2026-10-06T18:30:00,123456789+00:00",
+    "2026-10-06T18:30:00.123456789+05:30",
+    "2026-10-06T18:30:00.123456789-04:00",
+    "2026-10-06T18:30:00.123456789+00:00:30.5",
+    "2026-10-06T18:30:00.123456789+0000",
+    "2026-10-06T18:30:00",
+    "2026-10-06 18:30:00.123456789",
+    " 2026-10-06T18:30:00.123456789Z \n",
+    "2026-10-06 18:30:00.123456789 +0000 UTC m=+123.456789",
+    "2026-10-06 18:30:00.1 -0530 UTC m=-123",
+    "2026-10-06 18:30:00.1234567890 +0000 UTC m=+123",
+    "2026-10-06 18:30:00.123456789 +2400 UTC m=+123",
+    "2026-10-06 18:30:00.123456789 +0000 UTC m=bad",
+    "2026-02-30T18:30:00.123456789Z",
+    "2026-10-06T25:30:00.123456789Z",
+    "2026-10-06T18:30:60Z",
+    "2026-10-06T18:30:00.123456789+24:00",
+    "2026-10-06T18:30:00.123456789Zjunk",
+    "2026-10-06T18:30:00.123456789Z\njunk",
+    "20261006T183000+00:00",
+    "2026-W41-2T18:30:00Z",
+    "2026-10-06",
+    "2026-10-06T18:30:00.123456\u0667Z",
+]
+
+
+@pytest.mark.parametrize("value", _TIMESTAMP_CASES)
+def test_timestamp_normalization_matches_phase1(value):
+    expected = _outcome(lambda: _phase1_timestamp(value, field_name="test timestamp"))
+    actual = _outcome(
+        lambda: parser_module._require_utc_datetime(value, field_name="test timestamp")
+    )
+    assert actual == expected
+
+
+@contextmanager
+def _phase1_parser(monkeypatch):
+    def uncached_level2_event(event):
+        if not isinstance(event, parser_module.Mapping):
+            raise ValueError(f"Level 2 event must be a mapping: {event!r}")
+        event_type = event.get("type")
+        if event_type not in {"snapshot", "update"}:
+            raise ValueError(f"Unsupported Level 2 event type: {event_type!r}")
+        product_id = event.get("product_id")
+        if not isinstance(product_id, str) or not product_id:
+            raise ValueError("Level 2 event missing product_id")
+        updates_payload = event.get("updates")
+        if not isinstance(updates_payload, list) or not updates_payload:
+            raise ValueError("Level 2 event missing non-empty updates list")
+        updates = tuple(parser_module._parse_level2_update_entry(entry) for entry in updates_payload)
+        return Level2Event(type=event_type, product_id=product_id, updates=updates)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(parser_module, "_require_utc_datetime", _phase1_timestamp)
+        patch.setattr(parser_module, "parse_level2_event", uncached_level2_event)
+        yield
+
+
+def _phase1_message(payload, monkeypatch):
+    with _phase1_parser(monkeypatch):
+        return _outcome(lambda: parse_coinbase_ws_message(payload))
+
+
+@pytest.mark.parametrize("kind", ["snapshot", "update", "heartbeat"])
+@pytest.mark.parametrize("value", _TIMESTAMP_CASES)
+def test_timestamp_messages_match_phase1(kind, value, monkeypatch):
+    if kind == "heartbeat":
+        payload = _heartbeat_message(events=[{"current_time": value, "heartbeat_counter": 7}])
+    else:
+        payload = _level2_message(events=[_level2_event(
+            type=kind, updates=[
+                _level2_update(event_time=value),
+                _level2_update(side="offer", event_time=value),
+                _level2_update(event_time="2026-10-06T18:30:01.000000001Z"),
+                _level2_update(event_time=value),
+            ],
+        )])
+    assert _outcome(lambda: parse_coinbase_ws_message(payload)) == _phase1_message(payload, monkeypatch)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("price_level", "nan"), ("new_quantity", "-1"), ("side", "unknown"),
+    ("event_time", "malformed"),
+])
+def test_repeated_timestamp_does_not_skip_update_validation(field, value, monkeypatch):
+    payload = _level2_message(events=[_level2_event(
+        type="update",
+        updates=[_level2_update(), _level2_update(**{field: value})],
+    )])
+    expected = _phase1_message(payload, monkeypatch)
+    assert expected[0] == "error"
+    assert _outcome(lambda: parse_coinbase_ws_message(payload)) == expected
+
+
+def test_timestamp_reuse_is_event_local_and_does_not_cache_coercible_objects(monkeypatch):
+    class ChangingTimestamp:
+        def __init__(self):
+            self.calls = 0
+
+        def __str__(self):
+            self.calls += 1
+            return f"2026-10-06T18:30:0{self.calls}Z"
+
+    def payload():
+        value = ChangingTimestamp()
+        return _level2_message(events=[_level2_event(updates=[
+            _level2_update(event_time=value), _level2_update(event_time=value),
+        ])])
+
+    expected = _phase1_message(payload(), monkeypatch)
+    assert _outcome(lambda: parse_coinbase_ws_message(payload())) == expected
+
+    value = "2026-10-06T18:30:00.123456789Z"
+    first = parse_coinbase_ws_message(_level2_message(events=[_level2_event(
+        updates=[_level2_update(event_time=value)] * 3,
+    )]))
+    assert first["envelope"].events[0].updates[0].event_time_utc.microsecond == 123456
+    with pytest.raises(ValueError, match="Malformed update event_time"):
+        parse_coinbase_ws_message(_level2_message(events=[_level2_event(
+            updates=[_level2_update(event_time=value), _level2_update(event_time="bad")],
+        )]))
+
+
+@pytest.mark.parametrize("kind", ["snapshot", "update", "heartbeat"])
+@pytest.mark.parametrize("event_time", [
+    "2026-10-06T18:30:00.000000999Z",
+    "2026-10-06T18:30:00.000001000Z",
+    "2026-10-06T14:30:00.000001000-04:00",
+    "malformed",
+])
+def test_timestamp_optimization_preserves_causal_gate_and_replay(kind, event_time, monkeypatch):
+    import hashlib
+
+    from btc_quarter_hour_engine.research import prospective_replay as replay_module
+    from btc_quarter_hour_engine.research.prospective_source import RawFrameRecord
+
+    boundary = datetime(2026, 10, 6, 18, 30, tzinfo=timezone.utc)
+    if kind == "heartbeat":
+        payload = _heartbeat_message(
+            timestamp=boundary.isoformat(), sequence_num=0,
+            events=[{"current_time": event_time, "heartbeat_counter": 1}],
+        )
+    else:
+        payload = _level2_message(
+            timestamp=boundary.isoformat(), sequence_num=0,
+            events=[_level2_event(type=kind, updates=[
+                _level2_update(event_time=event_time),
+                _level2_update(side="offer", event_time=event_time),
+            ])],
+        )
+    raw = json.dumps(payload).encode()
+    frame = RawFrameRecord(
+        raw_bytes=raw, session_id="timestamp-parity", connection_id="connection-1",
+        frame_index=0, ingest_time_utc=boundary,
+        raw_frame_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+    def run():
+        replay = replay_module._CausalFeatureReplay("BTC-USD")
+        outcome = _outcome(lambda: replay_module._replay_frames(
+            (frame,), session_id=frame.session_id, expected_index=0, replay=replay,
+            cutoff=boundary, previous_ingest=None,
+            prefix_commitment=replay_module.initial_prefix_commitment(frame.session_id, boundary),
+        ))
+        return outcome, replay.to_checkpoint()
+
+    actual = run()
+    with _phase1_parser(monkeypatch):
+        expected = run()
+    assert actual == expected
+
+
+@pytest.mark.parametrize("kind", ["snapshot", "update"])
+def test_multiple_level2_events_keep_timestamp_caches_event_local(kind, monkeypatch):
+    value = "2026-10-06T18:30:00.123456789+05:30"
+    payload = _level2_message(events=[
+        _level2_event(type=kind, updates=[
+            _level2_update(event_time=value),
+            _level2_update(side="offer", event_time=value),
+        ]),
+        _level2_event(type=kind, updates=[
+            _level2_update(price_level="99", event_time=value),
+            _level2_update(side="offer", price_level="102", event_time=value),
+        ]),
+    ])
+    calls = []
+    original = parser_module._require_utc_datetime
+
+    def counted(timestamp, *, field_name):
+        calls.append((timestamp, field_name))
+        return original(timestamp, field_name=field_name)
+
+    monkeypatch.setattr(parser_module, "_require_utc_datetime", counted)
+    actual = parse_coinbase_ws_message(payload)
+    assert calls.count((value, "update event_time")) == 2
+    assert ("value", actual) == _phase1_message(payload, monkeypatch)
+    assert len(actual["envelope"].events) == 2
+    assert len(actual["updates"]) == 4
+
+
+@pytest.mark.parametrize("kind", ["snapshot", "update"])
+def test_second_level2_event_cannot_reuse_first_events_timestamp_for_invalid_input(kind, monkeypatch):
+    payload = _level2_message(events=[
+        _level2_event(type=kind),
+        _level2_event(type=kind, updates=[
+            _level2_update(),
+            _level2_update(event_time="malformed"),
+        ]),
+    ])
+    expected = _phase1_message(payload, monkeypatch)
+    assert expected[0] == "error"
+    assert _outcome(lambda: parse_coinbase_ws_message(payload)) == expected

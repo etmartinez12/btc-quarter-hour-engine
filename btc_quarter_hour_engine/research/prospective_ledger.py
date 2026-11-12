@@ -89,6 +89,7 @@ class ClockHealth:
         if not math.isfinite(max_drift_seconds) or max_drift_seconds < 0:
             raise ValueError("max_drift_seconds must be finite and nonnegative")
         self.max_drift_seconds = float(max_drift_seconds)
+        self._uses_system_clock = wall_clock is None and monotonic_clock is None
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._previous_wall: datetime | None = None
@@ -98,6 +99,11 @@ class ClockHealth:
     @property
     def observed_wall_utc(self) -> datetime | None:
         return self._observed_wall
+
+    @property
+    def uses_system_clock(self) -> bool:
+        """Whether no test or caller clock override was supplied."""
+        return self._uses_system_clock
 
     def now(self) -> datetime:
         return self.check(self._wall_clock(), self._monotonic_clock())
@@ -415,14 +421,21 @@ class ProspectiveLedger:
         evidence: Mapping[str, Any],
         *,
         model_bundle: object | None = None,
+        timings: dict[str, float] | None = None,
+        pre_attestation_check: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
-        return self._append_prediction_evidence(evidence, model_bundle=model_bundle)
+        return self._append_prediction_evidence(
+            evidence, model_bundle=model_bundle, timings=timings,
+            pre_attestation_check=pre_attestation_check,
+        )
 
     def _append_prediction_evidence(
         self,
         evidence: Mapping[str, Any],
         *,
         model_bundle: object | None,
+        timings: dict[str, float] | None = None,
+        pre_attestation_check: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         from btc_quarter_hour_engine.research.prospective_inference import (
             _verify_recorded_model_outputs,
@@ -552,6 +565,7 @@ class ProspectiveLedger:
         clock_error: ClockHealthError | None = None
         invalid_timestamp = False
         write_started_at: datetime | None = None
+        transaction_started = time.perf_counter()
         with self._transaction():
             try:
                 write_started_at = self.clock_health.now()
@@ -679,6 +693,10 @@ class ProspectiveLedger:
                         "source_provenance_sha256": source_sha,
                     },
                 )
+        if timings is not None:
+            timings["ledger_transaction_ms"] = (
+                time.perf_counter() - transaction_started
+            ) * 1000
         if clock_error is not None:
             raise clock_error
         if invalid_timestamp:
@@ -690,7 +708,17 @@ class ProspectiveLedger:
                 "A prediction or label already exists for this boundary"
             )
         assert write_started_at is not None
-        attested_at = self._attest_durable_commit(boundary)
+        attestation_started = time.perf_counter()
+        if pre_attestation_check is None:
+            attested_at = self._attest_durable_commit(boundary)
+        else:
+            attested_at = self._attest_durable_commit(
+                boundary, pre_attestation_check=pre_attestation_check
+            )
+        if timings is not None:
+            timings["post_commit_durability_attestation_ms"] = (
+                time.perf_counter() - attestation_started
+            ) * 1000
         deadline_met = (
             attested_at <= boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
         )
@@ -709,9 +737,47 @@ class ProspectiveLedger:
             "failure_reasons": [],
         }
 
-    def _attest_durable_commit(self, boundary: datetime) -> datetime:
+    def _attest_durable_commit(
+        self,
+        boundary: datetime,
+        *,
+        pre_attestation_check: Callable[[], Any] | None = None,
+    ) -> datetime:
+        # The prediction COMMIT has returned. A failed independent UTC check
+        # leaves that immutable row unconfirmed, never eligible for re-attestation.
         try:
-            attested_at = self.clock_health.now()
+            with self._transaction():
+                exists = self._connection.execute(
+                    "SELECT 1 FROM predictions WHERE boundary_utc = ?",
+                    (_iso(boundary),),
+                ).fetchone()
+                if exists is None:
+                    raise RuntimeError("Cannot attest a prediction transaction that is not durable")
+                if pre_attestation_check is not None:
+                    pre_attestation_check()
+                attested_at = self.clock_health.now()
+                deadline_met = (
+                    attested_at <= boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO durability_attestations (
+                        boundary_utc, attested_at_utc, deadline_met,
+                        clock_health_verified
+                    ) VALUES (?, ?, ?, 1)
+                    """,
+                    (_iso(boundary), _iso(attested_at), int(deadline_met)),
+                )
+                self._insert_event(
+                    boundary,
+                    "durability_attested" if deadline_met else "durability_late",
+                    attested_at,
+                    (
+                        "prediction_commit_confirmed_before_deadline"
+                        if deadline_met
+                        else "prediction_commit_confirmed_after_deadline"
+                    ),
+                )
         except ClockHealthError as exc:
             observed = self.clock_health.observed_wall_utc
             if observed is not None:
@@ -719,35 +785,6 @@ class ProspectiveLedger:
                     self._insert_event(boundary, "clock_skew", observed, str(exc))
             raise
 
-        deadline_met = (
-            attested_at <= boundary + timedelta(seconds=PREDICTION_DEADLINE_SECONDS)
-        )
-        with self._transaction():
-            exists = self._connection.execute(
-                "SELECT 1 FROM predictions WHERE boundary_utc = ?",
-                (_iso(boundary),),
-            ).fetchone()
-            if exists is None:
-                raise RuntimeError("Cannot attest a prediction transaction that is not durable")
-            self._connection.execute(
-                """
-                INSERT INTO durability_attestations (
-                    boundary_utc, attested_at_utc, deadline_met,
-                    clock_health_verified
-                ) VALUES (?, ?, ?, 1)
-                """,
-                (_iso(boundary), _iso(attested_at), int(deadline_met)),
-            )
-            self._insert_event(
-                boundary,
-                "durability_attested" if deadline_met else "durability_late",
-                attested_at,
-                (
-                    "prediction_commit_confirmed_before_deadline"
-                    if deadline_met
-                    else "prediction_commit_confirmed_after_deadline"
-                ),
-            )
         return attested_at
 
     @staticmethod

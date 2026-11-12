@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -16,10 +17,7 @@ from btc_quarter_hour_engine.research.prospective_source import (
     RawFrameSnapshot,
     build_causal_feature_vector,
 )
-from btc_quarter_hour_engine.acquisition.prospective_source_bridge import (
-    ClockHealthEvidence,
-    ProspectiveSourceReceiver,
-)
+from btc_quarter_hour_engine.acquisition.prospective_source_bridge import ProspectiveSourceReceiver
 from btc_quarter_hour_engine.market_data.replay import CanonicalReplayAccumulator
 from btc_quarter_hour_engine.research.model_freeze import OFFICIAL_STATUS, frozen_predictors
 from btc_quarter_hour_engine.research.prospective_contract import (
@@ -33,6 +31,9 @@ from btc_quarter_hour_engine.research.prospective_inference import (
 )
 from btc_quarter_hour_engine.research import prospective_inference as inference
 from btc_quarter_hour_engine.research import prospective_replay as replay_module
+from btc_quarter_hour_engine.research import features as feature_module
+from btc_quarter_hour_engine.research.features import _IngestFeatureReplay
+from btc_quarter_hour_engine.research.prospective_source import _frame_event_times
 from btc_quarter_hour_engine.research.prospective_replay import (
     FeatureReplayCheckpoint,
     FeatureReplayWarmup,
@@ -46,6 +47,7 @@ from btc_quarter_hour_engine.research.prospective_replay import (
     finish_feature_replay_warmup,
     initial_prefix_commitment,
 )
+from tests.chrony_fixtures import chrony_evidence
 
 
 UTC = timezone.utc
@@ -90,8 +92,10 @@ def _record(index: int, sequence: int, timestamp: datetime, *, connection="conne
     )
 
 
-def _snapshot(*, end: datetime = BOUNDARY + timedelta(minutes=45)) -> RawFrameSnapshot:
-    start = BOUNDARY - timedelta(hours=4)
+def _snapshot(
+    *, end: datetime = BOUNDARY + timedelta(minutes=45),
+    start: datetime = BOUNDARY - timedelta(hours=4),
+) -> RawFrameSnapshot:
     frames = [_record(0, 0, start, snapshot=True)]
     index = 1
     sequence = 1
@@ -189,6 +193,232 @@ def _populate_journal(path, source):
         )
     journal.advance_watermark(source.session_id, source.watermark_utc, clock_health_verified=True)
     return journal
+
+
+class _ReferenceCausalReplay(_IngestFeatureReplay):
+    """Original double-parse path: gate first, then consume raw bytes normally."""
+
+    def _prepare_frame(self, raw):
+        return _frame_event_times(replay_module.parse_coinbase_ws_message(raw))
+
+
+def _mixed_snapshot():
+    source = _snapshot(end=BOUNDARY)
+    heartbeat = json.dumps({
+        "channel": "heartbeats",
+        "timestamp": source.session_started_at_utc.isoformat(),
+        "sequence_num": 0,
+        "events": [{
+            "current_time": source.session_started_at_utc.isoformat(),
+            "heartbeat_counter": "0",
+        }],
+    }).encode()
+    frames = [_record(0, 0, source.session_started_at_utc, raw=heartbeat)]
+    for frame in source.frames:
+        payload = json.loads(frame.raw_bytes)
+        payload["sequence_num"] += 1
+        frames.append(_record(
+            len(frames), payload["sequence_num"], frame.ingest_time_utc,
+            raw=json.dumps(payload).encode(),
+        ))
+    timestamp = BOUNDARY + timedelta(minutes=1)
+    heartbeat = json.dumps({
+        "channel": "heartbeats",
+        "timestamp": timestamp.isoformat(),
+        "sequence_num": len(frames),
+        "events": [{"current_time": timestamp.isoformat(), "heartbeat_counter": "1"}],
+    }).encode()
+    frames.append(_record(len(frames), len(frames), timestamp, raw=heartbeat))
+    frames.append(_record(len(frames), len(frames), timestamp))
+    frames.append(_record(
+        len(frames), 0, BOUNDARY + timedelta(minutes=10),
+        connection="connection-2", snapshot=True,
+    ))
+    frames.append(_record(
+        len(frames), 1, BOUNDARY + timedelta(minutes=15), connection="connection-2",
+    ))
+    return replace(source, frames=tuple(frames), watermark_utc=frames[-1].ingest_time_utc)
+
+
+@pytest.mark.parametrize("operation", ["bootstrap", "warmup", "vector", "advance"])
+def test_causal_replay_parses_each_eligible_frame_once(tmp_path, monkeypatch, operation):
+    source = _mixed_snapshot()
+    checkpoint = _checkpoint(source)
+    tail = tail_from_snapshot(source, checkpoint)
+    calls = Counter()
+    parser = replay_module.parse_coinbase_ws_message
+
+    def counted(raw):
+        calls[raw] += 1
+        return parser(raw)
+
+    monkeypatch.setattr(replay_module, "parse_coinbase_ws_message", counted)
+    monkeypatch.setattr(feature_module, "parse_coinbase_ws_message", counted)
+    if operation == "bootstrap":
+        _checkpoint(source)
+        expected = source.frames[:checkpoint.last_frame_index + 1]
+    elif operation == "warmup":
+        journal = _populate_journal(tmp_path / "source.sqlite", source)
+        try:
+            warmup = None
+            while True:
+                chunk = journal.warmup_chunk(
+                    source.session_id,
+                    after_frame_index=-1 if warmup is None else warmup.last_frame_index,
+                    expected_prefix_commitment_sha256=(
+                        initial_prefix_commitment(source.session_id, source.session_started_at_utc)
+                        if warmup is None else warmup.prefix_commitment_sha256
+                    ),
+                    through_boundary_utc=BOUNDARY, max_chunk_frames=7,
+                )
+                warmup = accumulate_feature_replay_warmup(chunk, BOUNDARY, warmup)
+                if not chunk.has_more:
+                    break
+        finally:
+            journal.close()
+        assert warmup.data["replay_state"] == checkpoint.data["replay_state"]
+        expected = source.frames[:checkpoint.last_frame_index + 1]
+    else:
+        api = (
+            build_incremental_causal_feature_vector
+            if operation == "vector" else advance_feature_replay_checkpoint
+        )
+        api(tail, source.watermark_utc, checkpoint)
+        expected = tail.frames
+    assert calls == Counter(frame.raw_bytes for frame in expected)
+    assert sum(calls.values()) == len(expected)
+
+
+def test_single_parse_matches_reference_checkpoints_vectors_and_probabilities(tmp_path, monkeypatch):
+    import numpy as np
+    import pandas as pd
+
+    from btc_quarter_hour_engine.research.model_freeze import verified_probabilities
+
+    source = _mixed_snapshot()
+    journal = _populate_journal(tmp_path / "source.sqlite", source)
+
+    def replay_all():
+        checkpoint = _checkpoint(source)
+        chunk = journal.warmup_chunk(
+            source.session_id, after_frame_index=-1,
+            expected_prefix_commitment_sha256=initial_prefix_commitment(
+                source.session_id, source.session_started_at_utc,
+            ),
+            through_boundary_utc=BOUNDARY,
+        )
+        warmup = accumulate_feature_replay_warmup(chunk, BOUNDARY)
+        tail = tail_from_snapshot(source, checkpoint)
+        vector = build_incremental_causal_feature_vector(tail, source.watermark_utc, checkpoint)
+        advanced = advance_feature_replay_checkpoint(tail, source.watermark_utc, checkpoint)
+        return checkpoint, warmup, vector, advanced
+
+    try:
+        actual = replay_all()
+        with monkeypatch.context() as reference:
+            reference.setattr(replay_module, "_CausalFeatureReplay", _ReferenceCausalReplay)
+            expected = replay_all()
+    finally:
+        journal.close()
+    assert [item.serialized for item in (actual[0], actual[1], actual[3])] == [
+        item.serialized for item in (expected[0], expected[1], expected[3])
+    ]
+    assert actual[2] == expected[2]
+    assert tuple(actual[2].values) == actual[2].control_predictors == frozen_predictors()["full_v2"]
+    assert len(actual[2].values) == 91
+    assert actual[2].candidate_predictors == frozen_predictors()["range_volatility"]
+
+    class OrderedPipeline(_DeterministicPipeline):
+        def predict_proba(self, matrix):
+            assert tuple(matrix.columns) == tuple(self.feature_names_in_)
+            probability = np.asarray([float(matrix.iloc[0].sum()) % 1])
+            return np.column_stack((1 - probability, probability))
+
+    for names in frozen_predictors().values():
+        model = OrderedPipeline(names, 0)
+        matrices = [
+            pd.DataFrame([[vector.values[name] for name in names]], columns=list(names))
+            for vector in (actual[2], expected[2])
+        ]
+        assert verified_probabilities(model, matrices[0], names).tolist() == (
+            verified_probabilities(model, matrices[1], names).tolist()
+        )
+
+
+@pytest.mark.parametrize("case", [
+    "snapshot", "heartbeat", "update", "malformed_json", "malformed_update",
+    "future_envelope", "future_update", "future_heartbeat", "future_snapshot_level",
+    "duplicate", "stale", "gap", "reconnect_snapshot", "reconnect_update",
+])
+def test_causal_gate_and_replay_state_match_double_parse_reference(case):
+    timestamp = BOUNDARY - timedelta(minutes=1)
+    frames = [_record(0, 0, timestamp, snapshot=True)]
+    raw = json.loads(_wire_frame(1, timestamp))
+    connection = "connection-1"
+    if case in {"heartbeat", "future_heartbeat"}:
+        raw = {
+            "channel": "heartbeats", "timestamp": timestamp.isoformat(),
+            "sequence_num": 1,
+            "events": [{"current_time": (
+                BOUNDARY + timedelta(seconds=1) if case == "future_heartbeat" else timestamp
+            ).isoformat(), "heartbeat_counter": "1"}],
+        }
+    elif case in {"snapshot", "future_snapshot_level", "reconnect_snapshot"}:
+        raw["events"][0]["type"] = "snapshot"
+    if case == "future_envelope":
+        raw["timestamp"] = (BOUNDARY + timedelta(seconds=1)).isoformat()
+    if case in {"future_update", "future_snapshot_level"}:
+        raw["events"][0]["updates"][0]["event_time"] = (BOUNDARY + timedelta(seconds=1)).isoformat()
+    if case == "malformed_update":
+        raw["events"][0]["updates"][0]["new_quantity"] = "-1"
+    if case in {"duplicate", "stale", "gap"}:
+        if case == "stale":
+            frames.append(_record(1, 1, timestamp))
+        raw["sequence_num"] = 5 if case == "gap" else 0
+    if case.startswith("reconnect"):
+        connection = "connection-2"
+        raw["sequence_num"] = 0
+    payload = b"not-json" if case == "malformed_json" else json.dumps(raw).encode()
+    frames.append(_record(len(frames), 1, timestamp, raw=payload, connection=connection))
+
+    def run(replay_type):
+        replay = replay_type("BTC-USD")
+        try:
+            result = replay_module._replay_frames(
+                tuple(frames), session_id="replay-session", expected_index=0,
+                replay=replay, cutoff=BOUNDARY, previous_ingest=None,
+                prefix_commitment=initial_prefix_commitment("replay-session", timestamp),
+            )
+        except CausalInputError as exc:
+            result = str(exc)
+        return result, replay.to_checkpoint()
+
+    assert run(replay_module._CausalFeatureReplay) == run(_ReferenceCausalReplay)
+
+
+def test_prepared_frame_cannot_be_substituted_reused_or_injected(monkeypatch):
+    replay = replay_module._CausalFeatureReplay("BTC-USD")
+    raw = _wire_frame(0, BOUNDARY, snapshot=True)
+    replay._prepare_frame(raw)
+    calls = []
+    parser = feature_module.parse_coinbase_ws_message
+
+    def counted(payload):
+        calls.append(payload)
+        return parser(payload)
+
+    monkeypatch.setattr(feature_module, "parse_coinbase_ws_message", counted)
+    kwargs = dict(connection_id="connection-1", frame_index=0, ingest_time_utc=BOUNDARY)
+    # A different raw object cannot receive the prepared result, even if equal.
+    replay.consume(raw=bytes(bytearray(raw)), **kwargs)
+    replay.consume(raw=raw, **kwargs)
+    assert calls == [raw, raw]
+    assert replay.stale_frames == 1
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        replay.consume(raw=b"malformed", parsed_event={}, **kwargs)
+    replay.consume(raw=b"malformed", **kwargs)
+    assert replay.malformed_frames == 1
+    assert replay.to_checkpoint()["buckets"][-1]["stats"]["asof_book_synced"] == 0
 
 
 @pytest.mark.parametrize("api", [build_incremental_causal_feature_vector, advance_feature_replay_checkpoint])
@@ -300,24 +530,18 @@ def test_chunked_warmup_is_restartable_bounded_and_matches_full_replay(tmp_path,
     assert actual.feature_fingerprint == expected.feature_fingerprint
 
 
-def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_path):
-    target_boundary = BOUNDARY + timedelta(minutes=15)
-    source = _with_boundary_witnesses(
-        _snapshot(end=target_boundary), (BOUNDARY, target_boundary)
-    )
-    journal = ProspectiveRawFrameJournal(tmp_path / "source.sqlite")
+def _populate_receiver_journal(
+    path, source, boundaries, *, clock_verified=True, clock_reference_age=1.0
+):
+    journal = ProspectiveRawFrameJournal(path)
     clock_values = iter(
         (
-            ClockHealthEvidence(
-                observed_at_utc=boundary + timedelta(seconds=2),
-                synchronized=True,
-                verified=True,
-                offset_seconds=0.001,
-                reference_time_utc=boundary + timedelta(seconds=1),
-                leap_status="Normal",
-                source="synthetic test evidence",
+            chrony_evidence(
+                boundary + timedelta(seconds=2),
+                verified=clock_verified,
+                reference_age=clock_reference_age,
             )
-            for boundary in (BOUNDARY, target_boundary)
+            for boundary in boundaries
         )
     )
     receiver = ProspectiveSourceReceiver(
@@ -419,10 +643,9 @@ def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_pa
             },
             frame.raw_bytes,
         )
-        if canonical_boundary is not None and frame.ingest_time_utc in (
-            BOUNDARY + timedelta(seconds=1),
-            target_boundary + timedelta(seconds=1),
-        ):
+        if canonical_boundary is not None and frame.ingest_time_utc in {
+            boundary + timedelta(seconds=1) for boundary in boundaries
+        }:
             boundary = current_boundary
             receiver.process(
                 {
@@ -438,7 +661,17 @@ def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_pa
                 },
                 b"",
             )
+    return journal
 
+
+def test_receiver_journal_warmup_and_incremental_vector_match_full_replay(tmp_path):
+    target_boundary = BOUNDARY + timedelta(minutes=15)
+    source = _with_boundary_witnesses(
+        _snapshot(end=target_boundary), (BOUNDARY, target_boundary)
+    )
+    journal = _populate_receiver_journal(
+        tmp_path / "source.sqlite", source, (BOUNDARY, target_boundary)
+    )
     warmup_chunk = journal.warmup_chunk(
         source.session_id,
         after_frame_index=-1,
@@ -1161,7 +1394,7 @@ def test_offline_benchmark_reports_stage_percentiles_work_memory_and_failures(pu
         "ledger_commit_attestation_ms",
         "checkpoint_advance_and_write_ms",
     ):
-        assert set(result["stage_ms"][stage]) == {"median", "p95", "max"}
+        assert set(result["stage_ms"][stage]) == {"median", "p95", "p99", "max"}
 
 
 class _DeterministicPipeline:

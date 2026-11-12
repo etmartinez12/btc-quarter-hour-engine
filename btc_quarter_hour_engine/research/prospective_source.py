@@ -35,6 +35,10 @@ from btc_quarter_hour_engine.research.features_v2 import (
 )
 from btc_quarter_hour_engine.research.feature_families_v2 import FAMILY_CONTRACT_VERSION
 from btc_quarter_hour_engine.research.model_freeze import frozen_predictors
+from btc_quarter_hour_engine.research.prospective_clock import (
+    ClockHealthEvidence,
+    evaluate_clock_evidence,
+)
 
 
 def _utc(value: datetime, *, field: str) -> datetime:
@@ -329,22 +333,14 @@ def _validate_bridge_clock_evidence(
     observed = _parse_utc(observed_value)
     if observed < witness_time or observed > watermark + SOURCE_CERTIFICATION_WINDOW:
         raise ValueError("Bridge clock evidence falls outside the prospective window")
-    reference_value = evidence["reference_time_utc"]
-    reference = _parse_utc(reference_value) if isinstance(reference_value, str) else None
-    age = (observed - reference).total_seconds() if reference is not None else None
-    offset = evidence["offset_seconds"]
-    finite_offset = (
-        isinstance(offset, (int, float))
-        and not isinstance(offset, bool)
-        and math.isfinite(offset)
-    )
-    expected = bool(
-        evidence["leap_status"] == "Normal"
-        and finite_offset
-        and abs(float(offset)) <= 0.050
-        and age is not None
-        and 0 <= age <= 120.0
-    )
+    # Certification is recomputed from the stored fields under the single
+    # shared freshness policy; the recorded flags must agree with it exactly.
+    try:
+        decoded = ClockHealthEvidence.from_dict(evidence)
+    except (TypeError, ValueError):
+        expected = False
+    else:
+        expected = evaluate_clock_evidence(decoded).verified
     if type(evidence["verified"]) is not bool or evidence["verified"] != expected:
         raise ValueError("Bridge clock verification flag contradicts its evidence")
     if (
@@ -408,6 +404,31 @@ class CausalInputError(ValueError):
 
 class ProspectiveRawFrameJournal:
     """Isolated durable append-only feed adapter; not connected to the collector."""
+
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> "ProspectiveRawFrameJournal":
+        """Open an existing source journal without running schema or migration writes.
+
+        This consumer handle exposes the same snapshot APIs as a receiver-owned
+        journal instance while SQLite itself enforces read-only access.  It is
+        deliberately unsuitable for creating a journal or performing legacy
+        prefix migrations.
+        """
+        journal = cls.__new__(cls)
+        journal.path = Path(path)
+        if not journal.path.is_file():
+            raise FileNotFoundError(journal.path)
+        uri = journal.path.resolve().as_uri() + "?mode=ro"
+        journal._connection = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        journal._connection.row_factory = sqlite3.Row
+        journal._connection.execute("PRAGMA query_only = ON")
+        journal._connection.execute("PRAGMA busy_timeout = 1000")
+        return journal
 
     def __init__(self, path: str | Path, *, migrate_legacy_prefixes: bool = False) -> None:
         self.path = Path(path)
@@ -724,6 +745,17 @@ class ProspectiveRawFrameJournal:
             (session_id,),
         ).fetchone()
         return "offline" if row is None else row["source_mode"]
+
+    def has_fence_record(self, session_id: str, boundary_utc: datetime) -> bool:
+        """Return whether the exact bridge-fence row exists; callers must still validate it."""
+        boundary = _utc(boundary_utc, field="fence boundary")
+        if not _is_boundary(boundary):
+            raise ValueError("Fence lookup requires an exact UTC quarter-hour")
+        with self._read_transaction():
+            return self._connection.execute(
+                "SELECT 1 FROM source_fences WHERE session_id = ? AND watermark_utc = ?",
+                (session_id, _iso(boundary)),
+            ).fetchone() is not None
 
     def register_connection_epoch(
         self,
@@ -1235,16 +1267,13 @@ class ProspectiveRawFrameJournal:
         if clock_evidence.get("synchronized") is not clock_health_verified:
             raise ValueError("Clock synchronization evidence and status disagree")
         if clock_health_verified:
-            offset = clock_evidence.get("offset_seconds")
-            if (
-                not isinstance(offset, (int, float))
-                or isinstance(offset, bool)
-                or not math.isfinite(offset)
-                or abs(offset) > 0.050
-                or clock_evidence.get("leap_status") != "Normal"
-                or not isinstance(clock_evidence.get("reference_time_utc"), str)
-                or not isinstance(clock_evidence.get("observed_at_utc"), str)
-            ):
+            try:
+                assessment = evaluate_clock_evidence(
+                    ClockHealthEvidence.from_dict(clock_evidence)
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Verified clock evidence is incomplete or outside tolerance") from exc
+            if not assessment.verified:
                 raise ValueError("Verified clock evidence is incomplete or outside tolerance")
         evidence_json = json.dumps(
             clock_evidence, sort_keys=True, separators=(",", ":"), allow_nan=False
