@@ -566,7 +566,7 @@ def test_inference_cannot_be_generated_at_or_after_target_time():
 
 
 def test_boundary_runner_persists_success_and_records_missing_data(tmp_path, monkeypatch):
-    boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+    boundary = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
     class ManualClock:
         wall = boundary + timedelta(seconds=2)
         monotonic = 0.0
@@ -614,7 +614,7 @@ def test_boundary_runner_persists_success_and_records_missing_data(tmp_path, mon
 
 
 def test_unexpected_inference_failure_is_recorded_and_propagated(tmp_path, monkeypatch):
-    boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+    boundary = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
     model_bundle = _verified_test_bundle(monkeypatch)
     ledger = ProspectiveLedger(
         tmp_path / "inference-failure.sqlite",
@@ -644,7 +644,7 @@ def test_unexpected_inference_failure_is_recorded_and_propagated(tmp_path, monke
 
 
 def test_process_boundary_rejects_forged_hash_only_bundle(tmp_path):
-    boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+    boundary = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
     ledger = ProspectiveLedger(tmp_path / "forged-bundle.sqlite")
     with pytest.raises(ValueError, match="loaded by load_official_models"):
         process_boundary(
@@ -660,7 +660,7 @@ def test_process_boundary_rejects_forged_hash_only_bundle(tmp_path):
 
 
 def test_process_boundary_rejects_mutated_loaded_bundle(tmp_path, monkeypatch):
-    boundary = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+    boundary = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
     model_bundle = _verified_test_bundle(monkeypatch)
     model_bundle.model_sha256["range_volatility"] = "0" * 64
     ledger = ProspectiveLedger(tmp_path / "mutated-bundle.sqlite")

@@ -18,7 +18,7 @@ from btc_quarter_hour_engine.research.prospective_source import ProspectiveRawFr
 
 
 UTC = timezone.utc
-START = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+START = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
 
 
 class ManualClock:
@@ -57,8 +57,8 @@ def _config(tmp_path: Path, *, source: Path | None = None) -> RunnerConfig:
 
 
 def test_scheduler_uses_exact_utc_quarter_hours_and_never_fires_early():
-    before = datetime(2026, 11, 15, 0, 14, 59, 999999, tzinfo=UTC)
-    exact = datetime(2026, 11, 15, 0, 15, tzinfo=UTC)
+    before = datetime(2026, 11, 18, 0, 14, 59, 999999, tzinfo=UTC)
+    exact = datetime(2026, 11, 18, 0, 15, tzinfo=UTC)
     assert BoundaryScheduler.next_boundary(before) == exact
     assert BoundaryScheduler.next_boundary(exact) == exact
     assert not BoundaryScheduler.is_open(exact, exact - timedelta(microseconds=1))
@@ -99,7 +99,7 @@ def test_source_consumer_opens_query_only_and_does_not_change_journal(tmp_path):
     path = tmp_path / "source.sqlite"
     journal = ProspectiveRawFrameJournal(path)
     journal.start_session(
-        "read-only-session", datetime(2026, 11, 15, tzinfo=UTC), source_mode="bridge"
+        "read-only-session", datetime(2026, 11, 18, tzinfo=UTC), source_mode="bridge"
     )
     journal.close()
 
@@ -109,7 +109,7 @@ def test_source_consumer_opens_query_only_and_does_not_change_journal(tmp_path):
     assert consumer._connection.execute("PRAGMA query_only").fetchone()[0] == 1
     with pytest.raises(Exception):
         consumer.start_session(
-            "must-not-write", datetime(2026, 11, 15, tzinfo=UTC), source_mode="bridge"
+            "must-not-write", datetime(2026, 11, 18, tzinfo=UTC), source_mode="bridge"
         )
     assert consumer.session_started_at("must-not-write") is None
     consumer.close()
@@ -219,7 +219,7 @@ def test_read_only_cli_diagnostic_does_not_create_prediction_ledger(tmp_path, ca
         "--config",
         str(config_path),
         "--boundary",
-        "2026-11-15T00:00:00Z",
+        "2026-11-18T00:00:00Z",
     ]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["exact_boundary_fence_present"] is False

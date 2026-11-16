@@ -11,7 +11,7 @@ systemd unit. No research materializer, target construction, or model-training
 path is called by the runner.
 
 The protocol remains exactly the registered 2,880 UTC quarter-hours from
-`2026-11-15T00:00:00Z` through (exclusive) `2026-12-15T00:00:00Z`, with target
+`2026-11-18T00:00:00Z` through (exclusive) `2026-12-18T00:00:00Z`, with target
 `T+15m`, the fixed 0.5 threshold, and the durable T+60s deadline. Only
 `load_official_models()` can supply an accepted official model bundle.
 
@@ -149,7 +149,7 @@ ledger, infer, or write prediction evidence):
 
 ```powershell
 btc-qh-prospective-inference-runner dry-run `
-  --config .\runner.json --boundary 2026-11-15T00:00:00Z
+  --config .\runner.json --boundary 2026-11-18T00:00:00Z
 ```
 
 **Explicit checkpoint preparation** (source reads and immutable checkpoint
@@ -158,13 +158,13 @@ or deployment authorization):
 
 ```powershell
 btc-qh-prospective-inference-runner prepare `
-  --config .\runner.json --boundary 2026-11-15T00:00:00Z
+  --config .\runner.json --boundary 2026-11-18T00:00:00Z
 ```
 
 For the first registered prediction, the normal cutoff is
-`2026-11-14T23:45:00Z`. The separately authorized source must contain the exact
+`2026-11-17T23:45:00Z`. The separately authorized source must contain the exact
 240 minutes of history through that cutoff: its session must begin no later
-than `2026-11-14T19:45:00Z` (prefer earlier for operational margin). This is a
+than `2026-11-17T19:45:00Z` (prefer earlier for operational margin). This is a
 source-readiness requirement, **not authorization to enable the bridge**.
 Begin `prepare` as soon as the certified 23:45 fence exists, allowing the
 whole pre-window interval for replay and durable publication. Do not defer it
@@ -180,7 +180,7 @@ checks time between chunks and around ready publication, and refuses work
 at/after the prediction boundary. Partial/corrupt state is never promoted.
 
 Before midnight, require a successful JSON result with `ready: true`,
-`cutoff_utc: "2026-11-14T23:45:00Z"`, the expected source session, immutable
+`cutoff_utc: "2026-11-17T23:45:00Z"`, the expected source session, immutable
 checkpoint path and integrity SHA256. Rerunning `prepare` reopens and
 revalidates the published checkpoint against its exact certified source
 prefix without replaying the four hours or touching the ledger; the result
