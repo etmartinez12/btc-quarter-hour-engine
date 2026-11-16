@@ -10,8 +10,8 @@ RANGE_MODEL_SHA256 = (
 FULL_V2_MODEL_SHA256 = (
     "c8d2bf2289faf567896d1f514a3daf5d8c17d7a8b6cacddc1a700cb517d47fed"
 )
-WINDOW_START = datetime(2026, 11, 15, tzinfo=timezone.utc)
-WINDOW_END_EXCLUSIVE = datetime(2026, 12, 15, tzinfo=timezone.utc)
+WINDOW_START = datetime(2026, 11, 18, tzinfo=timezone.utc)
+WINDOW_END_EXCLUSIVE = datetime(2026, 12, 18, tzinfo=timezone.utc)
 PREDICTION_DEADLINE_SECONDS = 60
 PROBABILITY_THRESHOLD = 0.5
 BASELINE_PREDICTION = 0

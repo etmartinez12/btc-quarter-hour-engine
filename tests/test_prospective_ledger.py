@@ -28,7 +28,7 @@ from btc_quarter_hour_engine.research.prospective_source import (
 
 
 UTC = timezone.utc
-START = datetime(2026, 11, 15, 0, 0, tzinfo=UTC)
+START = datetime(2026, 11, 18, 0, 0, tzinfo=UTC)
 IMPLEMENTATION_SHA = "1" * 40
 
 
@@ -152,10 +152,10 @@ def test_registered_schedule_is_complete_and_immutable(tmp_path):
     assert ledger.scheduled_count == 2880
     assert len(schedule) == 2880
     assert schedule[0] == {
-        "boundary_utc": "2026-11-15T00:00:00.000000Z",
-        "target_utc": "2026-11-15T00:15:00.000000Z",
+        "boundary_utc": "2026-11-18T00:00:00.000000Z",
+        "target_utc": "2026-11-18T00:15:00.000000Z",
     }
-    assert schedule[-1]["boundary_utc"] == "2026-12-14T23:45:00.000000Z"
+    assert schedule[-1]["boundary_utc"] == "2026-12-17T23:45:00.000000Z"
     with pytest.raises(sqlite3.IntegrityError):
         ledger._connection.execute(
             "INSERT INTO scheduled_boundaries VALUES (?, ?)",
@@ -207,7 +207,7 @@ def test_prediction_persists_once_with_all_frozen_evidence(tmp_path, official_mo
     assert state["prediction"]["candidate_probability"] == 0.7
     assert state["prediction"]["candidate_prediction"] == 1
     assert state["prediction"]["baseline_prediction"] == 0
-    assert state["prediction"]["write_started_at_utc"] == "2026-11-15T00:00:05.000000Z"
+    assert state["prediction"]["write_started_at_utc"] == "2026-11-18T00:00:05.000000Z"
     assert state["prediction"]["clock_health_verified"] == 1
     assert len(state["prediction"]["feature_vector_json"].encode()) > 0
     with pytest.raises(DuplicatePredictionError):
@@ -451,12 +451,12 @@ def test_label_is_separate_append_only_evidence_and_cannot_rewrite_prediction(
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         ledger._connection.execute(
             "UPDATE predictions SET candidate_prediction = 0 WHERE boundary_utc = ?",
-            ("2026-11-15T00:00:00.000000Z",),
+            ("2026-11-18T00:00:00.000000Z",),
         )
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         ledger._connection.execute(
             "UPDATE labels SET target = 0 WHERE boundary_utc = ?",
-            ("2026-11-15T00:00:00.000000Z",),
+            ("2026-11-18T00:00:00.000000Z",),
         )
     with pytest.raises(DuplicateLabelError):
         clock.advance(1)

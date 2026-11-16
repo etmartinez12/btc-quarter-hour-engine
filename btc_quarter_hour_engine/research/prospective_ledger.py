@@ -21,8 +21,8 @@ from btc_quarter_hour_engine.research.prospective_contract import (
 from btc_quarter_hour_engine.research.prospective_source import (
     compute_feature_fingerprint,
 )
-WINDOW_START = datetime(2026, 11, 15, tzinfo=timezone.utc)
-WINDOW_END_EXCLUSIVE = datetime(2026, 12, 15, tzinfo=timezone.utc)
+WINDOW_START = datetime(2026, 11, 18, tzinfo=timezone.utc)
+WINDOW_END_EXCLUSIVE = datetime(2026, 12, 18, tzinfo=timezone.utc)
 PREDICTION_DEADLINE_SECONDS = 60
 _EVENT_TYPES = {
     "prediction_recorded",

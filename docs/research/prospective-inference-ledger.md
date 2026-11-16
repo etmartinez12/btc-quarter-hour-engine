@@ -160,10 +160,10 @@ prediction or contacts a market-data source:
 python -m btc_quarter_hour_engine.research.prospective_dry_run_cli `
   --dry-run `
   --source-snapshot "C:\research\synthetic-source-snapshot.json" `
-  --boundary "2026-11-15T00:00:00Z" `
+  --boundary "2026-11-18T00:00:00Z" `
   --model-directory "C:\research\official-model-freeze" `
   --implementation-git-sha "<full-reviewed-commit-sha>" `
-  --generated-at "2026-11-15T00:00:01Z"
+  --generated-at "2026-11-18T00:00:01Z"
 ```
 
 The snapshot JSON has exactly these top-level keys:
@@ -176,7 +176,7 @@ JSON keys, and invalid provenance are rejected.
 ## Ledger operation
 
 Constructing `ProspectiveLedger(path)` registers all 2,880 boundaries in
-`2026-11-15T00:00:00Z` through `2026-12-15T00:00:00Z`. An existing database
+`2026-11-18T00:00:00Z` through `2026-12-18T00:00:00Z`. An existing database
 with a different schedule is rejected. Schedule, events, predictions, and
 labels are protected by SQLite update/delete triggers; prediction and label
 boundary identities are unique. SQLite uses `WAL`, `synchronous=FULL`, foreign

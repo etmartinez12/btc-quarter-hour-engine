@@ -883,7 +883,7 @@ def test_configuration_diagnostic_and_preparation_cli_never_open_ledger(engine_f
         if mode != "simulate":
             args += ["--config", str(config_path)]
         if mode in {"dry-run", "prepare"}:
-            args += ["--boundary", "2026-11-15T00:00:00Z"]
+            args += ["--boundary", "2026-11-18T00:00:00Z"]
         assert cli.main(args) == 0
         output = json.loads(capsys.readouterr().out)
         assert output.get("official_records_written", False) is False
